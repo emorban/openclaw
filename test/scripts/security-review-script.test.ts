@@ -1413,30 +1413,28 @@ describe("combined security review entry point", () => {
       expect(result.combined.at(-1)).toBe("failure");
     });
 
-    it("retries a stale pending listing before publishing the completed gate", () => {
+    it("settles a completed run without waiting for the pending listing to refresh", () => {
       const result = evaluate(
-        {
-          [runsPath]: {
-            responses: [
-              { total_count: 1, workflow_runs: [{ ...run, status: "in_progress" }] },
-              { total_count: 1, workflow_runs: [run] },
-            ],
-          },
-        },
+        listedRuns([{ ...run, status: "in_progress" }]),
         "enforce",
         undefined,
         completedCi,
       );
       expect(result.status, result.stderr).toBe(0);
-      expect(result.waits.reduce((sum, delay) => sum + delay, 0)).toBe(60_000);
-      expect(result.combined.at(-1)).toBe("success");
+      expect(result.waits).toEqual([]);
+      expect(result.combined).toEqual(["pending", "success"]);
     });
 
     it.each([
       { name: "run", newer: { ...run, id: 11, status: "in_progress" } },
       { name: "attempt", newer: { ...run, run_attempt: 2, status: "in_progress" } },
     ])("keeps a newer active $name pending", ({ newer }) => {
-      const result = evaluate(listedRuns([newer]), "enforce", undefined, completedCi);
+      const result = evaluate(
+        { ...listedRuns([newer]), [`GET ${actions}/runs/${newer.id}`]: newer },
+        "enforce",
+        undefined,
+        completedCi,
+      );
       expect(result.status, result.stderr).toBe(0);
       expect(result.waits).toEqual([]);
       expect(result.combined.at(-1)).toBe("pending");
@@ -1457,6 +1455,37 @@ describe("combined security review entry point", () => {
       expect(result.waits.reduce((sum, delay) => sum + delay, 0)).toBe(60_000);
       expect(result.combined.at(-1)).toBe("success");
     });
+  });
+
+  it("settles completed CI when the run list still reports its previous attempt in progress", () => {
+    const current = { ...run, run_attempt: 2 };
+    const result = evaluate({
+      ...listedRuns([{ ...run, status: "in_progress" }]),
+      [`GET ${actions}/runs/10`]: current,
+      [`GET ${actions}/runs/10/attempts/2/jobs`]: jobs,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.combined).toEqual(["pending", "success"]);
+    expect(result.requests.filter((entry) => entry.path.endsWith("/jobs"))).toEqual([
+      expect.objectContaining({ path: `${actions}/runs/10/attempts/2/jobs` }),
+    ]);
+  });
+
+  it.each([
+    { field: "id", value: 11 },
+    { field: "head_sha", value: "d".repeat(40) },
+    { field: "head_branch", value: "other-branch" },
+    { field: "path", value: ".github/workflows/other.yml" },
+    { field: "repository", value: { id: 2 } },
+    { field: "event", value: "push" },
+  ])("rejects a changed $field when refreshing an unfinished run", ({ field, value }) => {
+    const result = evaluate({
+      ...listedRuns([{ ...run, status: "in_progress" }]),
+      [`GET ${actions}/runs/10`]: { ...run, [field]: value },
+    });
+    expect(result.status).toBe(1);
+    expect(result.combined).toEqual(["pending", "failure"]);
+    expect(result.requests.some((entry) => entry.path.endsWith("/jobs"))).toBe(false);
   });
 
   it.each<{
@@ -1548,11 +1577,26 @@ describe("combined security review entry point", () => {
     },
     ...[
       { name: "missing CI", runs: [] },
-      { name: "unfinished CI", runs: [{ ...run, status: "in_progress" }] },
+      {
+        name: "unfinished CI",
+        runs: [{ ...run, status: "in_progress" }],
+        current: { ...run, status: "in_progress" },
+      },
       { name: "another workflow", runs: [{ ...run, path: ".github/workflows/forged.yml" }] },
       { name: "stale head", runs: [{ ...run, head_sha: "d".repeat(40) }] },
-      { name: "newer unfinished CI", runs: [run, { ...run, id: 11, status: "queued" }] },
-    ].map(({ name, runs }) => ({ name, routes: listedRuns(runs), outcome: "pending" })),
+      {
+        name: "newer unfinished CI",
+        runs: [run, { ...run, id: 11, status: "queued" }],
+        current: { ...run, id: 11, status: "queued" },
+      },
+    ].map(({ name, runs, current }) => ({
+      name,
+      routes: {
+        ...listedRuns(runs),
+        ...(current ? { [`GET ${actions}/runs/${current.id}`]: current } : {}),
+      },
+      outcome: "pending",
+    })),
     ...["failure", "skipped"].map((conclusion) => ({
       name: `${conclusion} gate`,
       routes: { [jobsPath]: { ...jobs, jobs: [{ ...jobs.jobs[0], conclusion }] } },
