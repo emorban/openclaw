@@ -413,6 +413,7 @@ describe("CLI transcript account boundary", () => {
     await f.seed();
     const identity = {
       credential: { type: "token" as const, provider: "test-cli", token: "epoch-a" },
+      ownerSettleTimeoutMs: 0,
     };
     await f.withRun("orchestrator-prior", async (params) => {
       await claimAgentSessionWriter(params);
@@ -542,6 +543,7 @@ describe("CLI transcript account boundary", () => {
         await expect(
           prepareCliHistoryBoundary(params, {
             credential: { type: "token", provider: "test-cli", token: "epoch-a" },
+            ownerSettleTimeoutMs: 0,
           }),
         ).rejects.toThrow("CLI history owner changed before preparation");
       });

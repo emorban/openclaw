@@ -98,21 +98,63 @@ export async function prepareCliHistoryBoundary(
      * with); without it no owner can be established and history is refused.
      */
     preparedBackend?: Parameters<typeof resolveCliChildEnv>[0];
+    /**
+     * How long to wait for a live prior writer (usually the previous turn of the same
+     * session still settling its reply) before refusing. Defaults to 15 s; 0 refuses at once.
+     */
+    ownerSettleTimeoutMs?: number;
   },
 ): Promise<CliExecutionHistoryWriter | undefined> {
-  try {
-    return await prepareCliHistoryBoundaryOnce(params, identity);
-  } catch (error) {
-    if (
-      params.abortSignal?.aborted ||
-      !(error instanceof Error) ||
-      error.message !== CLI_HISTORY_CHANGED_BEFORE_PREPARATION
-    ) {
-      throw error;
+  const deadline =
+    Date.now() + Math.max(0, identity.ownerSettleTimeoutMs ?? OWNER_SETTLE_TIMEOUT_MS);
+  let rereadAfterSettlement = false;
+  for (let delayMs = OWNER_SETTLE_INITIAL_DELAY_MS; ; delayMs = Math.min(delayMs * 2, 1_000)) {
+    try {
+      return await prepareCliHistoryBoundaryOnce(params, identity);
+    } catch (error) {
+      if (params.abortSignal?.aborted || !(error instanceof Error)) {
+        throw error;
+      }
+      if (error.message === CLI_HISTORY_CHANGED_BEFORE_PREPARATION && !rereadAfterSettlement) {
+        // Settlement can move the tip after planning. Nothing committed; reread once.
+        rereadAfterSettlement = true;
+        continue;
+      }
+      if (
+        !(error instanceof CliHistoryOwnerChangedError) ||
+        Date.now() >= deadline
+      ) {
+        throw error;
+      }
+      // A live prior writer still owns the row (typically the previous turn finishing its
+      // reply when the next message arrives). Nothing committed; wait for it to settle.
+      await sleepUnlessAborted(
+        Math.min(delayMs, Math.max(0, deadline - Date.now())),
+        params.abortSignal,
+      );
     }
   }
-  // Settlement can move the tip after planning. Nothing committed; reread once.
-  return prepareCliHistoryBoundaryOnce(params, identity);
+}
+
+const OWNER_SETTLE_TIMEOUT_MS = 15_000;
+const OWNER_SETTLE_INITIAL_DELAY_MS = 100;
+
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /** Compaction may rewrite a covered transcript, but cannot establish account provenance. */
