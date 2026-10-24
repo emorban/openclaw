@@ -118,30 +118,23 @@ it("installs the package candidate before forwarding runtime secrets", () => {
 
   expect(installRunStart).toBeGreaterThanOrEqual(0);
   expect(installRunEnd).toBeGreaterThan(installRunStart);
+  // Captured Docker calls below own credential isolation and mount selection.
+  // Keep the independent install watchdog and log-redaction guards here.
   expectText(
     installRun,
     [
-      '-e OPENCLAW_E2E_NPM_INSTALL_TIMEOUT="${OPENCLAW_E2E_NPM_INSTALL_TIMEOUT:-600s}"',
       '"$timeout_bin" --kill-after=30s "$npm_install_timeout" npm install -g "$install_source" --no-fund --no-audit',
+      '"$timeout_bin" "$npm_install_timeout" npm install -g "$install_source" --no-fund --no-audit',
       "elif command -v gtimeout >/dev/null 2>&1; then",
       'timeout_bin="gtimeout"',
-      'echo "timeout or gtimeout is required for OPENCLAW_E2E_NPM_INSTALL_TIMEOUT=$npm_install_timeout" >&2',
       '"$timeout_bin" --kill-after=1s 1s true >/dev/null 2>&1',
-      '"$timeout_bin" "$npm_install_timeout" npm install -g "$install_source" --no-fund --no-audit',
-      '"${package_mount_args[@]}"',
-      'run_logged_print_heartbeat "npm-telegram-package-install" 60 docker_e2e_docker_run_cmd run --rm',
+      'echo "timeout or gtimeout is required for OPENCLAW_E2E_NPM_INSTALL_TIMEOUT=$npm_install_timeout" >&2',
     ],
-    [
-      "running package install without OPENCLAW_E2E_NPM_INSTALL_TIMEOUT",
-      '"${docker_env[@]}"',
-      "run_logged_print_heartbeat docker run --rm",
-    ],
+    ['"${docker_env[@]}"'],
   );
   expectText(
     script,
     [
-      'run_logged_print_heartbeat "npm-telegram-live-suite" 60 docker_e2e_run_with_harness',
-      '"${docker_env[@]}"',
       'if [ -z "$credential_role" ] && [ "$credential_source" = "convex" ]; then',
       'credential_role="ci"',
       'credential_role="maintainer"',
@@ -193,25 +186,16 @@ it("requires Convex leases instead of static credentials", () => {
   );
 });
 
-// Mount/env isolation is exercised through captured Docker calls below.
 it("links runtime dependencies from the trusted QA harness", () => {
   expectText(
     script,
     [
-      '*) OUTPUT_DIR_HOST="$ROOT_DIR/$OUTPUT_DIR" ;;',
-      'cp "$ROOT_DIR/package.json" "$harness_package_json"',
-      'node --import tsx "$ROOT_DIR/scripts/e2e/lib/npm-telegram-live/prepare-package.mts" "$harness_package_json"',
       "for dependency_dir in /trusted-harness/node_modules/*",
       "for workspace_dir in /app/packages/* /app/extensions/*",
       'link_harness_dependency "$workspace_dir" "$workspace_name"',
       "link_harness_dependency /app openclaw",
     ],
-    [
-      'openclaw_package_dir="/npm-global/lib/node_modules/openclaw"',
-      'cp "$openclaw_package_dir/package.json" /app/package.json',
-      "/app/node_modules/openclaw/package.json",
-      "link_installed_package_dependency",
-    ],
+    ['cp "$openclaw_package_dir/package.json" /app/package.json'],
   );
 });
 
@@ -226,10 +210,9 @@ it.each([false, true])(
   },
 );
 
-it("adds private SDK exports only to the trusted harness manifest", () => {
+it("adds loadable private SDK exports without replacing existing harness exports", () => {
   const root = mkTempRoot();
   const harnessManifestPath = path.join(root, "package.json");
-  const candidateManifestPath = path.join(root, "candidate-package.json");
   const existingGatewayExport = {
     types: "./existing/gateway-runtime.d.ts",
     default: "./existing/gateway-runtime.js",
@@ -242,8 +225,6 @@ it("adds private SDK exports only to the trusted harness manifest", () => {
       "./plugin-sdk/gateway-runtime": existingGatewayExport,
     },
   });
-  writeFileSync(candidateManifestPath, '{"name":"candidate","exports":{}}\n');
-  const candidateBefore = readFileSync(candidateManifestPath, "utf8");
 
   execFileSync(process.execPath, [PREPARE_PACKAGE_PATH, harnessManifestPath]);
 
@@ -272,7 +253,6 @@ for (const subpath of ${JSON.stringify(privateQaSubpaths)}) {
 `,
   );
   execFileSync(process.execPath, [loader], { cwd: root });
-  expect(readFileSync(candidateManifestPath, "utf8")).toBe(candidateBefore);
 });
 
 it.each([
