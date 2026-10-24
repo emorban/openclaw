@@ -262,11 +262,10 @@ export function startOpenAiCompatibleStream(params: {
         readOpenAiHttpRunTerminal(result);
       if (runFailed) {
         terminalPhase = "error";
-        if (
-          incompleteTurnText !== undefined &&
-          incompleteTurnText.startsWith(textStream.streamedText)
-        ) {
-          const delta = incompleteTurnText.slice(textStream.streamedText.length);
+        if (incompleteTurnText !== undefined) {
+          const delta = incompleteTurnText.startsWith(textStream.streamedText)
+            ? incompleteTurnText.slice(textStream.streamedText.length)
+            : "";
           if (delta && !params.constraint) {
             params.writeDelta(delta);
           }

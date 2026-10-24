@@ -210,13 +210,19 @@ const surfaces = [
 ] as const;
 
 describe("OpenAI-compatible recovered incomplete turns", () => {
-  it.each(surfaces)(
-    "delivers recovery text with a failure on $endpoint (stream=$stream, requiredTool=$requiredTool)",
-    async ({ endpoint, stream, requiredTool }) => {
+  it.each([
+    ...surfaces.map((surface) => ({ ...surface, divergent: false })),
+    { endpoint: "chat/completions", stream: true, requiredTool: false, divergent: true },
+    { endpoint: "responses", stream: true, requiredTool: false, divergent: true },
+  ] as const)(
+    "delivers recovery text with a failure on $endpoint (stream=$stream, requiredTool=$requiredTool, divergent=$divergent)",
+    async ({ endpoint, stream, requiredTool, divergent }) => {
+      const initialText = divergent ? "I will check the first file." : summary;
+      const expectedStreamText = requiredTool ? "" : divergent ? initialText : finalText;
       agentCommandMock.mockClear();
       agentCommandMock.mockImplementationOnce(async (opts: unknown) => {
         const { runId } = opts as { runId: string };
-        emitAgentEvent({ runId, stream: "assistant", data: { delta: summary } });
+        emitAgentEvent({ runId, stream: "assistant", data: { delta: initialText } });
         emitAgentEvent({
           runId,
           stream: "lifecycle",
@@ -268,7 +274,7 @@ describe("OpenAI-compatible recovered incomplete turns", () => {
               .flatMap((chunk) => chunk.choices ?? [])
               .map((choice) => choice.delta.content ?? "")
               .join(""),
-          ).toBe(requiredTool ? "" : finalText);
+          ).toBe(expectedStreamText);
           expect(chunks.at(-1)).toEqual({
             error: { message: finalText, type: "api_error", code: "incomplete_turn" },
           });
@@ -303,7 +309,7 @@ describe("OpenAI-compatible recovered incomplete turns", () => {
             .filter((event) => event.event === "response.output_text.delta")
             .map((event) => JSON.parse(event.data).delta)
             .join(""),
-        ).toBe(requiredTool ? "" : finalText);
+        ).toBe(expectedStreamText);
         expect(
           events
             .filter(
