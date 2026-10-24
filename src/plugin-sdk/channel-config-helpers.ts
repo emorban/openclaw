@@ -279,6 +279,7 @@ export function createScopedChannelConfigBase<
 }
 
 /** Build the full shared config adapter for account-scoped channels with allowlist/default target accessors. */
+/* oxlint-disable typescript/no-unnecessary-type-parameters -- The public accessor type constrains the no-projection overload. */
 export function createScopedChannelConfigAdapter<
   ResolvedAccount,
   AccessorAccount = ResolvedAccount,
@@ -290,6 +291,7 @@ export function createScopedChannelConfigAdapter<
       allowTopLevel?: boolean;
     } & ([ResolvedAccount] extends [AccessorAccount] ? unknown : never),
 ): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+/* oxlint-enable typescript/no-unnecessary-type-parameters */
 export function createScopedChannelConfigAdapter<
   ResolvedAccount,
   AccessorAccount = ResolvedAccount,
@@ -374,6 +376,7 @@ export function createTopLevelChannelConfigBase<
 }
 
 /** Build the full shared config adapter for top-level single-account channels with allowlist/default target accessors. */
+/* oxlint-disable typescript/no-unnecessary-type-parameters -- The public accessor type constrains the no-projection overload. */
 export function createTopLevelChannelConfigAdapter<
   ResolvedAccount,
   AccessorAccount = ResolvedAccount,
@@ -384,6 +387,7 @@ export function createTopLevelChannelConfigAdapter<
       resolveAccessorAccount?: (params: ChannelConfigAccessorParams<Config>) => ResolvedAccount;
     } & ([ResolvedAccount] extends [AccessorAccount] ? unknown : never),
 ): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+/* oxlint-enable typescript/no-unnecessary-type-parameters */
 export function createTopLevelChannelConfigAdapter<
   ResolvedAccount,
   AccessorAccount = ResolvedAccount,
@@ -456,6 +460,7 @@ export function createHybridChannelConfigBase<
 }
 
 /** Build the full shared config adapter for hybrid channels with allowlist/default target accessors. */
+/* oxlint-disable typescript/no-unnecessary-type-parameters -- The public accessor type constrains the no-projection overload. */
 export function createHybridChannelConfigAdapter<
   ResolvedAccount,
   AccessorAccount = ResolvedAccount,
@@ -467,6 +472,7 @@ export function createHybridChannelConfigAdapter<
       preserveSectionOnDefaultDelete?: boolean;
     } & ([ResolvedAccount] extends [AccessorAccount] ? unknown : never),
 ): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+/* oxlint-enable typescript/no-unnecessary-type-parameters */
 export function createHybridChannelConfigAdapter<
   ResolvedAccount,
   AccessorAccount = ResolvedAccount,
