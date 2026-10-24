@@ -201,20 +201,18 @@ const summary = "Recovered summary of the work so far.";
 const notice = "Warning: the turn reached its output limit before completion (#178525).";
 const finalText = `${summary}\n\n${notice}`;
 const surfaces = [
-  { endpoint: "chat/completions", stream: false, requiredTool: false },
-  { endpoint: "chat/completions", stream: true, requiredTool: false },
-  { endpoint: "responses", stream: false, requiredTool: false },
-  { endpoint: "responses", stream: true, requiredTool: false },
-  { endpoint: "chat/completions", stream: true, requiredTool: true },
-  { endpoint: "responses", stream: true, requiredTool: true },
+  { endpoint: "chat/completions", stream: false, requiredTool: false, divergent: false },
+  { endpoint: "chat/completions", stream: true, requiredTool: false, divergent: false },
+  { endpoint: "responses", stream: false, requiredTool: false, divergent: false },
+  { endpoint: "responses", stream: true, requiredTool: false, divergent: false },
+  { endpoint: "chat/completions", stream: true, requiredTool: true, divergent: false },
+  { endpoint: "responses", stream: true, requiredTool: true, divergent: false },
+  { endpoint: "chat/completions", stream: true, requiredTool: false, divergent: true },
+  { endpoint: "responses", stream: true, requiredTool: false, divergent: true },
 ] as const;
 
 describe("OpenAI-compatible recovered incomplete turns", () => {
-  it.each([
-    ...surfaces.map((surface) => ({ ...surface, divergent: false })),
-    { endpoint: "chat/completions", stream: true, requiredTool: false, divergent: true },
-    { endpoint: "responses", stream: true, requiredTool: false, divergent: true },
-  ] as const)(
+  it.each(surfaces)(
     "delivers recovery text with a failure on $endpoint (stream=$stream, requiredTool=$requiredTool, divergent=$divergent)",
     async ({ endpoint, stream, requiredTool, divergent }) => {
       const initialText = divergent ? "I will check the first file." : summary;
