@@ -349,7 +349,7 @@ it.each(["toggle-archived", "delete"] as const)(
     }
     await selectNativeMenu(menu, action);
     if (action === "delete") {
-      const dialog = await waitForConfirmDialogActions(document.body);
+      const dialog = await waitForConfirmDialogActions();
       expect(h.gateway.snapshot.deferredIntentCount).toBe(0);
       answerConfirmDialog(dialog, "confirm");
     }
@@ -366,25 +366,30 @@ it.each(["toggle-archived", "delete"] as const)(
       expect(h.state.selectedChatSessionArchived).toBe(true);
     }
     h.reconnect();
-    await waitForSolid(() => expect(h.gateway.snapshot.deferredIntentDraining).toBe(false));
     if (action === "delete") {
-      expect(h.pane.onSessionDeleted).toHaveBeenCalledWith(
-        h.pane.paneId,
-        "agent:main:current",
-        "agent:main:main",
-        false,
+      await waitForSolid(() =>
+        expect(h.pane.onSessionDeleted).toHaveBeenCalledWith(
+          h.pane.paneId,
+          "agent:main:current",
+          "agent:main:main",
+          false,
+        ),
       );
     } else {
-      expect(h.writes()).toHaveLength(1);
+      await waitForSolid(() => expect(h.writes()).toHaveLength(1));
       expect(h.state.selectedChatSessionArchived).toBe(true);
     }
+    await waitForSolid(() => expect(h.gateway.snapshot.deferredIntentDraining).toBe(false));
   },
 );
 
 it("a queued delete discards and rolls back the open chat's queued reaction and metadata", async () => {
   const h = await setup();
   h.disconnect();
-  await h.pane.setMessageReaction("message-1", "👍", false);
+  const onReact = h.pane.render().layout?.primary.chat.onReact;
+  assert(onReact);
+  onReact("message-1", "👍", false);
+  await waitForSolid(() => expect(h.gateway.snapshot.deferredIntentCount).toBe(1));
   await h.sessions.patch(
     "agent:main:current",
     { label: "Unsent title" },

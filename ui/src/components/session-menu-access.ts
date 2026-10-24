@@ -116,9 +116,6 @@ export function sessionMenuReasons(params: {
     ? sessionPlacementActionReason(snapshot, params.placementRow, params.requiredProfile)
     : undefined;
   return {
-    ...(snapshot?.phase !== "connected"
-      ? { "toggle-pin": t("sessionsView.actionRequiresConnection") }
-      : {}),
     ...(placementReason ? { "move-session": placementReason } : {}),
     ...(snoozeReason ? { snooze: snoozeReason, wake: snoozeReason } : {}),
     ...(renameReason ? { rename: renameReason } : {}),

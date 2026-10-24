@@ -196,9 +196,9 @@ suite.define(() => {
     });
   });
 
-  it("keeps the session header available while disabling Gateway actions on reconnect", async () => {
+  it("keeps offline session actions and layout controls available while reconnecting", async () => {
     const page = await newPage();
-    const sessionKey = "agent:main:main";
+    const sessionKey = "agent:main:offline-actions";
     const gateway = await installMockGateway(page, { sessionKey });
 
     await page.goto(controlUiSessionUrl(suite.server.baseUrl, sessionKey, "dashboard"));
@@ -229,7 +229,20 @@ suite.define(() => {
     expect(await outlet.getAttribute("aria-disabled")).toBeNull();
     expect(await header.isVisible()).toBe(true);
 
-    expect(await actions.isVisible()).toBe(false);
+    expect(await actions.isVisible()).toBe(true);
+    await actions.click();
+    const archive = page.getByRole("menuitem", { name: "Archive session", exact: true });
+    await archive.waitFor({ state: "visible" });
+    expect(await archive.isEnabled()).toBe(true);
+    expect(
+      await page.getByRole("menuitem", { name: "Mark as unread", exact: true }).isDisabled(),
+    ).toBe(true);
+    await page.getByRole("menuitem", { name: "Advanced", exact: true }).click();
+    const deleteSession = page.getByRole("menuitem", { name: "Delete…", exact: true });
+    await deleteSession.waitFor({ state: "visible" });
+    expect(await deleteSession.isEnabled()).toBe(true);
+    await actions.click();
+    await deleteSession.waitFor({ state: "hidden" });
     expect(await header.getByRole("button", { name: "Details", exact: true }).isEnabled()).toBe(
       true,
     );
@@ -244,6 +257,9 @@ suite.define(() => {
     await panels.click();
     await sideHeader.waitFor({ state: "hidden" });
     await gateway.setOnline(true);
+    await expect
+      .poll(() => page.evaluate(() => window.openclawControlUi?.snapshot().gatewayPhase))
+      .toBe("connected");
     await actions.waitFor();
     await actions.click();
     expect(await split.isEnabled()).toBe(true);

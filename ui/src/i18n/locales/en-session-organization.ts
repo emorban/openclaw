@@ -332,6 +332,7 @@ const enSessionOrganization = {
     deleteSessionMenu: "Delete…",
     deleteSessionCount: "Delete {count}…",
     deleteSessionStale: en.sessionsView.deleteSessionStale,
+    deleteSessionIdentityMissing: en.sessionsView.deleteSessionIdentityMissing,
     deleteSessionsStale: en.sessionsView.deleteSessionsStale,
     groupBy: "Group by",
     groupByNone: "None",

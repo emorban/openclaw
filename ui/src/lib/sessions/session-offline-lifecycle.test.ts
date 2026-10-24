@@ -297,6 +297,22 @@ it("queues one delete per selected session", async () => {
   expect(h.gateway.snapshot.deferredIntentCount).toBe(2);
 });
 
+it("reports targets without an identity while queuing the rest of an offline delete batch", async () => {
+  const h = await setup();
+  h.offline();
+  const missing = { key: "agent:main:missing", agentId: "main" };
+  const result = await h.sessions.deleteMany([missing, { key: "agent:main:offline", ...h.target }]);
+  const message =
+    'Cannot queue deletion of "agent:main:missing" without its session identity. Refresh after reconnecting and try again.';
+  expect(result.errors).toEqual([{ target: missing, error: new Error(message) }]);
+  expect(showToast).toHaveBeenCalledWith({ message });
+  expect(h.sessions.state.error).toBe(message);
+  expect(result.queued).toEqual(["agent:main:offline"]);
+  expect(h.gateway.snapshot.deferredIntentCount).toBe(1);
+  expect(h.sessions.deletionState(missing.key, missing.agentId)).toBeUndefined();
+  expect(h.writes()).toHaveLength(0);
+});
+
 it("moves an offline unarchive to active and restores the archive on rejection", async () => {
   const h = await setup(true);
   h.offline();

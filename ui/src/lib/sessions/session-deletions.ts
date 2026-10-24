@@ -1,5 +1,3 @@
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { GatewayRequestError } from "../../api/gateway.ts";
 import type { GatewaySessionRow, SessionsListResult } from "../../api/types.ts";
 import type { ApplicationGateway } from "../../app/gateway.ts";
 import { t } from "../../i18n/index.ts";
@@ -193,74 +191,33 @@ export function createSessionDeletions(host: DeletionHost) {
     if (deletion.operation) {
       return deletion.operation;
     }
-    const { target } = deletion;
-    const confirmAbsent = async () => {
-      if (!allowAbsent || !host.connection.isCurrent(scope)) {
-        return false;
-      }
-      try {
-        const result = await scope.client.request<{ session: GatewaySessionRow | null }>(
-          "sessions.describe",
-          { key: target.key, agentId: target.agentId },
-        );
-        if (result.session !== null || !host.connection.isCurrent(scope) || !owns(deletion)) {
-          return false;
-        }
-        confirm(deletion, target.key);
-        return true;
-      } catch {
-        // A failed read is not proof that the target is gone.
-        return false;
-      }
-    };
-    deletion.operation = (async () => {
-      try {
-        const response = await requestSessionDelete(scope.client, target.key, target);
-        if (!owns(deletion)) {
-          return { deleted: false };
-        }
-        if (!response.deleted && deletion.phase !== "confirmed") {
-          if (await confirmAbsent()) {
-            return { deleted: true };
-          }
-          if (!owns(deletion)) {
-            return { deleted: false };
-          }
-          rollback(deletion);
-          if (allowAbsent) {
-            reportError(t("sessionsView.deleteSessionStale", { session: target.key }));
-          }
-          return { deleted: false };
-        }
-        confirm(deletion, target.key);
-        return {
-          deleted: true,
-          ...(response.worktreePreserved ? { worktreePreserved: response.worktreePreserved } : {}),
-        };
-      } catch (error) {
-        if (!owns(deletion)) {
-          return { deleted: false };
-        }
-        // A missing expected incarnation (or missing archived row) can reject
-        // before deletion. Permission and other failures must still roll back.
-        if (
-          error instanceof GatewayRequestError &&
-          error.gatewayCode === "INVALID_REQUEST" &&
-          ((isRecord(error.details) && error.details.reason === "session-changed") ||
-            error.message ===
-              `Session ${target.key} is not archived. Archive it first, then delete it.`) &&
-          (await confirmAbsent())
-        ) {
-          return { deleted: true };
-        }
+    // Admit the write synchronously; only settlement needs the lazy runtime.
+    const response = new Promise<Awaited<ReturnType<typeof requestSessionDelete>>>((resolve) => {
+      resolve(requestSessionDelete(scope.client, deletion.target.key, deletion.target));
+    }).then(
+      (result) => ({ result }),
+      (error: unknown) => ({ error }),
+    );
+    deletion.operation = import("./session-delete-operation.ts").then(
+      ({ settleSessionDelete }) => {
+        return settleSessionDelete(response, deletion.target, scope, allowAbsent, {
+          isCurrent: () => host.connection.isCurrent(scope),
+          owns: () => owns(deletion),
+          confirmed: () => deletion.phase === "confirmed",
+          confirm: () => confirm(deletion, deletion.target.key),
+          rollback: () => rollback(deletion),
+          reportError,
+        });
+      },
+      (error: unknown) => {
         if (!owns(deletion)) {
           return { deleted: false };
         }
         rollback(deletion);
         reportError(formatUiError(error));
         throw error;
-      }
-    })();
+      },
+    );
     return deletion.operation;
   };
 
@@ -278,6 +235,10 @@ export function createSessionDeletions(host: DeletionHost) {
         const record = begin({ ...target });
         if (!record.sessionId?.trim()) {
           rollback(record);
+          const error = new Error(
+            t("sessionsView.deleteSessionIdentityMissing", { session: target.key }),
+          );
+          result.errors.push({ target, error });
           continue;
         }
         record.target.expectedSessionId ??= record.sessionId;
@@ -344,6 +305,9 @@ export function createSessionDeletions(host: DeletionHost) {
         }
       }
       publish();
+      if (result.errors.length > 0) {
+        reportError(result.errors.map(({ error }) => formatUiError(error)).join("; "));
+      }
       return result;
     }
     // Claim the complete selection before the first RPC. Cloud teardown may

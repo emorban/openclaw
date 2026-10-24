@@ -70,12 +70,12 @@ describe("session organizer nested archive choice", () => {
   it("confirms only the selected offline parent without discovering or archiving its subtree", async () => {
     const h = createHarness({ phase: "reconnecting" });
     h.scope.allowDeferred = true;
-    const root = sessionRow(0, { hasArchiveDescendants: true });
+    const root = { ...sessionRow(0), hasArchiveDescendants: true };
     const tree = prepareArchiveTree(h, [gatewayRow(0), gatewayRow(1)]);
     const modal = createModalDialogTestFixture();
     onTestFinished(() => modal.cleanup());
     const pending = modal.track(confirmSessionArchive(root, h.scope, () => true));
-    const dialog = await waitForConfirmDialogActions(document.body);
+    const dialog = await waitForConfirmDialogActions();
     expect(document.body.textContent).toContain("Reconnect to archive the complete subtree.");
     answerConfirmDialog(dialog, "confirm");
     await expect(pending).resolves.toEqual({ kind: "single" });

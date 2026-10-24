@@ -50,7 +50,7 @@ describe("patchSessionRows", () => {
       const h = createHarness({ phase });
       h.scope.gateway.snapshot.deferredIntentCount = 1;
       const row = {
-        ...makeRow(1),
+        ...sessionRow(1),
         archiveGuard: { expectedArchived: false },
       };
       const result = await patchSessionRows(h.host, [row], { archived: true }, h.scope, {
@@ -73,7 +73,7 @@ describe("patchSessionRows", () => {
     const h = createHarness({ phase: "reconnecting" });
     h.scope.allowDeferred = true;
     h.scope.sessions.patch = vi.fn(async () => ({ queued: true as const }));
-    const rows = [makeRow(0), makeRow(1)];
+    const rows = [sessionRow(0), sessionRow(1)];
     await expect(
       patchSessionRows(h.host, rows, { archived: true }, h.scope, { sessionScope: true }),
     ).resolves.toEqual(rows);

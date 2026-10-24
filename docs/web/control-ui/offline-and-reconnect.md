@@ -28,6 +28,8 @@ message reaction additions or removals appear immediately. Archived sessions mov
 out of the active list, unarchived sessions return, and deleted sessions disappear.
 Archive and delete keep their confirmation dialogs while offline. Multi-select
 archive and delete queue one change per selected session.
+Deletion requires a known session identity. If it is unavailable, the UI shows an
+error and asks you to refresh after reconnecting; other selected sessions still queue.
 The connection status in the sidebar footer counts these
 changes together with queued chat messages. Repeated changes to the same fields
 or reaction replace the earlier queued change and move to the end of the queue,
@@ -55,11 +57,12 @@ offline access discards the queue and shows how many changes were discarded.
 Chat drafts and chat messages retain their separate storage and recovery rules.
 
 Other actions do not use this queue: creating categories, moving sessions between
-projects or workspaces, pinning, sharing or visibility changes, approvals, settings
+projects or workspaces, shared pins, sharing or visibility changes, approvals, settings
 or model changes, and terminal actions still need their existing live connection
 and authority. Discovering and archiving a complete nested subtree also requires
 a connection; offline archive targets only the selected rows. Workspace recovery
 and removal of preserved worktrees are not queued.
+Personal sidebar pins remain usable offline without this queue.
 
 ## Busy initial connection
 

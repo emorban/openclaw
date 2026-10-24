@@ -126,9 +126,6 @@ export class SessionOrganizer {
   ): Promise<unknown> {
     switch (action.kind) {
       case "toggle-pin":
-        if (!this.deps.sessionData.beginSessionMutation()) {
-          return undefined;
-        }
         return this.setPersonalSessionPin(session.key, !this.isPersonalSessionPin(session.key));
       case "toggle-unread":
         return session.subagentSummary?.unreadHiddenRuns?.length

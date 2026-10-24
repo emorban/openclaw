@@ -341,6 +341,7 @@ type EnglishCatalog = TranslationMap & {
       | "archiveSession"
       | "restoreSession"
       | "deleteSessionStale"
+      | "deleteSessionIdentityMissing"
       | "deleteSessionsStale"
       | "groupMenu"
       | "groupOptions"
@@ -793,6 +794,8 @@ const startupEnglish = {
     archiveSession: "Archive session",
     restoreSession: "Restore session",
     deleteSessionStale: 'Gateway connection replaced before "{session}" was deleted. Try again.',
+    deleteSessionIdentityMissing:
+      'Cannot queue deletion of "{session}" without its session identity. Refresh after reconnecting and try again.',
     deleteSessionsStale:
       "Gateway connection replaced before {count} sessions were deleted. Try again.",
     groupMenu: "Group options for {group}",

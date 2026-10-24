@@ -36,7 +36,7 @@ it.each([false, true])(
     expect(menuItem(menu, batch ? "Archive 2" : "Archive session").disabled).toBe(false);
     expect(menuItem(menu, batch ? "Delete 2…" : "Delete…").disabled).toBe(false);
     expect(readReasons()["new-group"]).toBeDefined();
-    expect(readReasons()["toggle-pin"]).toBeDefined();
+    expect(readReasons()["toggle-pin"]).toBeUndefined();
     store.gateway.stop();
     menu.actionDisabledReasons = readReasons();
     await settleSessionMenu(menu);
