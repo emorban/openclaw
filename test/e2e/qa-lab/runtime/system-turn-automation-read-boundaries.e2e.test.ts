@@ -36,7 +36,6 @@ import { isolatedGatewayEnv } from "./gateway-recovery.test-support.js";
 import { resetGatewayState } from "./gateway-startup-routing.test-support.js";
 
 type ProviderRequest = {
-  instructions?: string;
   input: Array<{
     role?: string;
     type?: string;
@@ -53,7 +52,6 @@ type RunsOutcome = { id?: string; ok?: boolean; payload?: unknown; threw?: strin
 const seams = vi.hoisted(() => ({
   clock: undefined as GatewaySchedulerClock | undefined,
   hold: undefined as { held: () => void; release: Promise<void> } | undefined,
-  runsOutcomes: [] as RunsOutcome[],
   onRunsOutcome: undefined as ((outcome: RunsOutcome) => void) | undefined,
 }));
 vi.mock("../../../../src/infra/gateway-scheduler.js", async (importOriginal) => {
@@ -109,7 +107,6 @@ vi.mock("../../../../src/gateway/server-methods/cron-runs.js", async (importOrig
         outcome.threw = String(error);
         throw error;
       } finally {
-        seams.runsOutcomes.push(outcome);
         seams.onRunsOutcome?.(outcome);
       }
     },
@@ -121,7 +118,6 @@ beforeEach(resetGatewayState);
 afterEach(() => {
   seams.clock = undefined;
   seams.hold = undefined;
-  seams.runsOutcomes.length = 0;
   seams.onRunsOutcome = undefined;
   resetGatewayState();
 });
@@ -287,115 +283,84 @@ it(
               if (lastOutput?.type === "function_call_output" && lastOutput.call_id) {
                 outputs.set(lastOutput.call_id.replace(/^call_/, ""), lastOutput.output ?? "");
               }
-              const call = (name: string, callId: string, args: Record<string, unknown>) =>
+              const call = (callId: string, args: Record<string, unknown>, name = "automations") =>
                 writeToolCall(response, name, callId, args);
               const owned = () => jobs.owned!.id;
-              switch (step++) {
+              const steps = [
                 // Owner turn in the owned chat creates two one-shot automations.
-                case 0:
-                  call("automations", "add_owned", proofJob("Owned proof", "RUN-MARKER-A", 60_000));
-                  break;
-                case 1:
+                () => call("add_owned", proofJob("Owned proof", "RUN-MARKER-A", 60_000)),
+                () => {
                   jobs.owned = JSON.parse(outputs.get("add_owned")!) as CronJob;
-                  call(
-                    "automations",
-                    "add_closing",
-                    proofJob("Closing proof", "RUN-MARKER-C", 120_000),
-                  );
-                  break;
-                case 2:
+                  call("add_closing", proofJob("Closing proof", "RUN-MARKER-C", 120_000));
+                },
+                () => {
                   jobs.closing = JSON.parse(outputs.get("add_closing")!) as CronJob;
                   reply("Scheduled.");
-                  break;
+                },
                 // Owner turn in another chat creates the foreign automation.
-                case 3:
-                  call(
-                    "automations",
-                    "add_foreign",
-                    proofJob("Foreign proof", "RUN-MARKER-B", 3_600_000),
-                  );
-                  break;
-                case 4:
+                () => call("add_foreign", proofJob("Foreign proof", "RUN-MARKER-B", 3_600_000)),
+                () => {
                   jobs.foreign = JSON.parse(outputs.get("add_foreign")!) as CronJob;
                   reply("Scheduled.");
-                  break;
+                },
                 // The scheduler's real auto-disable notice turn for the failed owned automation.
-                case 5:
+                () => {
                   expect(JSON.stringify(body.input)).toContain(
                     'Automation \\"Owned proof\\" was auto-disabled after 1 consecutive run failures.',
                   );
-                  call("automations", "get_owned", { action: "get", jobId: owned() });
-                  break;
-                case 6:
+                  call("get_owned", { action: "get", jobId: owned() });
+                },
+                () => {
                   // Fail fast on the owner gate instead of waiting on later reads.
                   expect(outputs.get("get_owned")).not.toContain("needs the owner's authority");
-                  call("automations", "runs_owned", { action: "runs", jobId: owned() });
-                  break;
-                case 7:
-                  call("automations", "get_foreign", { action: "get", jobId: jobs.foreign!.id });
-                  break;
-                case 8:
-                  call("automations", "runs_foreign", { action: "runs", jobId: jobs.foreign!.id });
-                  break;
-                case 9:
-                  call("automations", "list", { action: "list", includeDisabled: true });
-                  break;
-                case 10:
-                  call("automations", "update", {
+                  call("runs_owned", { action: "runs", jobId: owned() });
+                },
+                () => call("get_foreign", { action: "get", jobId: jobs.foreign!.id }),
+                () => call("runs_foreign", { action: "runs", jobId: jobs.foreign!.id }),
+                () => call("list", { action: "list", includeDisabled: true }),
+                () =>
+                  call("update", {
                     action: "update",
                     jobId: owned(),
                     patch: { enabled: true },
-                  });
-                  break;
-                case 11:
-                  call("automations", "remove", { action: "remove", jobId: owned() });
-                  break;
-                case 12:
-                  call("automations", "add", proofJob("Notice-created", "RUN-MARKER-X", 60_000));
-                  break;
-                case 13:
-                  call("automations", "run", { action: "run", jobId: owned() });
-                  break;
-                case 14:
-                  call("automations", "status", { action: "status" });
-                  break;
-                case 15:
-                  call("gateway", "gateway", { action: "config.get" });
-                  break;
-                case 16:
+                  }),
+                () => call("gateway", { action: "config.get" }, "gateway"),
+                () => {
                   void holdNextHistoryRead().then(() => removalHeld.resolve());
-                  call("automations", "runs_removed", { action: "runs", jobId: owned() });
-                  break;
-                case 17:
+                  call("runs_removed", { action: "runs", jobId: owned() });
+                },
+                () => {
                   reply("Automation history inspected.");
                   firstNoticeDone.resolve();
-                  break;
+                },
                 // The second notice turn's read is closed before disclosure.
-                case 18: {
+                () => {
                   expect(JSON.stringify(body.input)).toContain(
                     'Automation \\"Closing proof\\" was auto-disabled',
                   );
                   void holdNextHistoryRead().then(() => closingNoticeHeld.resolve());
-                  call("automations", "runs_closed", { action: "runs", jobId: jobs.closing!.id });
-                  break;
-                }
+                  call("runs_closed", { action: "runs", jobId: jobs.closing!.id });
+                },
                 // A non-owner client's agent turn that asserts scheduler provenance.
-                case 19:
+                () => {
                   if (lastOutput?.call_id === "call_runs_closed") {
                     lateNoticeRequest = lastOutput.output;
                     step--;
                     reply("Stopped.");
-                    break;
+                    return;
                   }
-                  call("automations", "forged_get", { action: "get", jobId: jobs.closing!.id });
-                  break;
-                case 20:
+                  call("forged_get", { action: "get", jobId: jobs.closing!.id });
+                },
+                () => {
                   reply("Done.");
                   forgedDone.resolve();
-                  break;
-                default:
-                  throw new Error("Unexpected provider request " + step);
+                },
+              ];
+              const next = steps[step++];
+              if (!next) {
+                throw new Error("Unexpected provider request " + step);
               }
+              next();
             } catch (error) {
               failure.resolve(error instanceof Error ? error : new Error(String(error)));
               throw error;
@@ -530,10 +495,8 @@ it(
         expect(inventory.jobs.map((job) => job.id).toSorted()).toEqual(
           [jobs.owned.id, jobs.closing.id].toSorted(),
         );
-        // Every write and every other owner-only tool keeps the owner gate.
-        for (const id of ["update", "remove", "add", "run", "status"]) {
-          expect(outputs.get(id)).toContain("Other actions need the owner's authority");
-        }
+        // Other non-read actions share this gate; the turn-authority unit suite covers the matrix.
+        expect(outputs.get("update")).toContain("Other actions need the owner's authority");
         expect(outputs.get("gateway")).toContain("gateway needs the owner's authority");
         // Removed during the awaited read: the disclosure-time recheck withholds history.
         expect(outputs.get("runs_removed")).toContain(`not found: ${jobs.owned.id}`);

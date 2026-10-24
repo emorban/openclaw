@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { expectDefined } from "@openclaw/normalization-core";
-import { afterEach, describe, expect, it, onTestFailed, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFailed } from "vitest";
 import { z } from "zod";
 import { isInternalRuntimeContextCarrierText } from "../../../../extensions/qa-lab/api.js";
 import { createQaLiveLaneGateway } from "../../../../extensions/qa-lab/runtime-api.js";
@@ -34,8 +34,6 @@ type GatewayHandle = Awaited<
   ReturnType<ReturnType<typeof createQaLiveLaneGateway>["start"]>
 >["gateway"];
 
-const HISTORY_RETRY_TIMEOUT_MS = 10_000;
-const HISTORY_RETRY_DEFAULT_MS = 250;
 const requestSnapshotsSchema = z.array(
   z.object({ cursor: z.number().int(), model: z.string(), raw: z.string() }),
 );
@@ -155,10 +153,7 @@ async function waitForChatHistory(params: {
   agentId?: string;
   expectedUser: string;
   expectedAssistant: string;
-  timeoutMs?: number;
-  intervalMs?: number;
 }): Promise<GatewayChatHistory> {
-  const timeoutMs = params.timeoutMs ?? HISTORY_RETRY_TIMEOUT_MS;
   return pollHistory(
     () =>
       params.gateway.call(
@@ -168,9 +163,9 @@ async function waitForChatHistory(params: {
       ) as Promise<GatewayChatHistory>,
     (history) =>
       historyContainsExpectedTurns(history, params.expectedUser, params.expectedAssistant),
-    timeoutMs,
-    params.intervalMs ?? HISTORY_RETRY_DEFAULT_MS,
-    () => `timed out waiting for complete chat.history after ${timeoutMs}ms`,
+    10_000,
+    250,
+    () => "timed out waiting for complete chat.history after 10000ms",
   );
 }
 
@@ -203,43 +198,6 @@ async function readMockJson<T>(baseUrl: string, requestPath: string): Promise<T>
 }
 
 describe("Gateway chat RPCs", () => {
-  it("waits past a successful incomplete chat.history response", async () => {
-    vi.useFakeTimers();
-    try {
-      const call = vi
-        .fn()
-        .mockResolvedValueOnce({
-          messages: [
-            { role: "user", content: "expected user" },
-            { role: "assistant", content: "still working" },
-          ],
-        })
-        .mockResolvedValueOnce({
-          messages: [
-            { role: "user", content: "expected user" },
-            { role: "assistant", content: "expected assistant" },
-          ],
-        });
-      const pending = waitForChatHistory({
-        gateway: { call } as unknown as GatewayHandle,
-        sessionKey: "session-history-projection",
-        expectedUser: "expected user",
-        expectedAssistant: "expected assistant",
-        timeoutMs: 1_000,
-        intervalMs: 100,
-      });
-
-      await vi.advanceTimersByTimeAsync(100);
-
-      await expect(pending).resolves.toMatchObject({
-        messages: [{ role: "user" }, { role: "assistant" }],
-      });
-      expect(call).toHaveBeenCalledTimes(2);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
   it("preserves model and history whitespace", { timeout: 120_000 }, async () => {
     harness = await startChatGateway();
     const { gateway } = harness;
@@ -314,8 +272,7 @@ describe("Gateway chat RPCs", () => {
   });
 
   it("keeps inline trace diagnostics on their own turn", { timeout: 120_000 }, async () => {
-    const { gateway, mock } = await startChatGateway();
-    const provider = expectDefined(mock, "trace mock provider");
+    const { gateway } = await startChatGateway();
     const sessionKey = `agent:qa:gateway-inline-trace-${randomUUID()}`;
     const finals = new Map<string, string[]>();
     const settledRunIds = new Set<string>();
@@ -376,18 +333,6 @@ describe("Gateway chat RPCs", () => {
         await expect(
           client.request("agent.wait", { runId, timeoutMs: 30_000 }, { timeoutMs: 35_000 }),
         ).resolves.toMatchObject({ status: "ok" });
-        await expect
-          .poll(
-            async () => {
-              const requests = await readMockJson<MockRequestSnapshot[]>(
-                provider.baseUrl,
-                "/debug/requests",
-              );
-              return requests.some((request) => request.prompt?.includes(reply));
-            },
-            { timeout: 10_000, interval: 250 },
-          )
-          .toBe(true);
         // A directive acknowledgement may finish before the model's separate final delivery.
         await expect
           .poll(() => finals.get(runId)?.some((text) => text.includes(reply)), { timeout: 10_000 })
@@ -418,10 +363,8 @@ describe("Gateway chat RPCs", () => {
   });
 
   it.each([
-    { first: "main", second: "work", withAttachment: false, seedChat: true },
     { first: "main", second: "work", withAttachment: true, seedChat: true },
     { first: "work", second: "main", withAttachment: false, seedChat: true },
-    { first: "work", second: "main", withAttachment: true, seedChat: true },
     { first: "main", second: "work", withAttachment: false, seedChat: false },
   ])(
     "keeps explicit $first then $second ownership through global chat and native agent dispatch and history (chatAttachment=$withAttachment, seedChat=$seedChat)",

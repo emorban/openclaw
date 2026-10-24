@@ -100,28 +100,12 @@ describe("node worker launch wire", () => {
       let finalizationStartedAt: number | undefined;
       let resolveWaveFinalizationStarted: ((startedAt: number) => void) | undefined;
       let workerAuditBeforeRestart: string | undefined;
-      let cleanupStartedAfterMs: number | undefined;
       const baselineStatusObserved = createDeferred();
-      const pendingCleanupOwners = new Set<string>();
       const loadTerminals = new Map<string, (payload: Record<string, unknown>) => void>();
       let phase = "provider startup";
       const markPhase = (next: string) => {
         phase = next;
-        process.stderr.write(
-          `[node-worker-launch-wire] ${JSON.stringify({
-            elapsedMs: Math.round(performance.now() - testStartedAt),
-            phase,
-            aborted: context.signal.aborted,
-            cleanupStartedAfterMs,
-          })}\n`,
-        );
       };
-      markPhase(phase);
-      const onAbort = () => markPhase(phase);
-      context.signal.addEventListener("abort", onAbort, { once: true });
-      context.onTestFinished(() => {
-        context.signal.removeEventListener("abort", onAbort);
-      });
       onTestFailed(() => {
         process.stderr.write(
           redactSensitiveText(
@@ -129,8 +113,6 @@ describe("node worker launch wire", () => {
               phase,
               elapsedMs: Math.round(performance.now() - testStartedAt),
               providerRequestCount: provider?.requestCount,
-              cleanupStartedAfterMs,
-              pendingCleanupOwners: [...pendingCleanupOwners],
               nodeCommands: workerNode?.commands.slice(-20),
               nodeErrors: workerNode?.invokeErrors.map(String),
               legacyNodeCommands: legacyWorkerNode?.commands.slice(-20),
@@ -746,24 +728,15 @@ describe("node worker launch wire", () => {
         },
         async () => {
           baselineStatusObserved.resolve();
-          cleanupStartedAfterMs = Math.round(performance.now() - testStartedAt);
           markPhase("fixture cleanup start");
-          const cleanups = {
-            workerNode: workerNode?.stop(),
-            legacyWorkerNode: legacyWorkerNode?.stop(),
-            operator: operator?.stopAndWait({ timeoutMs: 2_000 }),
-            gateway: stopQaGatewayFixture(gatewayOwner),
-            provider: provider?.stop(),
-            publishedWorkspace: publishedResource
-              ? closeWireServer(publishedResource.server)
-              : undefined,
-          };
-          const cleanup = await Promise.allSettled(
-            Object.entries(cleanups).map(([name, completion]) => {
-              pendingCleanupOwners.add(name);
-              return Promise.resolve(completion).finally(() => pendingCleanupOwners.delete(name));
-            }),
-          );
+          const cleanup = await Promise.allSettled([
+            workerNode?.stop(),
+            legacyWorkerNode?.stop(),
+            operator?.stopAndWait({ timeoutMs: 2_000 }),
+            stopQaGatewayFixture(gatewayOwner),
+            provider?.stop(),
+            publishedResource ? closeWireServer(publishedResource.server) : undefined,
+          ]);
           const failures = cleanup.flatMap((result) =>
             result.status === "rejected" ? [result.reason] : [],
           );
