@@ -86,16 +86,39 @@ type ChannelConfigAccessorParams<Config extends OpenClawConfig = OpenClawConfig>
   accountId?: string | null;
 };
 
-type MultiAccountChannelConfigAdapterParams<
-  ResolvedAccount,
-  AccessorAccount = ResolvedAccount,
-  Config extends OpenClawConfig = OpenClawConfig,
-> = NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> & {
-  resolveAccessorAccount?: (params: ChannelConfigAccessorParams<Config>) => AccessorAccount;
+type ChannelAccountAccessors<AccessorAccount> = {
   resolveAllowFrom: (account: AccessorAccount) => Array<string | number> | null | undefined;
   formatAllowFrom: (allowFrom: Array<string | number>) => string[];
   resolveDefaultTo?: (account: AccessorAccount) => string | number | null | undefined;
 };
+
+type ResolvedAccountAccessors<ResolvedAccount> = ChannelAccountAccessors<ResolvedAccount> & {
+  resolveAccessorAccount?: undefined;
+};
+
+type ProjectedAccountAccessors<
+  AccessorAccount,
+  Config extends OpenClawConfig,
+> = ChannelAccountAccessors<AccessorAccount> & {
+  resolveAccessorAccount: (params: ChannelConfigAccessorParams<Config>) => AccessorAccount;
+};
+
+type ChannelAccountAccessorOptions<
+  ResolvedAccount,
+  AccessorAccount,
+  Config extends OpenClawConfig,
+> =
+  | (ChannelAccountAccessors<ResolvedAccount> & {
+      resolveAccessorAccount?: (params: ChannelConfigAccessorParams<Config>) => ResolvedAccount;
+    } & ([ResolvedAccount] extends [AccessorAccount] ? unknown : never))
+  | ProjectedAccountAccessors<AccessorAccount, Config>;
+
+type MultiAccountChannelConfigAdapterParams<
+  ResolvedAccount,
+  AccessorAccount,
+  Config extends OpenClawConfig,
+> = NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> &
+  (ResolvedAccountAccessors<ResolvedAccount> | ProjectedAccountAccessors<AccessorAccount, Config>);
 
 type NamedAccountChannelConfigBaseParams<
   ResolvedAccount,
@@ -187,23 +210,32 @@ function createChannelConfigAdapterFromBase<
   ResolvedAccount,
   AccessorAccount,
   Config extends OpenClawConfig = OpenClawConfig,
->(params: {
-  base: ChannelCrudConfigAdapter<ResolvedAccount>;
-  resolveAccessorAccount?: (params: ChannelConfigAccessorParams<Config>) => AccessorAccount;
-  resolveAccountForAccessors: (params: ChannelConfigAccessorParams<Config>) => AccessorAccount;
-  resolveAllowFrom: (account: AccessorAccount) => Array<string | number> | null | undefined;
-  formatAllowFrom: (allowFrom: Array<string | number>) => string[];
-  resolveDefaultTo?: (account: AccessorAccount) => string | number | null | undefined;
-}): ChannelConfigAdapterWithAccessors<ResolvedAccount> {
+>(
+  params: {
+    base: ChannelCrudConfigAdapter<ResolvedAccount>;
+    resolveAccountForAccessors: (params: ChannelConfigAccessorParams<Config>) => ResolvedAccount;
+  } & (
+    | ResolvedAccountAccessors<ResolvedAccount>
+    | ProjectedAccountAccessors<AccessorAccount, Config>
+  ),
+): ChannelConfigAdapterWithAccessors<ResolvedAccount> {
+  const accessors =
+    params.resolveAccessorAccount != null
+      ? createScopedAccountConfigAccessors<AccessorAccount, Config>({
+          resolveAccount: params.resolveAccessorAccount,
+          resolveAllowFrom: params.resolveAllowFrom,
+          formatAllowFrom: params.formatAllowFrom,
+          resolveDefaultTo: params.resolveDefaultTo,
+        })
+      : createScopedAccountConfigAccessors<ResolvedAccount, Config>({
+          resolveAccount: params.resolveAccountForAccessors,
+          resolveAllowFrom: params.resolveAllowFrom,
+          formatAllowFrom: params.formatAllowFrom,
+          resolveDefaultTo: params.resolveDefaultTo,
+        });
   return {
     ...params.base,
-    ...createScopedAccountConfigAccessors<AccessorAccount, Config>({
-      // Read-only accessors prefer a lighter projection over runtime account setup.
-      resolveAccount: params.resolveAccessorAccount ?? params.resolveAccountForAccessors,
-      resolveAllowFrom: params.resolveAllowFrom,
-      formatAllowFrom: params.formatAllowFrom,
-      resolveDefaultTo: params.resolveDefaultTo,
-    }),
+    ...accessors,
   };
 }
 
@@ -252,6 +284,37 @@ export function createScopedChannelConfigAdapter<
   AccessorAccount = ResolvedAccount,
   Config extends OpenClawConfig = OpenClawConfig,
 >(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> &
+    ChannelAccountAccessors<ResolvedAccount> & {
+      resolveAccessorAccount?: (params: ChannelConfigAccessorParams<Config>) => ResolvedAccount;
+      allowTopLevel?: boolean;
+    } & ([ResolvedAccount] extends [AccessorAccount] ? unknown : never),
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createScopedChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> &
+    ProjectedAccountAccessors<AccessorAccount, Config> & {
+      allowTopLevel?: boolean;
+    },
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createScopedChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> &
+    ChannelAccountAccessorOptions<ResolvedAccount, AccessorAccount, Config> & {
+      allowTopLevel?: boolean;
+    },
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createScopedChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
   params: MultiAccountChannelConfigAdapterParams<ResolvedAccount, AccessorAccount, Config> & {
     allowTopLevel?: boolean;
   },
@@ -260,7 +323,7 @@ export function createScopedChannelConfigAdapter<
     ...params,
     base: createScopedChannelConfigBase<ResolvedAccount, Config>({ ...params }),
     resolveAccountForAccessors({ cfg, accountId }) {
-      return params.resolveAccount(cfg, accountId) as unknown as AccessorAccount;
+      return params.resolveAccount(cfg, accountId);
     },
   });
 }
@@ -316,18 +379,43 @@ export function createTopLevelChannelConfigAdapter<
   AccessorAccount = ResolvedAccount,
   Config extends OpenClawConfig = OpenClawConfig,
 >(
-  params: Parameters<typeof createTopLevelChannelConfigBase<ResolvedAccount, Config>>[0] & {
-    resolveAccessorAccount?: (params: ChannelConfigAccessorParams<Config>) => AccessorAccount;
-    resolveAllowFrom: (account: AccessorAccount) => Array<string | number> | null | undefined;
-    formatAllowFrom: (allowFrom: Array<string | number>) => string[];
-    resolveDefaultTo?: (account: AccessorAccount) => string | number | null | undefined;
-  },
+  params: Parameters<typeof createTopLevelChannelConfigBase<ResolvedAccount, Config>>[0] &
+    ChannelAccountAccessors<ResolvedAccount> & {
+      resolveAccessorAccount?: (params: ChannelConfigAccessorParams<Config>) => ResolvedAccount;
+    } & ([ResolvedAccount] extends [AccessorAccount] ? unknown : never),
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createTopLevelChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: Parameters<typeof createTopLevelChannelConfigBase<ResolvedAccount, Config>>[0] &
+    ProjectedAccountAccessors<AccessorAccount, Config>,
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createTopLevelChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: Parameters<typeof createTopLevelChannelConfigBase<ResolvedAccount, Config>>[0] &
+    ChannelAccountAccessorOptions<ResolvedAccount, AccessorAccount, Config>,
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createTopLevelChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: Parameters<typeof createTopLevelChannelConfigBase<ResolvedAccount, Config>>[0] &
+    (
+      | ResolvedAccountAccessors<ResolvedAccount>
+      | ProjectedAccountAccessors<AccessorAccount, Config>
+    ),
 ): ChannelConfigAdapterWithAccessors<ResolvedAccount> {
   return createChannelConfigAdapterFromBase<ResolvedAccount, AccessorAccount, Config>({
     ...params,
     base: createTopLevelChannelConfigBase<ResolvedAccount, Config>({ ...params }),
     resolveAccountForAccessors({ cfg }) {
-      return params.resolveAccount(cfg) as unknown as AccessorAccount;
+      return params.resolveAccount(cfg);
     },
   });
 }
@@ -373,6 +461,37 @@ export function createHybridChannelConfigAdapter<
   AccessorAccount = ResolvedAccount,
   Config extends OpenClawConfig = OpenClawConfig,
 >(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> &
+    ChannelAccountAccessors<ResolvedAccount> & {
+      resolveAccessorAccount?: (params: ChannelConfigAccessorParams<Config>) => ResolvedAccount;
+      preserveSectionOnDefaultDelete?: boolean;
+    } & ([ResolvedAccount] extends [AccessorAccount] ? unknown : never),
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createHybridChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> &
+    ProjectedAccountAccessors<AccessorAccount, Config> & {
+      preserveSectionOnDefaultDelete?: boolean;
+    },
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createHybridChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> &
+    ChannelAccountAccessorOptions<ResolvedAccount, AccessorAccount, Config> & {
+      preserveSectionOnDefaultDelete?: boolean;
+    },
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createHybridChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
   params: MultiAccountChannelConfigAdapterParams<ResolvedAccount, AccessorAccount, Config> & {
     preserveSectionOnDefaultDelete?: boolean;
   },
@@ -381,7 +500,7 @@ export function createHybridChannelConfigAdapter<
     ...params,
     base: createHybridChannelConfigBase<ResolvedAccount, Config>({ ...params }),
     resolveAccountForAccessors({ cfg, accountId }) {
-      return params.resolveAccount(cfg, accountId) as unknown as AccessorAccount;
+      return params.resolveAccount(cfg, accountId);
     },
   });
 }

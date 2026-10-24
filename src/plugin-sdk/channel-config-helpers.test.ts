@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import type { ChannelConfigAdapter } from "../channels/plugins/types.adapters.js";
 import { DEFAULT_ACCOUNT_ID } from "../routing/session-key.js";
 import {
@@ -213,6 +213,52 @@ it("createScopedChannelConfigBase wires shared account config CRUD through the s
 });
 
 describe("createScopedChannelConfigAdapter", () => {
+  it("requires a producer for a distinct accessor account shape", () => {
+    type RuntimeAccount = { token: string };
+    type AccessorAccount = { allowFrom: string[] };
+    type MissingProjection = {
+      sectionKey: string;
+      listAccountIds: () => string[];
+      resolveAccount: () => RuntimeAccount;
+      defaultAccountId: () => string;
+      clearBaseFields: string[];
+      resolveAllowFrom: (account: AccessorAccount) => string[];
+      formatAllowFrom: (entries: Array<string | number>) => string[];
+    };
+    expectTypeOf<MissingProjection>().not.toMatchTypeOf<
+      Parameters<typeof createScopedChannelConfigAdapter<RuntimeAccount, AccessorAccount>>[0]
+    >();
+    expectTypeOf<MissingProjection>().not.toMatchTypeOf<
+      Parameters<typeof createHybridChannelConfigAdapter<RuntimeAccount, AccessorAccount>>[0]
+    >();
+    expectTypeOf<MissingProjection>().not.toMatchTypeOf<
+      Parameters<typeof createTopLevelChannelConfigAdapter<RuntimeAccount, AccessorAccount>>[0]
+    >();
+  });
+
+  it.each([false, true])("accepts an optional same-account resolver: %s", (useProjection) => {
+    const runtimeAccount = { allowFrom: ["runtime"] };
+    const projectedAccount = { allowFrom: ["projection"] };
+    const resolveAccessorAccount = useProjection ? () => projectedAccount : undefined;
+    const params = {
+      ...namedAccountBase,
+      resolveAccount: () => runtimeAccount,
+      resolveAccessorAccount,
+      resolveAllowFrom: (account: typeof runtimeAccount) => account.allowFrom,
+      formatAllowFrom: mapAllowFromEntries,
+    };
+    const adapters = [
+      createScopedChannelConfigAdapter(params),
+      createHybridChannelConfigAdapter(params),
+      createTopLevelChannelConfigAdapter(params),
+    ];
+    for (const adapter of adapters) {
+      expect(adapter.resolveAllowFrom?.({ cfg: {} })).toEqual([
+        useProjection ? "projection" : "runtime",
+      ]);
+    }
+  });
+
   it("combines scoped CRUD and allowFrom accessors", () => {
     const adapter = createScopedChannelConfigAdapter({
       ...namedAccountBase,
