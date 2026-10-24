@@ -1,10 +1,10 @@
+import path from "node:path";
+import type { Worker } from "node:worker_threads";
 import type {
   WorkerTaskChannel,
   WorkerTaskControl,
   WorkerTaskHandler,
 } from "@openclaw/worker-runtime/worker";
-import path from "node:path";
-import type { Worker } from "node:worker_threads";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { PostgresPhysicalFacts } from "../infra/database-engine/physical-facts.js";

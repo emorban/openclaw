@@ -143,8 +143,7 @@ it.each([
           const chunk = chunks.get(name);
           return (
             chunk?.facadeModuleId?.replaceAll("\\", "/").endsWith(streamModule) === true ||
-            chunk?.moduleIds.some((id) => id.replaceAll("\\", "/").endsWith(streamModule)) ===
-              true
+            chunk?.moduleIds.some((id) => id.replaceAll("\\", "/").endsWith(streamModule)) === true
           );
         });
         const [streamTarget] = streamTargets;
