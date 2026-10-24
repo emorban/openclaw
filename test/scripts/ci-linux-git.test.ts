@@ -27,6 +27,7 @@ const noOutputs = { githubOutput: "", githubEnv: "", githubSummary: "", githubPa
 const docsClone = "Clone publish repo";
 const docsCommit = "Commit publish repo sync";
 const command = (words: string, ...args: string[]) => [...words.split(" "), ...args];
+type GitOptions = Partial<Parameters<typeof runCiGitStep>[0]>;
 const length = (value: number) => expect.objectContaining({ length: value });
 const fetchCase = (label: string, code: number, ...fetchResults: FetchResult[]) => ({
   label,
@@ -42,7 +43,7 @@ function runCheckout(
   signal: AbortSignal,
   job: string,
   fetchResults: FetchResult[],
-  options: Partial<Parameters<typeof runCiGitStep>[0]> = {},
+  options: GitOptions = {},
 ) {
   return runCiGitStep({ signal, job, fetchResults, ...options });
 }
@@ -204,7 +205,7 @@ linuxIt(
       expect(fetch.args).toEqual(expect.arrayContaining(["--depth=2", "--filter=blob:none"]));
     }
     expect(argsOf(report.checkouts)).toEqual([
-      ["checkout", "--detach", "refs/remotes/origin/checkout"],
+      command("checkout --detach refs/remotes/origin/checkout"),
     ]);
   },
 );
@@ -581,28 +582,28 @@ posixIt.for([
         ({ cwd, configuration }) => cwd === report.workspace && configuration?.length === 0,
       ),
     ).toBe(true);
-    expect(report.commands.filter(({ tool }) => tool === "gh")).toEqual([]);
+    expect(toolArgs(report, "gh")).toEqual([]);
     const probes = failure
       ? []
       : [
           ...(baseline
             ? [
-                ["rev-parse", "baseline^{commit}"],
-                ["merge-base", "--is-ancestor", base, "refs/remotes/origin/main"],
+                command("rev-parse baseline^{commit}"),
+                command(`merge-base --is-ancestor ${base} refs/remotes/origin/main`),
               ]
             : []),
-          ...(shared ? [["rev-parse", "candidate^{commit}"]] : []),
-          ["merge-base", "--is-ancestor", candidate, "refs/remotes/origin/main"],
+          ...(shared ? [command("rev-parse candidate^{commit}")] : []),
+          command(`merge-base --is-ancestor ${candidate} refs/remotes/origin/main`),
           ...(release
             ? [
-                ["tag", "--points-at", candidate],
+                command(`tag --points-at ${candidate}`),
                 mantisReleaseFetch,
-                ["rev-parse", `refs/remotes/origin/${mantisReleaseRef}`],
+                command(`rev-parse refs/remotes/origin/${mantisReleaseRef}`),
               ]
             : []),
         ];
     expect(argsOf(report.commands)).toEqual([
-      ...(!shared ? [["rev-parse", "HEAD"]] : []),
+      ...(!shared ? [command("rev-parse HEAD")] : []),
       qaMainFetch,
       ...probes,
     ]);
@@ -743,11 +744,7 @@ const commit = [
 const publishAttempt = [fetch, show, rebase, ...dependencyReads, push];
 const committed = [diff, fetch, show, ...commit];
 
-function runDocs(
-  signal: AbortSignal,
-  step: string,
-  options: Partial<Parameters<typeof runCiGitStep>[0]> = {},
-) {
+function runDocs(signal: AbortSignal, step: string, options: GitOptions = {}) {
   return runCiGitStep({
     signal,
     workflow: { file: ".github/workflows/docs-sync-publish.yml", job: "sync-publish-repo", step },
@@ -892,7 +889,7 @@ posixIt.for([
     (args, index) => [index === 0 ? "manifest" : "lock", cleanupFailure(args), 11 + index] as const,
   ),
   ["push", { pushResults: ["cleanup-failure"] }, 13],
-] satisfies (readonly [string, Partial<Parameters<typeof runCiGitStep>[0]>, number])[])(
+] satisfies (readonly [string, GitOptions, number])[])(
   "docs publication cleanup uncertainty at %s prevents abort/retry/next Git",
   async ([_operation, options, stop], { signal }) => {
     const report = await runDocs(signal, docsCommit, options);
@@ -919,15 +916,11 @@ posixIt.for([docsClone, docsCommit])(
       cloning ? [] : Array.from({ length: 5 }, () => [...abort]),
     );
     expect(report.pushes).toEqual([]);
-    expect(
-      report.output
-        .trim()
-        .endsWith(
-          cloning
-            ? "Failed to clone publish repo after retries."
-            : "Failed to push publish-repo sync after retries.",
-        ),
-    ).toBe(true);
+    expect(report.output.trim()).toMatch(
+      cloning
+        ? /Failed to clone publish repo after retries\.$/u
+        : /Failed to push publish-repo sync after retries\.$/u,
+    );
   },
 );
 
@@ -1039,27 +1032,16 @@ posixIt.for([0, 23, "cleanup-failure"] satisfies FetchResult[])(
     );
     expect(gitArgs(report)).toEqual([["rev-parse", "HEAD"]]);
     expect(report.commands[0]?.cwd).toBe(path.join(report.workspace, "clawhub-source"));
-    expect(toolArgs(report, "node")).toEqual(
-      revParseResult === 0
-        ? [
-            [
-              "scripts/docs-sync-publish.mjs",
-              "--target",
-              path.join(report.workspace, "publish"),
-              "--source-repo",
-              "fixture/checkout",
-              "--source-sha",
-              candidate,
-              "--clawhub-repo",
-              path.join(report.workspace, "clawhub-source"),
-              "--clawhub-source-repo",
-              "openclaw/clawhub",
-              "--clawhub-source-sha",
-              candidate,
-            ],
-          ]
-        : [],
-    );
+    const syncCommand = [
+      "scripts/docs-sync-publish.mjs",
+      "--target",
+      path.join(report.workspace, "publish"),
+      ...command(`--source-repo fixture/checkout --source-sha ${candidate}`),
+      "--clawhub-repo",
+      path.join(report.workspace, "clawhub-source"),
+      ...command(`--clawhub-source-repo openclaw/clawhub --clawhub-source-sha ${candidate}`),
+    ];
+    expect(toolArgs(report, "node")).toEqual(revParseResult === 0 ? [syncCommand] : []);
   },
 );
 
@@ -1106,11 +1088,7 @@ const agentCommitCommands = [
 const agentOutput = (reviewBase = base) =>
   `run_agent=true\nbase_sha=${candidate}\nreview_base_sha=${reviewBase}\nreview_head_sha=${candidate}\n`;
 
-function runDocsAgent(
-  signal: AbortSignal,
-  step: string,
-  options: Partial<Parameters<typeof runCiGitStep>[0]> = {},
-) {
+function runDocsAgent(signal: AbortSignal, step: string, options: GitOptions = {}) {
   return runCiGitStep({
     signal,
     ...options,
@@ -1136,10 +1114,7 @@ posixIt.for([0, 128, 125])(
       env: { EVENT_NAME: "workflow_dispatch" },
       commandResults: { "rev-parse HEAD": { code: 0 }, [`rev-parse ${candidate}^`]: { code } },
     });
-    expectGit(report, 0, [
-      ["rev-parse", "HEAD"],
-      ["rev-parse", `${candidate}^`],
-    ]);
+    expectGit(report, 0, [command("rev-parse HEAD"), command(`rev-parse ${candidate}^`)]);
     expect(toolArgs(report, "gh")).toEqual([]);
     expect(report.githubOutput).toBe(agentOutput(code === 0 ? base : candidate));
   },
@@ -1231,12 +1206,9 @@ posixIt.for([
     expect(report.githubOutput).toBe(code === 0 ? agentOutput(reviewBase) : "");
     expect(toolArgs(report, "gh")).toEqual([
       agentRunsRequest,
-      [
-        "api",
-        "--paginate",
-        "--slurp",
-        "repos/fixture/checkout/actions/runs/122/attempts/1/jobs?per_page=100",
-      ],
+      command(
+        "api --paginate --slurp repos/fixture/checkout/actions/runs/122/attempts/1/jobs?per_page=100",
+      ),
     ]);
     expect(backoffs(report)).toEqual([]);
   },
@@ -1304,7 +1276,7 @@ posixIt.for([
     { pushResults: [23], revParseResult: "cleanup-failure" },
     [...agentCommitCommands, agentFetch, agentPush, ["rev-parse", "origin/main"]],
   ],
-] satisfies (readonly [string, Partial<Parameters<typeof runCiGitStep>[0]>, string[][]])[])(
+] satisfies (readonly [string, GitOptions, string[][]])[])(
   "Docs Agent commit cleanup failure at %s is terminal before retry/stale success",
   async ([_operation, options, commands], { signal }) => {
     const report = await runDocsAgent(signal, agentCommit, {
@@ -1335,15 +1307,11 @@ posixIt.for(["gate", "commit fetch", "commit push"])(
         (attempt) => `${diagnostic} attempt ${attempt} failed; retrying.`,
       ),
     );
-    expect(
-      report.output
-        .trim()
-        .endsWith(
-          gate
-            ? "Failed to fetch main after retries."
-            : "Failed to push docs updates after retries.",
-        ),
-    ).toBe(true);
+    expect(report.output.trim()).toMatch(
+      gate
+        ? /Failed to fetch main after retries\.$/u
+        : /Failed to push docs updates after retries\.$/u,
+    );
   },
 );
 

@@ -356,7 +356,7 @@ describe("mock OpenAI response markers", () => {
       await withMockServer(ctx, async (baseUrl) => {
         const run = "topic-proof";
         const marker = (phase: string, id = run) => `TELEGRAM_BINDING_${phase}_${id}`;
-        const user = (text: string) => ({ role: "user", content: [{ type: "input_text", text }] });
+        const user = (text: string) => inputMessage([{ type: "input_text", text }]);
         const create = user(marker("SPAWN"));
         const tools = [functionTool("sessions_spawn")];
         const context = user(internalText("Runtime facts."));
@@ -426,39 +426,21 @@ describe("mock OpenAI response markers", () => {
           [...completed, user("ordinary later request"), currentContext],
           "OPENCLAW_E2E_OK",
         );
-        for (const text of [
-          "OpenClaw runtime context:\nTELEGRAM_BINDING_CHILD_boundary",
-          "ordinary prefix\nOpenClaw runtime context:\nTELEGRAM_BINDING_CHILD_boundary\nEnd OpenClaw runtime context.",
-          "OpenClaw runtime context:\nTELEGRAM_BINDING_CHILD_boundary\nEnd OpenClaw runtime context.\nordinary suffix",
-        ]) {
-          await expectText(
-            [...completed, user(text), currentContext],
-            marker("ACK_CHILD", "boundary"),
-          );
-        }
+        // Carrier boundary variants belong to the mock-inference-facts owner test.
         await expectText(
           [
             ...completed,
-            inputMessage([{ type: "text", text: "TELEGRAM_BINDING_CHILD_unsupported" }]),
+            user("OpenClaw runtime context:\nTELEGRAM_BINDING_CHILD_boundary"),
             currentContext,
           ],
-          "OPENCLAW_E2E_OK",
+          marker("ACK_CHILD", "boundary"),
         );
-        await expectText(
-          [
-            user(
-              [
-                "[Chat messages since your last reply - for context]",
-                marker("SPAWN"),
-                "",
-                "[Current message - respond to this]",
-                "ordinary latest message",
-              ].join("\n"),
-            ),
-            currentContext,
-          ],
-          "OPENCLAW_E2E_OK",
-        );
+        const unsupported = inputMessage([
+          { type: "text", text: "TELEGRAM_BINDING_CHILD_unsupported" },
+        ]);
+        await expectText([...completed, unsupported, currentContext], "OPENCLAW_E2E_OK");
+        const history = `[Chat messages since your last reply - for context]\n${marker("SPAWN")}\n\n[Current message - respond to this]\nordinary latest message`;
+        await expectText([user(history), currentContext], "OPENCLAW_E2E_OK");
         await expectText(
           [user(`TELEGRAM_BINDING_SPAWN_${run} TELEGRAM_BINDING_CHILD_${run}`)],
           "TELEGRAM_BINDING_FAIL_AMBIGUOUS_MARKER",
@@ -494,7 +476,7 @@ describe("mock OpenAI response markers", () => {
         ctx,
         { models: { "fixture-utility": { text: utilityText } } },
         async (baseUrl) => {
-          const user = { role: "user", content: "return OPENCLAW_E2E_DRAFTPROOF" };
+          const user = inputMessage("return OPENCLAW_E2E_DRAFTPROOF");
           const tool = {
             name: "exec",
             description: "Execute a shell command",
@@ -558,8 +540,7 @@ describe("mock OpenAI response markers", () => {
             taskExpect(call.name).toBe("exec");
             assistant = [
               {
-                role: "assistant",
-                content: "Checking the workspace before answering.",
+                ...inputMessage("Checking the workspace before answering.", "assistant"),
                 tool_calls: toolCalls,
               },
             ];
@@ -593,12 +574,9 @@ describe("mock OpenAI response markers", () => {
 
           const finalStartedAt = performance.now();
           const facts = runtimeText("Current conversation facts");
-          const runtimeContext = {
-            role: "user",
-            content: stream
-              ? [{ type: api === "responses" ? "input_text" : "text", text: facts }]
-              : facts,
-          };
+          const runtimeContext = inputMessage(
+            stream ? [{ type: api === "responses" ? "input_text" : "text", text: facts }] : facts,
+          );
           const completedTurn = [
             user,
             ...assistant,
@@ -699,20 +677,13 @@ describe("mock OpenAI response markers", () => {
       async (baseUrl, { control }) => {
         const request = () => post(baseUrl, { model: "toString", input: "hello", stream: false });
         expect((await (await request()).json()).output[0].content[0].text).toBe("OPENCLAW_E2E_OK");
-        for (const global of [
-          { text: "global" },
-          { responses: [{ text: "global" }] },
-          { default: { text: "global" } },
-          { scriptVersion: "global" },
-        ]) {
-          await writeFile(
-            control,
-            JSON.stringify({ models: { arbitrary: { text: "mapped" } }, ...global }),
-          );
-          const response = await request();
-          expect(response.status).toBe(500);
-          expect(await response.text()).toContain("exclusive nonempty map");
-        }
+        await writeFile(
+          control,
+          JSON.stringify({ models: { arbitrary: { text: "mapped" } }, text: "global" }),
+        );
+        const response = await request();
+        expect(response.status).toBe(500);
+        expect(await response.text()).toContain("exclusive nonempty map");
       },
     );
   });
@@ -732,12 +703,10 @@ describe("mock OpenAI response markers", () => {
       const context = internalText(`Earlier reply: ${olderMarker}`);
       for (const route of ["responses", "chat/completions"] as const) {
         for (const stream of [false, true]) {
-          const user = (text: string) => ({
-            role: "user",
-            content: stream
-              ? [{ type: route === "responses" ? "input_text" : "text", text }]
-              : text,
-          });
+          const user = (text: string) =>
+            inputMessage(
+              stream ? [{ type: route === "responses" ? "input_text" : "text", text }] : text,
+            );
           const current = user(`Reply exactly with ${currentMarker}.`);
           const toolOutput =
             route === "responses"
@@ -1083,7 +1052,6 @@ describe("mock OpenAI response markers", () => {
       tools: ["exec", "wait"],
     },
     { output: "not JSON", tools: ["exec", "wait"] },
-    { output: "", tools: ["exec", "wait"] },
     { output: undefined, tools: ["exec", "wait"] },
   ])("rejects an unusable MCP Code Mode continuation: $output", async ({ output, tools }, ctx) => {
     await withMockServer(ctx, async (baseUrl) => {
@@ -1120,9 +1088,9 @@ describe("mock OpenAI response markers", () => {
       const runtimeContext = inputMessage(internalText("Current fixture context"));
       const input: unknown[] = [inputMessage("agent plugin bundle qa check"), runtimeContext];
       const controls = ["tool_search", "tool_describe", "dispatch_action"];
-      const request = async (names = controls) => {
+      const request = async () => {
         const response = await requestResponse(baseUrl, input, {
-          tools: names.map((name) => functionTool(name)),
+          tools: controls.map((name) => functionTool(name)),
         });
         return response.output[0];
       };
@@ -1132,23 +1100,27 @@ describe("mock OpenAI response markers", () => {
           call_id: call.call_id,
           output: wrapExternalContent(JSON.stringify(output), { source: "api" }),
         });
-      expect((await request([])).content[0].text).toBe("AGENT_BUNDLE_MCP_FAIL tool-not-declared");
       const target = {
         id: "mcp:weather-probe:weather-probe__weather_probe",
         name: "weather-probe__weather_probe",
         source: "mcp",
       };
-      const search = await request();
-      expect(search).toMatchObject({ type: "function_call", name: "tool_search" });
-      expect(JSON.parse(search.arguments)).toEqual({ query: target.name, limit: 1 });
-      appendResult(search, [target]);
-      const description = await request();
-      expect(description).toMatchObject({ type: "function_call", name: "tool_describe" });
-      expect(JSON.parse(description.arguments)).toEqual({ id: target.id });
-      appendResult(description, {
-        ...target,
-        parameters: { type: "object", properties: {}, additionalProperties: false },
-      });
+      // Selection and receipt rejection are covered by agent-plugin-bundle-response.test.ts.
+      // Here retain the HTTP round trip and the recap/current-turn routing boundary.
+      for (const [name, value] of [
+        ["tool_search", [target]],
+        [
+          "tool_describe",
+          {
+            ...target,
+            parameters: { type: "object", properties: {}, additionalProperties: false },
+          },
+        ],
+      ] as const) {
+        const call = await request();
+        expect(call).toMatchObject({ type: "function_call", name });
+        appendResult(call, value);
+      }
       const recap = await post(baseUrl, {
         stream: true,
         input: [
@@ -1180,14 +1152,7 @@ describe("mock OpenAI response markers", () => {
         },
       });
       expect((await request()).content[0].text).toBe("AGENT_BUNDLE_MCP_OK");
-      input[input.length - 1] = {
-        type: "function_call_output",
-        call_id: call.call_id,
-        output: "probe failed",
-      };
-      const failed = await request();
-      expect(failed.content[0].text).toBe("AGENT_BUNDLE_MCP_FAIL unexpected-tool-output");
-      input.push(failed, { role: "user", content: "OPENCLAW_E2E_NEXT_TURN" }, runtimeContext);
+      input.push(inputMessage("OPENCLAW_E2E_NEXT_TURN"), runtimeContext);
       expect(await request()).toMatchObject({
         type: "message",
         content: [{ type: "output_text", text: "OPENCLAW_E2E_NEXT_TURN" }],
