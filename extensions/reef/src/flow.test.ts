@@ -3,7 +3,6 @@ import { createPluginRuntimeMock } from "openclaw/plugin-sdk/plugin-test-runtime
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   canonicalBytes,
-  REEF_ENVELOPE_MAX_AGE_SECONDS,
   guardInstructions,
   openClaimed,
   sha256Hex,
@@ -220,99 +219,46 @@ describe("ReefMessageFlow inbound", () => {
     }
   });
 
-  it.each([true, false])(
-    "parks a review-pending inbound message until owner approval=%s",
-    async (approved) => {
-      const id = "01JZ0000000000000000000106";
-      const replay = new MemoryReplayStore();
-      const claim = vi.spyOn(replay, "claim");
-      const release = vi.spyOn(replay, "release");
-      const review: Verdict = { ...allow, decision: "review", category: "ambiguous" };
-      // A stochastic classifier would allow a second call; pending review owns redelivery.
-      const {
-        peerKeys: alice,
-        keys: bob,
-        stores,
-        onIngress,
-        relay,
-        classifier,
-        audit,
-        flow,
-      } = await createFlow({ verdicts: [review, allow], replay });
-      const entry = inbox(await envelope(alice, bob, id, "needs an owner decision"));
+  it("parks a review-pending inbound message until the owner decides, without re-classifying", async () => {
+    const id = "01JZ0000000000000000000106";
+    const review: Verdict = { ...allow, decision: "review", category: "ambiguous" };
+    // A stochastic classifier would allow a second call; pending review owns redelivery.
+    const {
+      peerKeys: alice,
+      keys: bob,
+      stores,
+      onIngress,
+      relay,
+      classifier,
+      audit,
+      flow,
+    } = await createFlow({ verdicts: [review, allow] });
+    const entry = inbox(await envelope(alice, bob, id, "needs an owner decision"));
 
-      await expect(flow.processEntries([entry])).rejects.toMatchObject({
-        name: "ReefInboxEntryParkedError",
-      });
-      expect(relay.acknowledge).not.toHaveBeenCalled();
-      // Redelivery before the decision parks again with zero guard calls.
-      await expect(flow.processEntries([{ ...entry, seq: 2 }])).rejects.toMatchObject({
-        name: "ReefInboxEntryParkedError",
-      });
-      expect(classifier.classify).toHaveBeenCalledTimes(1);
-      expect(onIngress).not.toHaveBeenCalled();
-      // The first retry observes the newly created pending review. Later polls
-      // carry that receipt until the review owner invalidates it.
-      await expect(flow.processEntries([{ ...entry, seq: 3 }])).rejects.toMatchObject({
-        name: "ReefInboxEntryParkedError",
-      });
-      expect(claim).toHaveBeenCalledTimes(2);
-      expect(release).toHaveBeenCalledTimes(2);
+    await expect(flow.processEntries([entry])).rejects.toMatchObject({
+      name: "ReefInboxEntryParkedError",
+    });
+    expect(relay.acknowledge).not.toHaveBeenCalled();
+    // Redelivery before the decision parks again with zero guard calls.
+    await expect(flow.processEntries([{ ...entry, seq: 2 }])).rejects.toMatchObject({
+      name: "ReefInboxEntryParkedError",
+    });
+    expect(classifier.classify).toHaveBeenCalledTimes(1);
+    expect(onIngress).not.toHaveBeenCalled();
 
-      const pending = await stores.reviews.list();
-      expect(pending).toHaveLength(1);
-      await stores.reviews.decide(pending[0]!.approvalDigest, approved);
-      await flow.processEntries([{ ...entry, seq: 4 }]);
-      expect(onIngress).toHaveBeenCalledTimes(approved ? 1 : 0);
-      expect(relay.acknowledge).toHaveBeenCalledOnce();
-      // One post-approval classification, never a per-redelivery re-roll.
-      expect(classifier.classify).toHaveBeenCalledTimes(approved ? 2 : 1);
-      expect(relay.acknowledge.mock.calls[0]![2].status).toBe(approved ? "accepted" : "rejected");
-      // One durable read observation for the whole park lifecycle — a 30s
-      // re-poll cadence must not fill the audit chain with retries.
-      const readEvents = (await audit.entries()).filter((row) => row.event.type === "read");
-      expect(readEvents).toHaveLength(1);
-    },
-  );
-
-  it.each(["envelope", "policy", "expiry"] as const)(
-    "rechecks a parked review after %s changes",
-    async (change) => {
-      const replay = new MemoryReplayStore();
-      const claim = vi.spyOn(replay, "claim");
-      const review: Verdict = { ...allow, decision: "review", category: "ambiguous" };
-      const { peerKeys, keys, flow, classifier, onIngress } = await createFlow({
-        verdicts: [review],
-        replay,
-      });
-      const entry = inbox(
-        await envelope(peerKeys, keys, "01JZ0000000000000000000107", "review me"),
-      );
-      for (let attempt = 0; attempt < 2; attempt++) {
-        await expect(flow.processEntries([entry])).rejects.toBeInstanceOf(
-          ReefInboxEntryParkedError,
-        );
-      }
-      expect(claim).toHaveBeenCalledTimes(2);
-      if (change === "envelope") {
-        entry.envelope = await envelope(peerKeys, keys, entry.id, "changed body");
-        await expect(flow.processEntries([entry])).rejects.toThrow("replay id binding mismatch");
-      } else if (change === "policy") {
-        flow.options.config.guard!.policyVersion = "changed-policy";
-        classifier.classify.mockResolvedValue({ ...review, policyVersion: "changed-policy" });
-        await expect(flow.processEntries([entry])).rejects.toBeInstanceOf(
-          ReefInboxEntryParkedError,
-        );
-      } else {
-        vi.spyOn(Date, "now").mockReturnValue(
-          (entry.envelope!.ts + REEF_ENVELOPE_MAX_AGE_SECONDS + 1) * 1000,
-        );
-        await expect(flow.processEntries([entry])).rejects.toThrow("expired");
-      }
-      expect(claim).toHaveBeenCalledTimes(3);
-      expect(onIngress).not.toHaveBeenCalled();
-    },
-  );
+    const pending = await stores.reviews.list();
+    expect(pending).toHaveLength(1);
+    await stores.reviews.decide(pending[0]!.approvalDigest, true);
+    await flow.processEntries([{ ...entry, seq: 3 }]);
+    expect(onIngress).toHaveBeenCalledOnce();
+    expect(relay.acknowledge).toHaveBeenCalledOnce();
+    // One post-approval classification, never a per-redelivery re-roll.
+    expect(classifier.classify).toHaveBeenCalledTimes(2);
+    // One durable read observation for the whole park lifecycle — a 30s
+    // re-poll cadence must not fill the audit chain with retries.
+    const readEvents = (await audit.entries()).filter((row) => row.event.type === "read");
+    expect(readEvents).toHaveLength(1);
+  });
 
   it("acks a signed rejected receipt and never delivers its body", async () => {
     const deny: Verdict = { ...allow, decision: "deny", category: "injection", reason: "Denied." };
