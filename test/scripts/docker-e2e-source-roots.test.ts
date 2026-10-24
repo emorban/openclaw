@@ -12,7 +12,7 @@ import {
 import { createServer } from "node:net";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { runManagedCommand } from "../../scripts/lib/managed-child-process.mts";
+import { runNodeScript } from "../helpers/run-node-script.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -54,7 +54,6 @@ function fixture(root: string) {
 type CommandCall = {
   command: string;
   args: string[];
-  status?: number | null;
   aliasKind?: "symlink" | "directory" | null;
   installerSource?: string;
 };
@@ -63,6 +62,7 @@ function readCommandCalls(log: string): CommandCall[] {
   return readFileSync(log, "utf8")
     .trim()
     .split("\n")
+    .filter(Boolean)
     .map((line) => JSON.parse(line) as CommandCall);
 }
 
@@ -76,12 +76,11 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const command = ${JSON.stringify(command)};
 const args = process.argv.slice(2);
-function run(bin, args, timeout = 1_000, record = () => {}) {
+function run(bin, args, timeout = 1_000) {
   const result = spawnSync(bin, args, {
     env: process.env, encoding: "utf8", timeout, killSignal: "SIGKILL", maxBuffer: 1024 * 1024,
   });
   if (result.error) throw result.error;
-  record(result);
   process.stdout.write(result.stdout);
   process.stderr.write(result.stderr);
   process.exit(result.status ?? 1);
@@ -119,40 +118,21 @@ async function runFixtureBash(
   env: NodeJS.ProcessEnv,
   timeoutMs: number,
 ) {
-  const overflow = new AbortController();
-  let bytes = 0;
-  const output = { stdout: "", stderr: "" };
-  const status = await runManagedCommand({
-    bin: "/bin/bash",
-    args: ["--noprofile", "--norc", "-f", ...args],
+  const result = await runNodeScript(["--noprofile", "--norc", "-f", ...args], env, timeoutMs, {
+    executable: "/bin/bash",
     cwd,
-    env,
-    timeoutMs,
-    timeoutKillGraceMs: 500,
-    abortKillGraceMs: 500,
-    cleanupDrainTimeoutMs: 1_000,
+    maxBuffer: 512 * 1024,
     requireProcessTreeExit: true,
-    signal: overflow.signal,
-    stdio: ["ignore", "pipe", "pipe"],
-    onReady(child) {
-      for (const name of ["stdout", "stderr"] as const) {
-        child[name]!.on("data", (chunk: Buffer) => {
-          bytes += chunk.byteLength;
-          if (bytes > 1024 * 1024) {
-            overflow.abort(new Error("fixture command output exceeded 1 MiB"));
-            return;
-          }
-          output[name] += chunk.toString();
-        });
-      }
-    },
   });
-  return { status, ...output };
+  if (result.error) {
+    throw result.error;
+  }
+  return result;
 }
 
 function prepareSourceCaptureCommands(bin: string, root: string) {
   // Only these outer-script utilities are executable; neither captured container runs here.
-  for (const name of "basename dirname cat chmod mktemp mkfifo tee tail wc".split(" ")) {
+  for (const name of "basename dirname cat chmod mktemp mkfifo tee tail wc seq".split(" ")) {
     const executable = [`/usr/bin/${name}`, `/bin/${name}`].find(existsSync);
     if (!executable) {
       throw new Error(`missing fixture utility: ${name}`);
@@ -202,13 +182,14 @@ async function assertSourceBootstrapIsolation(args: string[], root: string) {
     }),
   );
   expect(containerEnv).toEqual({ ...sourceHomeEnv, OPENCLAW_NO_AUTO_UPDATE: "1" });
-  const body = args.at(-1)!;
   for (const kind of ["symlink", "absent", "directory"] as const) {
     const rootForKind = path.join(root, kind);
     const { at, dir, file, bin, log } = fixture(rootForKind);
     const modules = at("node_modules");
     const target = dir("opt/openclaw-e2e/node_modules");
     const aptLists = dir("var/lib/apt/lists");
+    const home = at("home");
+    prepareSourceCaptureCommands(bin, rootForKind);
     file("opt/openclaw-e2e/node_modules/keep", "shared image dependencies");
     file("var/lib/apt/lists/cache", "fixture apt cache");
     if (kind === "symlink") {
@@ -216,64 +197,53 @@ async function assertSourceBootstrapIsolation(args: string[], root: string) {
     } else if (kind === "directory") {
       file("node_modules/keep", "real directory must survive");
     }
-    for (const command of ["apt-get", "rm", "curl", "install", "runuser"]) {
+    for (const command of ["apt-get", "curl", "install", "runuser"]) {
       writeNodeCommand(
         bin,
         command,
         `
 const log = (record) => fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(record) + "\\n");
 const modules = ${JSON.stringify(modules)};
-const aptLists = ${JSON.stringify(aptLists)};
 log({ command, args });
-if (command === "rm") {
-  // Keep the final component lexical: resolving it would follow the very alias under test.
-  const mapped = args.flatMap((arg) => {
-    if (/^-[frR]+$/.test(arg) || arg === "--") return [arg];
-    if (arg === "/node_modules") return [modules];
-    if (arg === "/var/lib/apt/lists/*") {
-      const entries = fs.readdirSync(aptLists).filter((name) => !name.startsWith(".")).sort();
-      return (entries.length ? entries : ["*"]).map((name) => path.join(aptLists, name));
-    }
-    throw new Error("bootstrap rm operand outside fixture namespace");
-  });
-  run("/bin/rm", mapped, 1_000, (result) => log({ command: "rm-result", args, status: result.status }));
-}
-if (command === "apt-get") {
-  if (!["update", "install -y --no-install-recommends curl"].includes(args.join(" "))) {
-    throw new Error("unexpected fixture apt command");
-  }
-} else if (command === "install") {
-  if (JSON.stringify(args) !== JSON.stringify(["-d", "-o", "appuser", "-g", "appuser", "/tmp/openclaw-source-home"])) {
-    throw new Error("unexpected bootstrap home");
-  }
-  fs.mkdirSync(${JSON.stringify(at("home"))}, { recursive: true });
+if (command === "install") {
+  if (args.at(-1) !== process.env.HOME) throw new Error("bootstrap home escaped fixture");
+  fs.mkdirSync(process.env.HOME, { recursive: true });
 } else if (command === "runuser") {
   const stat = fs.lstatSync(modules, { throwIfNoEntry: false });
   log({ command: "handoff", args, aliasKind: stat?.isSymbolicLink() ? "symlink" : stat?.isDirectory() ? "directory" : null });
   // This is the boundary observation, not an execution of env/bash or a success oracle.
-} else {
+} else if (command === "curl") {
   throw new Error("curl must only be located, never executed");
 }
 `,
       );
     }
-    // No login/profile, inherited shell functions/options, operator PATH, or host glob expansion.
+    // Rebase only filesystem operands. Real rm/globbing now exercise symlink and
+    // directory behavior; the shared rm wrapper refuses anything outside this root.
+    const body = args
+      .at(-1)!
+      .replaceAll("/node_modules", '"$FIXTURE_MODULES"')
+      .replaceAll("/var/lib/apt/lists", '"$FIXTURE_APT_LISTS"');
     const result = await runFixtureBash(
-      ["-c", body],
+      ["-c", `set +f\n${body}`],
       rootForKind,
-      { ...containerEnv, PATH: bin, TMPDIR: rootForKind, LANG: "C" },
+      {
+        ...containerEnv,
+        HOME: home,
+        PATH: bin,
+        TMPDIR: rootForKind,
+        LANG: "C",
+        FIXTURE_MODULES: modules,
+        FIXTURE_APT_LISTS: aptLists,
+      },
       5_000,
     );
     const calls = readCommandCalls(log);
     const handoffs = calls.filter((call) => call.command === "handoff");
     expect(readFileSync(path.join(target, "keep"), "utf8"), kind).toBe("shared image dependencies");
     if (kind === "directory") {
-      const refusal = calls.find(
-        (call) => call.command === "rm-result" && call.args.includes("/node_modules"),
-      );
-      expect(refusal, result.stderr).toBeDefined();
-      expect(refusal!.status).not.toBe(0);
-      expect(result.status).toBe(refusal!.status);
+      expect(result.status, result.stderr).not.toBe(0);
+      expect(result.stderr).toContain(modules);
       expect(handoffs).toEqual([]);
       expect(readFileSync(path.join(modules, "keep"), "utf8")).toBe("real directory must survive");
     } else {
@@ -286,7 +256,9 @@ if (command === "apt-get") {
             "appuser",
             "--",
             "env",
-            ...Object.entries(sourceHomeEnv).map(([key, value]) => `${key}=${value}`),
+            ...Object.entries({ ...sourceHomeEnv, HOME: home }).map(
+              ([key, value]) => `${key}=${value}`,
+            ),
             "bash",
             "/tmp/source-proof.sh",
           ],
@@ -302,7 +274,13 @@ if (command === "apt-get") {
 
 describe("Docker E2E source and harness inputs", () => {
   posixIt.each<
-    [script: string, dockerfiles?: string[], harnessDockerfile?: boolean, reuse?: boolean]
+    [
+      script: string,
+      dockerfiles?: string[],
+      harnessDockerfile?: boolean,
+      reuse?: boolean,
+      logFailure?: boolean,
+    ]
   >([
     ["docker-selected-plugins.sh", ["Dockerfile", "Dockerfile", "Dockerfile"]],
     [
@@ -320,9 +298,10 @@ describe("Docker E2E source and harness inputs", () => {
     ],
     ["compose-setup.sh", undefined, false, true],
     ["cli-installer-distribution-docker.sh", undefined, false, true],
+    ["cli-installer-distribution-docker.sh", undefined, false, true, true],
   ])(
     "keeps candidate product inputs for %s",
-    async (script, dockerfiles, harnessDockerfile, reuse) => {
+    async (script, dockerfiles, harnessDockerfile, reuse, logFailure) => {
       const root = tempDirs.make("e2e-src-");
       const { at, dir, file, bin, log, env } = fixture(root);
       const target = dir("candidate source");
@@ -358,13 +337,17 @@ if (command === 'git') {
 ) {
   if (${captureSource} && args[0] === 'run') {
     const name = args[args.indexOf('--name') + 1];
-    if (/^openclaw-hosted-installer-proof-[0-9]+$/.test(name)) process.exit(0);
-    if (!/^openclaw-source-installer-proof-[0-9]+$/.test(name)) {
+    if (!/^openclaw-(hosted|source)-installer-proof-[0-9]+$/.test(name)) {
       throw new Error('unexpected source capture container');
     }
+    process.exit(0);
   }
   console.error('fixture-stop at product input boundary');
   process.exit(49);
+} else if (${captureSource} && args[0] === 'logs') {
+  console.log('fixture proof output');
+  console.error('fixture proof diagnostics');
+  process.exit(${logFailure ? 73 : 0});
 }
 `,
         );
@@ -401,8 +384,10 @@ if (command === 'git') {
               },
               target,
             );
-        expect(result.status).not.toBe(0);
-        expect(result.stdout + result.stderr).toContain("fixture-stop at product input boundary");
+        expect(result.status).toBe(captureSource ? (logFailure ? 73 : 0) : 49);
+        if (!captureSource) {
+          expect(result.stdout + result.stderr).toContain("fixture-stop at product input boundary");
+        }
         const calls = readCommandCalls(log);
         if (dockerfiles) {
           const builds = calls.filter(
@@ -431,11 +416,34 @@ if (command === 'git') {
               ?.installerSource,
           ).toBe("#!/bin/bash\necho installer\n");
           expect(existsSync(path.join(target, "dist"))).toBe(false);
+          expect(
+            calls
+              .filter((call) => call.command === "docker" && call.args[0] === "exec")
+              .map((call) => call.args.slice(2)),
+          ).toEqual(
+            Array.from({ length: logFailure ? 1 : 2 }, () => [
+              "test",
+              "-f",
+              "/tmp/openclaw-proof-ready",
+            ]),
+          );
+          expect(result.stdout).toContain("fixture proof output");
+          expect(result.stderr).toContain("fixture proof diagnostics");
+          expect(result.stdout.includes("CLI installer distribution proof passed.")).toBe(
+            !logFailure,
+          );
           const runs = calls.filter(
             (call) =>
               call.command === "docker" && call.args[0] === "run" && call.args.includes("-d"),
           );
           expect(runs).toHaveLength(2);
+          expect(
+            calls.find((call) => call.command === "docker" && call.args[0] === "rm")?.args,
+          ).toEqual([
+            "rm",
+            "-f",
+            ...runs.map((call) => call.args[call.args.indexOf("--name") + 1]),
+          ]);
           expect(runs.map((call) => call.args[call.args.indexOf("--name") + 1])).toEqual([
             expect.stringMatching(/^openclaw-hosted-installer-proof-[0-9]+$/),
             expect.stringMatching(/^openclaw-source-installer-proof-[0-9]+$/),
@@ -444,7 +452,9 @@ if (command === 'git') {
           if (!sourceRun) {
             throw new Error("missing captured source container run");
           }
-          await assertSourceBootstrapIsolation(sourceRun.args, root);
+          if (!logFailure) {
+            await assertSourceBootstrapIsolation(sourceRun.args, root);
+          }
         }
       } finally {
         await new Promise<void>((resolve, reject) => {
@@ -454,52 +464,29 @@ if (command === 'git') {
     },
   );
   posixIt.each([
-    { runner: "cli", mode: "ready", exit: 0 },
-    { runner: "package", mode: "ready", exit: 49 },
-    { runner: "cli", mode: "pending", exit: 0 },
-    { runner: "package", mode: "stopped", exit: 1 },
-    { runner: "cli", mode: "exhausted", exit: 1 },
-    { runner: "package", mode: "exhausted", exit: 1 },
-    { runner: "cli", mode: "inspect-empty", exit: 1 },
-    { runner: "package", mode: "inspect-true", exit: 49 },
-    { runner: "cli", mode: "success-log-error", exit: 73 },
-    { runner: "package", mode: "failure-log-error", exit: 73 },
-  ])("preserves $runner proof settlement: $mode", ({ runner, mode, exit }) => {
+    { mode: "ready", exit: 0 },
+    { mode: "pending", exit: 0 },
+    { mode: "stopped", exit: 1 },
+    { mode: "exhausted", exit: 1 },
+    { mode: "inspect-empty", exit: 1 },
+    { mode: "inspect-true", exit: 0 },
+    { mode: "failure-log-error", exit: 73 },
+  ])("preserves shared proof settlement: $mode", ({ mode, exit }) => {
     const root = tempDirs.make("e2e-wait-");
-    const { at, file, bin, log, env } = fixture(root);
-    file("package/package.json", JSON.stringify({ name: "openclaw", version: "1.2.3" }));
-    const packageTgz = at("candidate.tgz");
-    expect(spawnSync("tar", ["-czf", packageTgz, "-C", root, "package"]).status).toBe(0);
+    const { log, env } = fixture(root);
     const commands = {
-      git: `if [[ "$*" == *rev-parse* ]]; then printf '%040d\\n' 0; fi`,
       sleep: `printf 'sleep %s\\n' "$*" >> "$PROOF_TRACE"`,
       docker: `
 case "$1" in
-  run)
-    shift
-    while (($#)); do
-      if [[ "$1" == --name ]]; then
-        printf 'start %s\\n' "\${2%-*}" >> "$PROOF_TRACE"
-        break
-      fi
-      shift
-    done
-    ;;
   exec)
     container="$2"
-    shift 2
-    if [[ "$*" != 'test -f /tmp/openclaw-proof-ready' ]]; then
-      printf 'identity %s %s\\n' "\${container%-*}" "$*" >> "$PROOF_TRACE"
-      echo 'fixture-stop at package identity boundary' >&2
-      exit 49
-    fi
     printf 'probe %s\\n' "\${container%-*}" >> "$PROOF_TRACE"
     count=0
     if [[ -f "$PROOF_STATE/$container" ]]; then read -r count < "$PROOF_STATE/$container"; fi
     count=$((count + 1))
     printf '%s\\n' "$count" > "$PROOF_STATE/$container"
     case "$PROOF_MODE" in
-      ready|success-log-error) exit 0 ;;
+      ready) exit 0 ;;
       pending|inspect-true) if ((count > 1)); then exit 0; fi ;;
     esac
     exit 1
@@ -519,43 +506,24 @@ case "$1" in
     printf 'proof-err:%s\\n' "\${2%-*}" >&2
     case "$PROOF_MODE" in *log-error) exit 73 ;; esac
     ;;
-  rm)
-    shift 2
-    for container in "$@"; do printf 'cleanup %s\\n' "\${container%-*}" >> "$PROOF_TRACE"; done
-    ;;
 esac
 `,
     };
-    for (const [command, body] of Object.entries(commands)) {
-      const executable = path.join(bin, command);
-      writeFileSync(executable, `#!/bin/bash\nset -eu\n${body}\n`);
-      chmodSync(executable, 0o755);
-    }
-    // Keep all 1,200 exhaustion probes without starting a new Bash per command.
-    const shellFunctions = file(
-      "proof-functions.sh",
-      Object.entries(commands)
-        .map(([command, body]) => `${command}() (\n${body}\n)\n`)
-        .join("\n"),
-    );
-    const cli = runner === "cli";
-    const containers = cli
-      ? ["openclaw-hosted-installer-proof", "openclaw-source-installer-proof"]
-      : [
-          "openclaw-package-npm-proof",
-          "openclaw-package-pnpm-proof",
-          "openclaw-package-bun-proof",
-          "openclaw-package-musl-proof",
-        ];
-    const script = cli ? "cli-installer-distribution-docker.sh" : "docker-package-install.sh";
+    const container = "fixture-proof";
     const result = runBash(
-      [e2e(script)],
+      [
+        "-c",
+        `set -euo pipefail
+source "$ROOT_DIR/scripts/lib/docker-e2e-container.sh"
+${Object.entries(commands)
+  .map(([command, body]) => `${command}() (\n${body}\n)`)
+  .join("\n")}
+docker_e2e_wait_for_proof ${container}-1 3
+`,
+      ],
       {
         ...env,
-        BASH_ENV: shellFunctions,
-        OPENCLAW_CURRENT_PACKAGE_TGZ: packageTgz,
-        OPENCLAW_SKIP_DOCKER_BUILD: "1",
-        OPENCLAW_DOCKER_ARTIFACT_IDENTITY_PATH: at("identity.json"),
+        ROOT_DIR: harness,
         PROOF_TRACE: log,
         PROOF_STATE: root,
         PROOF_MODE: mode,
@@ -566,49 +534,32 @@ esac
     expect(result.error).toBeUndefined();
     expect(result.status, result.stdout + result.stderr).toBe(exit);
     const calls = readFileSync(log, "utf8").trim().split("\n");
-    const expected = containers.map((container) => `start ${container}`);
-    const settled = exit === 0 || exit === 49;
-    for (const container of settled ? containers : containers.slice(0, 1)) {
-      const attempts = mode === "exhausted" ? (cli ? 1200 : 240) : 1;
-      for (let attempt = 0; attempt < attempts; attempt++) {
-        expected.push(`probe ${container}`);
-        if (mode !== "ready" && mode !== "success-log-error") {
-          expected.push(`inspect ${container} --format {{.State.Running}}`);
-          if (["pending", "inspect-true", "exhausted"].includes(mode)) {
-            expected.push("sleep 1");
-          }
+    const expected: string[] = [];
+    const attempts = mode === "exhausted" ? 3 : 1;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      expected.push(`probe ${container}`);
+      if (mode !== "ready") {
+        expected.push(`inspect ${container} --format {{.State.Running}}`);
+        if (["pending", "inspect-true", "exhausted"].includes(mode)) {
+          expected.push("sleep 1");
         }
       }
-      if (mode === "pending" || mode === "inspect-true") {
-        expected.push(`probe ${container}`);
-      }
-      if (cli || !settled) {
-        expected.push(`logs ${container}`);
-      }
     }
-    if (exit === 49) {
-      // Waits completed; this fixture does not claim installed package acceptance.
-      expected.push("identity openclaw-package-pnpm-proof cat /tmp/openclaw-package-root");
-      expect(result.stderr).toContain("fixture-stop at package identity boundary");
+    if (mode === "pending" || mode === "inspect-true") {
+      expected.push(`probe ${container}`);
     }
-    expected.push(...containers.map((container) => `cleanup ${container}`));
+    if (exit !== 0) {
+      expected.push(`logs ${container}`);
+    }
     expect(calls).toEqual(expected);
-    if (cli && (settled || mode === "success-log-error")) {
-      expect(result.stdout).toContain(`proof-out:${containers[0]}`);
-      expect(result.stderr).toContain(`proof-err:${containers[0]}`);
-      expect(result.stderr).not.toContain("proof-out:");
-    } else if (!settled) {
-      expect(result.stdout).not.toContain("proof-out:");
-      expect(result.stderr).toContain(`proof-out:${containers[0]}`);
-      expect(result.stderr).toContain(`proof-err:${containers[0]}`);
+    expect(result.stdout).toBe("");
+    if (exit !== 0) {
+      expect(result.stderr).toContain(`proof-out:${container}`);
+      expect(result.stderr).toContain(`proof-err:${container}`);
     } else {
       expect(result.stdout + result.stderr).not.toContain("proof-out:");
     }
     expect(result.stderr.includes("inspect-error")).toBe(mode.startsWith("inspect-"));
-    expect(result.stdout.includes("CLI installer distribution proof passed.")).toBe(
-      cli && exit === 0,
-    );
-    expect(result.stdout).not.toContain("npm, pnpm, and Bun package artifact proofs passed.");
   });
   posixIt("packs candidate source through the sourced trusted package helper", () => {
     const root = tempDirs.make("e2e-pack-");

@@ -1,18 +1,8 @@
 import { spawnSync } from "node:child_process";
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, expect, it } from "vitest";
-import { runManagedCommand } from "../../scripts/lib/managed-child-process.mts";
-import { withinTest } from "../helpers/promise.js";
+import { createCommandFixture, createCommandTest } from "../helpers/command-fixture.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -183,32 +173,6 @@ function runSweepShell(script: string, env: NodeJS.ProcessEnv = {}) {
     env: { ...process.env, ...toBashEnv(env) },
   });
   return { ...result, output: `${result.stdout}\n${result.stderr}` };
-}
-
-async function runManagedSweep(script: string, env: NodeJS.ProcessEnv, signal: AbortSignal) {
-  const captured = { stdout: "", stderr: "" };
-  const command = runManagedCommand({
-    bin: BASH_BIN,
-    args: ["-c", toBashScript(script)],
-    cwd: process.cwd(),
-    env: { ...process.env, ...toBashEnv(env) },
-    stdio: ["ignore", "pipe", "pipe"],
-    requireProcessTreeExit: process.platform !== "win32",
-    signal,
-    onReady(child) {
-      for (const stream of ["stdout", "stderr"] as const) {
-        child[stream]!.on("data", (chunk: Buffer) => {
-          captured[stream] += chunk.toString();
-        });
-      }
-    },
-  });
-  try {
-    return { status: await withinTest(command, signal), ...captured };
-  } finally {
-    // The managed owner joins the shell tree after cancellation before temp files are removed.
-    await command.catch(() => {});
-  }
 }
 
 function toBashScript(script: string) {
@@ -559,51 +523,17 @@ node scripts/e2e/lib/kitchen-sink-plugin/assertions.mjs scan-logs
   expect(result.stdout).toContain("log scan passed");
 });
 
-it("cleans a ClawHub fixture server that times out before readiness", () => {
-  const parent = tempDirs.make("openclaw-kitchen-sink-clawhub-");
-  const env = serverFixture(parent);
-  writeExecutable(path.join(env.FAKE_BIN, "node"), "#!/usr/bin/env bash\nsleep 30\n");
-
-  const result = runSweepShell(
-    `
-export PATH="$FAKE_BIN:$PATH"
-source scripts/e2e/lib/kitchen-sink-plugin/sweep.sh
-if start_kitchen_sink_clawhub_fixture_server "$FIXTURE_DIR"; then
-  echo "fixture unexpectedly became ready" >&2
-  exit 1
-fi
-server_pid="$(cat "$FIXTURE_DIR/clawhub-fixture-pid")"
-kill -0 "$server_pid"
-cleanup_kitchen_sink_sweep
-if kill -0 "$server_pid" 2>/dev/null; then
-  echo "fixture server still running after cleanup" >&2
-  exit 1
-fi
-test ! -e "$FIXTURE_DIR"
-test -d "$SCRATCH_ROOT"
-`,
-    env,
-  );
-
-  expect(result.status).toBe(0);
-  expect(result.output).toContain("Timed out waiting for kitchen-sink ClawHub fixture server.");
-  expect(existsSync(env.FIXTURE_DIR)).toBe(false);
-  expect(existsSync(env.SCRATCH_ROOT)).toBe(true);
+const commandIt = createCommandTest().extend({
+  command: async ({ signal, onTestFinished }, use) => {
+    await use(createCommandFixture({ signal, onTestFinished }, "tree"));
+  },
 });
-
-it("bounds ClawHub fixture server logs on startup timeout", async ({ signal, onTestFinished }) => {
-  const parent = mkdtempSync(path.join(tmpdir(), "openclaw-kitchen-sink-clawhub-log-"));
-  const env = serverFixture(parent);
-  const fixtureReadyPath = path.join(parent, "fixture-log-ready");
-  let command: ReturnType<typeof runManagedSweep> | undefined;
-  let cleanup: Promise<void> | undefined;
-  const close = () =>
-    (cleanup ??= (async () => {
-      await command?.catch(() => {});
-      rmSync(parent, { force: true, recursive: true });
-    })());
-  onTestFinished(close);
-  try {
+commandIt(
+  "bounds startup-timeout logs and cleans the ClawHub fixture server",
+  async ({ command }) => {
+    const parent = command.createTempDir("openclaw-kitchen-sink-clawhub-log-");
+    const env = serverFixture(parent);
+    const fixtureReadyPath = path.join(parent, "fixture-log-ready");
     writeExecutable(
       path.join(env.FAKE_BIN, "node"),
       `#!/usr/bin/env bash
@@ -624,8 +554,11 @@ printf "%s\\n" "$ready" >&3
 `,
     );
 
-    command = runManagedSweep(
-      `
+    const result = await command.run(
+      BASH_BIN,
+      [
+        "-c",
+        toBashScript(`
 mkfifo "$FIXTURE_READY_PATH"
 exec 3<>"$FIXTURE_READY_PATH"
 export PATH="$FAKE_BIN:$PATH"
@@ -635,19 +568,34 @@ set +e
 start_kitchen_sink_clawhub_fixture_server "$FIXTURE_DIR"
 status="$?"
 set -e
+test "$status" -ne 0
+server_pid="$(cat "$FIXTURE_DIR/clawhub-fixture-pid")"
+kill -0 "$server_pid"
 cleanup_kitchen_sink_sweep
+if kill -0 "$server_pid" 2>/dev/null; then
+  echo "fixture server still running after cleanup" >&2
+  exit 1
+fi
+test ! -e "$FIXTURE_DIR"
+test -d "$SCRATCH_ROOT"
+echo fixture-cleanup-complete
 exit "$status"
-`,
-      { ...env, FIXTURE_READY_PATH: fixtureReadyPath },
-      signal,
+`),
+      ],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, ...toBashEnv({ ...env, FIXTURE_READY_PATH: fixtureReadyPath }) },
+      },
     );
-    const result = await command;
+    expect(result.error).toBeUndefined();
 
     expect(result.status).not.toBe(0);
+    expect(result.stdout).toContain("fixture-cleanup-complete");
+    expect(result.stderr).toContain("Timed out waiting for kitchen-sink ClawHub fixture server.");
+    expect(existsSync(env.FIXTURE_DIR)).toBe(false);
+    expect(existsSync(env.SCRATCH_ROOT)).toBe(true);
     expect(result.stdout).toContain("truncated: showing last 64");
     expect(result.stdout).toContain("FIXTURE_TAIL_MARKER");
     expect(result.stdout).not.toContain("DO_NOT_DUMP_CLAWHUB_PREFIX");
-  } finally {
-    await close();
-  }
-});
+  },
+);
