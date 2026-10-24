@@ -28,6 +28,7 @@ import { sha256Hex } from "../../infra/crypto-digest.js";
 import { assertExistingDatabaseIdentity } from "../../infra/sqlite-worker-identity.js";
 import type { UserTurnTranscriptAdmissionReceipt } from "../../sessions/user-turn-transcript.types.js";
 import { applySkillEnvOverridesFromSnapshot } from "../../skills/runtime/env-overrides.js";
+import { sleep } from "../../utils/sleep.js";
 import {
   getAdmittedRunDelegatedAuthority,
   resolveAdmittedRunActiveAssertion,
@@ -48,9 +49,16 @@ import type { PreparedCliRunContext } from "./types.js";
  * failure: model fallback must stop instead of replaying the turn on another candidate.
  */
 export class CliHistoryOwnerChangedError extends Error {
-  constructor() {
+  /**
+   * `live-writer`: a different run that is still live holds the row (normally the previous
+   * turn settling its reply); it can clear once that run finishes. `replaced`: the session,
+   * lifecycle or writer changed under this run; that never clears and stays terminal.
+   */
+  readonly kind: "live-writer" | "replaced";
+  constructor(kind: "live-writer" | "replaced" = "replaced") {
     super("CLI history owner changed before preparation");
     this.name = "CliHistoryOwnerChangedError";
+    this.kind = kind;
   }
 }
 
@@ -98,17 +106,15 @@ export async function prepareCliHistoryBoundary(
      * with); without it no owner can be established and history is refused.
      */
     preparedBackend?: Parameters<typeof resolveCliChildEnv>[0];
-    /**
-     * How long to wait for a live prior writer (usually the previous turn of the same
-     * session still settling its reply) before refusing. Defaults to 15 s; 0 refuses at once.
-     */
-    ownerSettleTimeoutMs?: number;
   },
 ): Promise<CliExecutionHistoryWriter | undefined> {
-  const deadline =
-    Date.now() + Math.max(0, identity.ownerSettleTimeoutMs ?? OWNER_SETTLE_TIMEOUT_MS);
+  const deadline = Date.now() + OWNER_SETTLE_TIMEOUT_MS;
   let rereadAfterSettlement = false;
-  for (let delayMs = OWNER_SETTLE_INITIAL_DELAY_MS; ; delayMs = Math.min(delayMs * 2, 1_000)) {
+  for (
+    let delayMs = OWNER_SETTLE_INITIAL_DELAY_MS;
+    ;
+    delayMs = Math.min(delayMs * 2, OWNER_SETTLE_MAX_DELAY_MS)
+  ) {
     try {
       return await prepareCliHistoryBoundaryOnce(params, identity);
     } catch (error) {
@@ -120,42 +126,27 @@ export async function prepareCliHistoryBoundary(
         rereadAfterSettlement = true;
         continue;
       }
+      // Only a live predecessor can clear by waiting. Lifecycle, session or writer
+      // replacement is terminal and propagates at once.
       if (
         !(error instanceof CliHistoryOwnerChangedError) ||
+        error.kind !== "live-writer" ||
         Date.now() >= deadline
       ) {
         throw error;
       }
-      // A live prior writer still owns the row (typically the previous turn finishing its
-      // reply when the next message arrives). Nothing committed; wait for it to settle.
-      await sleepUnlessAborted(
-        Math.min(delayMs, Math.max(0, deadline - Date.now())),
-        params.abortSignal,
-      );
+      // Nothing committed and no history was read; wait for the predecessor to settle.
+      await sleep(Math.min(delayMs, Math.max(0, deadline - Date.now())), params.abortSignal);
+      // The wait can outlive this run's authority. A revoked, replaced or aborted run must
+      // fail here rather than replan (the replan itself also refences at commit).
+      createCliRunCurrentAssertion(params)();
     }
   }
 }
 
 const OWNER_SETTLE_TIMEOUT_MS = 15_000;
 const OWNER_SETTLE_INITIAL_DELAY_MS = 100;
-
-function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(signal.reason);
-      return;
-    }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(signal?.reason);
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
+const OWNER_SETTLE_MAX_DELAY_MS = 1_000;
 
 /** Compaction may rewrite a covered transcript, but cannot establish account provenance. */
 export async function prepareCliHistoryCompactionBoundary(
@@ -325,7 +316,7 @@ async function prepareCliHistoryBoundaryOnce(
           snapshot.activeWriterRunId !== writerRunId &&
           hasLiveAgentRunContext(snapshot.activeWriterRunId)
         ) {
-          throw new CliHistoryOwnerChangedError();
+          throw new CliHistoryOwnerChangedError("live-writer");
         }
         assertSource();
       }),
