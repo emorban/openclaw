@@ -305,6 +305,7 @@ it("leaves a missing lifecycle store absent", async () => {
 });
 
 it("pages orphan marker reads while protecting fresh and retained history", () => {
+  const freshSessionId = "history-000";
   const ids = Array.from(
     { length: 129 },
     (_, index) => `history-${String(index).padStart(3, "0")}`,
@@ -354,10 +355,10 @@ it("pages orphan marker reads while protecting fresh and retained history", () =
         .prepare(
           "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?, 1, ?, ?)",
         )
-        .run(ids[0], JSON.stringify({ type: "metadata" }), nowMs);
+        .run(freshSessionId, JSON.stringify({ type: "metadata" }), nowMs);
     }, options);
     expect(plan().deletePlans.map((item) => item.sessionId)).toEqual(
-      ids.filter((id) => id !== ids[0] && id !== ids.at(-2)),
+      ids.filter((id) => id !== freshSessionId && id !== ids.at(-2)),
     );
     expect(reads.counts.transcriptSelection).toBe(4);
   } finally {
