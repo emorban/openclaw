@@ -227,7 +227,10 @@ describe.skipIf(!connection)("PostgreSQL binary vector schema", () => {
           const search = admitStoreSearch(migrated, vectorSchema(dim));
           const query = Array<number>(dim).fill(0);
           query[0] = -1;
-          const table = sql.table(`vectors_${dim}`);
+          const table =
+            /* kysely-allow-raw: Table comes from this fixture's admitted vector index. */ sql.table(
+              search.vectors.notes!.table,
+            );
           pending.push(
             search.vector!.nearest<{ id: string }>({
               index: search.vectors.notes!,
