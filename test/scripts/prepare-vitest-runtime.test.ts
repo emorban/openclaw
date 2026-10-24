@@ -93,6 +93,82 @@ beforeEach(async () => {
 afterEach(() => vi.restoreAllMocks());
 
 it.each([
+  { preparation: "ran", dts: undefined },
+  { preparation: "ran", dts: "0" },
+  { preparation: "ran", dts: "1" },
+  ...["cached", "reused", "postbuild", "warm", "locked recheck"].map((preparation) => ({
+    preparation,
+    dts: "1",
+  })),
+])(
+  "keeps the standalone AI writer unless an equivalent typed build completed here: $preparation, DTS=$dts",
+  async ({ preparation, dts }) => {
+    env.OPENCLAW_RUN_NODE_SKIP_DTS_BUILD = dts;
+    const resolvePreparation = vi.spyOn(sourceRunner, "resolveRunNodePreparation");
+    resolvePreparation.mockReturnValue({
+      build: !["warm", "postbuild"].includes(preparation),
+      runtime: preparation === "postbuild",
+      immutable: false,
+    });
+    if (preparation === "locked recheck") {
+      resolvePreparation.mockReturnValueOnce({ build: true, runtime: true, immutable: false });
+      resolvePreparation.mockReturnValue({ build: false, runtime: false, immutable: false });
+    }
+    vi.spyOn(postbuild, "runRuntimePostBuild").mockImplementation(() => {});
+    const build = vi.spyOn(buildAll, "runBuildAllSteps").mockResolvedValue({
+      exitCode: 0,
+      timings: [
+        { label: "tsdown", status: preparation === "ran" ? "ran" : "cached", durationMs: 1 },
+      ],
+    });
+    if (preparation === "reused") {
+      build.mockResolvedValue({
+        exitCode: 0,
+        timings: [{ label: "tsdown", status: "reused", durationMs: 1 }],
+      });
+    }
+    commands.prepare.mockImplementation(async ({ env: commandEnv, signal }) => {
+      expect(commandEnv).toBe(env);
+      expect(commandEnv.OPENCLAW_RUN_NODE_SKIP_DTS_BUILD).toBe(dts);
+      // A standalone writer must be able to acquire its own claim immediately.
+      const claim = await acquireDistArtifactOwnership(root, false, signal);
+      await claim.release();
+      return 0;
+    });
+    expect(await prepareTestRuntime(root, env, undefined, { withAiPackage: true })).toBe(0);
+    expect(commands.prepare).toHaveBeenCalledTimes(preparation === "ran" && dts !== "1" ? 0 : 1);
+    if (build.mock.calls.length) {
+      expect(build).toHaveBeenCalledWith(
+        "qaRuntime",
+        expect.objectContaining({
+          env: { ...env, OPENCLAW_BUILD_PRIVATE_QA: "1", OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "0" },
+        }),
+      );
+    }
+  },
+);
+
+it("propagates the joined standalone AI writer's failure", async () => {
+  mockPreparation(false);
+  commands.prepare.mockResolvedValue(23);
+  expect(await prepareTestRuntime(root, env, undefined, { withAiPackage: true })).toBe(23);
+});
+
+it("does not start another writer after a failed compiler generation", async () => {
+  vi.spyOn(sourceRunner, "resolveRunNodePreparation").mockReturnValue({
+    build: true,
+    runtime: true,
+    immutable: false,
+  });
+  vi.spyOn(buildAll, "runBuildAllSteps").mockResolvedValue({
+    exitCode: 7,
+    timings: [{ label: "tsdown", status: "ran", durationMs: 1 }],
+  });
+  expect(await prepareTestRuntime(root, env, undefined, { withAiPackage: true })).toBe(7);
+  expect(commands.prepare).not.toHaveBeenCalled();
+});
+
+it.each([
   "unavailable service",
   "incomplete inventory",
   "live overlapping service",
@@ -264,7 +340,7 @@ it("joins a canceled compiler before releasing checkout ownership", async () => 
       return { status: 0 };
     },
   });
-  const attempt = prepareTestRuntime(root, env, controller.signal);
+  const attempt = prepareTestRuntime(root, env, controller.signal, { withAiPackage: true });
   try {
     await Promise.race([started.promise, attempt]);
     controller.abort();
@@ -276,6 +352,7 @@ it("joins a canceled compiler before releasing checkout ownership", async () => 
     await expect(attempt).rejects.toMatchObject({ name: "AbortError" });
   }
   expect(finalize).not.toHaveBeenCalled();
+  expect(commands.prepare).not.toHaveBeenCalled();
   const next = await acquireDistArtifactOwnership(root);
   await next.release();
 });
