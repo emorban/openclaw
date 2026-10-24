@@ -187,6 +187,22 @@ function evaluate(
   };
 }
 
+type ReviewResult = ReturnType<typeof evaluate>;
+
+function requestsFor(result: ReviewResult, route: string) {
+  return result.requests.filter((entry) => `${entry.method} ${entry.path}` === route);
+}
+
+function afterFirstWait(result: ReviewResult) {
+  return result.requests.slice(result.requests.findIndex((entry) => entry.method === "WAIT") + 1);
+}
+
+const filePage = () =>
+  Array.from({ length: 100 }, (_, index) => ({
+    filename: `docs/page-${index}.md`,
+    status: "modified",
+  }));
+
 describe("combined security review entry point", () => {
   it("finishes ordinary preparation with the same decisions and fewer requests than separate detection", () => {
     const detection = evaluate({}, "detect");
@@ -269,9 +285,7 @@ describe("combined security review entry point", () => {
     const result = evaluate({ [route]: { responses: [failure, response] } });
     expect(result.status, result.stderr).toBe(0);
     expect(result.waits).toEqual([1_000]);
-    const afterWait = result.requests.slice(
-      result.requests.findIndex((entry) => entry.method === "WAIT") + 1,
-    );
+    const afterWait = afterFirstWait(result);
     expect(afterWait[0]).toMatchObject({ method: "GET", path: pullPath });
     expect(result.combined.at(-1)).toBe("success");
   });
@@ -302,9 +316,7 @@ describe("combined security review entry point", () => {
     });
     expect(result.status, result.stderr).toBe(0);
     expect(result.waits).toEqual([1_000]);
-    const afterWait = result.requests.slice(
-      result.requests.findIndex((entry) => entry.method === "WAIT") + 1,
-    );
+    const afterWait = afterFirstWait(result);
     expect(afterWait[0]).toMatchObject({ method: "GET", path: pullPath });
     expect(afterWait.some((entry) => entry.body?.state === "success")).toBe(false);
     expect(result.combined.at(-1)).toBe("failure");
@@ -324,9 +336,7 @@ describe("combined security review entry point", () => {
     );
     expect(result.status, result.stderr).toBe(0);
     expect(result.waits).toEqual([1_000]);
-    const afterWait = result.requests.slice(
-      result.requests.findIndex((entry) => entry.method === "WAIT") + 1,
-    );
+    const afterWait = afterFirstWait(result);
     expect(afterWait[0]).toMatchObject({ method: "GET", path: pullPath });
     expect(result.requests.filter((entry) => entry.path === "/graphql")).toHaveLength(1);
   });
@@ -476,9 +486,7 @@ describe("combined security review entry point", () => {
     });
     expect(result.status).toBe(1);
     expect(result.waits).toEqual([]);
-    expect(
-      result.requests.filter((entry) => entry.method === "POST" && entry.path === commentPath),
-    ).toHaveLength(1);
+    expect(requestsFor(result, `POST ${commentPath}`)).toHaveLength(1);
     expect(result.combined.at(-1)).toBe("failure");
     expect(result.stderr).toContain(`GitHub API POST ${commentPath} failed: 400`);
   });
@@ -511,9 +519,7 @@ describe("combined security review entry point", () => {
       } else {
         expect(result.waits).toEqual([1_000, 2_000, 4_000]);
       }
-      expect(
-        result.requests.filter((entry) => `${entry.method} ${entry.path}` === route),
-      ).toHaveLength(4);
+      expect(requestsFor(result, route)).toHaveLength(4);
       expect(result.requests.some((entry) => entry.body?.state === "success")).toBe(false);
     },
   );
@@ -529,9 +535,7 @@ describe("combined security review entry point", () => {
     });
     expect(result.status).toBe(1);
     expect(result.waits).toEqual([]);
-    expect(
-      result.requests.filter((entry) => `${entry.method} ${entry.path}` === route),
-    ).toHaveLength(1);
+    expect(requestsFor(result, route)).toHaveLength(1);
     expect(result.stderr).toContain("exceeded timeout 30000ms");
     expect(result.combined).not.toContain("success");
   });
@@ -585,9 +589,7 @@ describe("combined security review entry point", () => {
     });
     expect(result.status, result.stderr).toBe(0);
     expect(result.waits).toEqual([30_000, 30_000]);
-    const afterWait = result.requests.slice(
-      result.requests.findIndex((entry) => entry.method === "WAIT") + 1,
-    );
+    const afterWait = afterFirstWait(result);
     expect(afterWait[0]).toMatchObject({ method: "GET", path: pullPath });
     expect(afterWait.some((entry) => entry.body?.state === "success")).toBe(false);
     expect(result.combined.at(-1)).toBe("failure");
@@ -597,10 +599,7 @@ describe("combined security review entry point", () => {
   });
 
   it("restarts incomplete pagination and still requires approval for recovered sensitive files", () => {
-    const firstPage = Array.from({ length: 100 }, (_, index) => ({
-      filename: `docs/example-${index}.md`,
-      status: "modified",
-    }));
+    const firstPage = filePage();
     const result = evaluate({
       [`GET ${pullPath}`]: { ...pr, changed_files: 102 },
       [`GET ${pullPath}/files`]: { responses: [firstPage, [], firstPage, files] },
@@ -653,9 +652,7 @@ describe("combined security review entry point", () => {
       expect(result.stdout).toContain("Superseded");
       expect(result.waits).toEqual([30_000]);
       expect(result.requests.filter((entry) => entry.path === pullPath + "/files")).toHaveLength(1);
-      const afterWait = result.requests.slice(
-        result.requests.findIndex((entry) => entry.method === "WAIT") + 1,
-      );
+      const afterWait = afterFirstWait(result);
       expect(afterWait).toEqual([{ method: "GET", path: pullPath }]);
       expect(result.combined).not.toContain("success");
     },
@@ -664,10 +661,7 @@ describe("combined security review entry point", () => {
   it.each([false, true])(
     "checks the head before more slow file pages (superseded=%s)",
     (superseded) => {
-      const firstPage = Array.from({ length: 100 }, (_, index) => ({
-        filename: "docs/page-" + index + ".md",
-        status: "modified",
-      }));
+      const firstPage = filePage();
       const original = { ...pr, changed_files: 202 };
       const result = evaluate({
         [`GET ${pullPath}`]: {
@@ -806,9 +800,7 @@ describe("combined security review entry point", () => {
     });
     expect(result.status, result.stderr).toBe(0);
     expect(result.waits).toHaveLength(1);
-    const afterWait = result.requests.slice(
-      result.requests.findIndex((entry) => entry.method === "WAIT") + 1,
-    );
+    const afterWait = afterFirstWait(result);
     expect(afterWait[0]?.path).toBe(pullPath);
     expect(afterWait.some((entry) => entry.body?.state === "success")).toBe(false);
     expect(result.combined.at(-1)).toBe("failure");
@@ -824,9 +816,7 @@ describe("combined security review entry point", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(result.waits).toEqual([1_000]);
     expect(result.stdout).toContain("Superseded");
-    const afterWait = result.requests.slice(
-      result.requests.findIndex((entry) => entry.method === "WAIT") + 1,
-    );
+    const afterWait = afterFirstWait(result);
     expect(afterWait.every((entry) => entry.method === "GET")).toBe(true);
     expect(result.combined).not.toContain("success");
   });
@@ -895,9 +885,7 @@ describe("combined security review entry point", () => {
       });
       expect(result.status).toBe(1);
       expect(result.waits).toEqual([]);
-      expect(
-        result.requests.filter((entry) => entry.method === "POST" && entry.path === commentPath),
-      ).toHaveLength(1);
+      expect(requestsFor(result, `POST ${commentPath}`)).toHaveLength(1);
       expect(result.combined.at(-1)).toBe("failure");
       expect(result.stderr).toContain(`GitHub API POST ${commentPath} failed: 400`);
     },
@@ -918,9 +906,7 @@ describe("combined security review entry point", () => {
       });
       expect(result.status, result.stderr).toBe(0);
       expect(result.waits).toEqual([1_000]);
-      const afterWait = result.requests.slice(
-        result.requests.findIndex((entry) => entry.method === "WAIT") + 1,
-      );
+      const afterWait = afterFirstWait(result);
       expect(afterWait[0]).toMatchObject({ method: "GET", path: pullPath });
       const commentRead = afterWait.findIndex(
         (entry) => entry.method === "GET" && entry.path === commentPath,
@@ -932,9 +918,7 @@ describe("combined security review entry point", () => {
         method: accepted ? "PATCH" : "POST",
         path: accepted ? "/repos/openclaw/openclaw/issues/comments/321" : commentPath,
       });
-      expect(
-        result.requests.filter((entry) => entry.method === "POST" && entry.path === commentPath),
-      ).toHaveLength(accepted ? 1 : 2);
+      expect(requestsFor(result, `POST ${commentPath}`)).toHaveLength(accepted ? 1 : 2);
       expect(result.combined.at(-1)).toBe("success");
     }
   });
@@ -1000,9 +984,7 @@ describe("combined security review entry point", () => {
     });
     expect(result.status, result.stderr).toBe(0);
     expect(result.waits).toEqual([1_000]);
-    const afterWait = result.requests.slice(
-      result.requests.findIndex((entry) => entry.method === "WAIT") + 1,
-    );
+    const afterWait = afterFirstWait(result);
     expect(afterWait).toEqual([{ method: "GET", path: pullPath }]);
     expect(result.stdout).toContain("Superseded");
     expect(result.combined).not.toContain("success");
@@ -1018,9 +1000,7 @@ describe("combined security review entry point", () => {
     });
     expect(result.status).toBe(1);
     expect(result.waits).toEqual([1_000, 2_000, 4_000]);
-    expect(
-      result.requests.filter((entry) => entry.method === "POST" && entry.path === commentPath),
-    ).toHaveLength(4);
+    expect(requestsFor(result, `POST ${commentPath}`)).toHaveLength(4);
     expect(result.combined).not.toContain("success");
     expect(result.stderr).toContain("recovery budget exhausted");
   });
@@ -1209,10 +1189,7 @@ describe("combined security review entry point", () => {
   );
 
   it("keeps reading file pages after a merge so late sensitive files are reviewed", () => {
-    const page = Array.from({ length: 100 }, (_, index) => ({
-      filename: `docs/page-${index}.md`,
-      status: "modified",
-    }));
+    const page = filePage();
     const result = evaluate({
       [`GET ${pullPath}`]: {
         settlesAt: "2026-01-02T00:00:30Z",
@@ -1307,10 +1284,7 @@ describe("combined security review entry point", () => {
   );
 
   it.each(lifecycleChanges)("stops a $name before reading more file pages", ({ changedPr }) => {
-    const page = Array.from({ length: 100 }, (_, index) => ({
-      filename: `docs/page-${index}.md`,
-      status: "modified",
-    }));
+    const page = filePage();
     const result = evaluate({
       [`GET ${pullPath}`]: {
         settlesAt: "2026-01-02T00:00:30Z",
