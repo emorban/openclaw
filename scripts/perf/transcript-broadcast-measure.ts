@@ -4450,7 +4450,6 @@ try {
       ),
     );
   }
-  console.log("PHASE warmed");
   if (values["worker-retained-heap"]) {
     const resources = await readGatewayResources(gateway, { includeWorkers: true });
     const live = [
@@ -4482,6 +4481,18 @@ try {
       }
     }
   }
+  const initialRetainedResources = reasoningScenario
+    ? await readGatewayResources(gateway, {
+        includeWorkers: true,
+        collectGarbage: !soakScenario || !values.allocations,
+        sessionCensus: values["session-census"],
+        ...(idleScenario && values["heap-snapshot"]
+          ? { snapshotPath: path.join(output, "initial.heapsnapshot") }
+          : {}),
+      })
+    : undefined;
+  // Both peers must finish forced collections before releasing their shared start.
+  console.log("PHASE warmed");
   if (values["start-file"]) {
     while (!existsSync(values["start-file"])) {
       assertGatewayAlive();
@@ -4495,16 +4506,6 @@ try {
     }
     await delay(startAt - Date.now());
   }
-  const initialRetainedResources = reasoningScenario
-    ? await readGatewayResources(gateway, {
-        includeWorkers: true,
-        collectGarbage: !soakScenario || !values.allocations,
-        sessionCensus: values["session-census"],
-        ...(idleScenario && values["heap-snapshot"]
-          ? { snapshotPath: path.join(output, "initial.heapsnapshot") }
-          : {}),
-      })
-    : undefined;
   const soakAllocationPath =
     soakScenario && values.allocations
       ? path.join(output, "allocation-soak.heapprofile")
