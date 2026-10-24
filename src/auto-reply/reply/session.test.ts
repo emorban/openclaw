@@ -36,6 +36,7 @@ import {
   testing as sessionBindingTesting,
   getSessionBindingService,
   registerSessionBindingAdapter,
+  type SessionBindingRecord,
 } from "../../infra/outbound/session-binding-service.js";
 import {
   enqueueSystemEvent,
@@ -242,20 +243,7 @@ function registerCurrentConversationBindingAdapterForTest(params: {
   channel: "slack" | "signal" | "googlechat";
   accountId: string;
 }): void {
-  const bindings: Array<{
-    bindingId: string;
-    targetSessionKey: string;
-    targetKind: "session" | "subagent";
-    conversation: {
-      channel: string;
-      accountId: string;
-      conversationId: string;
-      parentConversationId?: string;
-    };
-    status: "active";
-    boundAt: number;
-    metadata?: Record<string, unknown>;
-  }> = [];
+  const bindings: SessionBindingRecord[] = [];
   registerSessionBindingAdapter({
     channel: params.channel,
     accountId: params.accountId,
@@ -2331,29 +2319,14 @@ describe("initSessionState reset authorization", () => {
 });
 
 describe("initSessionState reset triggers in Slack channels", () => {
-  async function seedSessionStore(params: {
-    storePath: string;
-    sessionKey: string;
-    sessionId: string;
-  }): Promise<void> {
-    await writeSessionStoreFast(params.storePath, {
-      [params.sessionKey]: {
-        sessionId: params.sessionId,
-        updatedAt: Date.now(),
-      },
-    });
-  }
-
   it("supports mention-prefixed Slack reset commands and preserves args", async () => {
     setMinimalCurrentConversationBindingRegistryForTests();
     const existingSessionId = "existing-session-123";
     const sessionKey = "agent:main:slack:channel:c2";
     const body = "<@U123> /new take notes";
     const storePath = await makeStorePath("openclaw-slack-channel-new-");
-    await seedSessionStore({
-      storePath,
-      sessionKey,
-      sessionId: existingSessionId,
+    await writeSessionStoreFast(storePath, {
+      [sessionKey]: { sessionId: existingSessionId, updatedAt: Date.now() },
     });
     const cfg = {
       session: { store: storePath, idleMinutes: 999 },
@@ -2386,21 +2359,6 @@ describe("initSessionState reset triggers in Slack channels", () => {
 });
 
 describe("initSessionState preserves behavior overrides across /new and /reset", () => {
-  async function seedSessionStoreWithOverrides(params: {
-    storePath: string;
-    sessionKey: string;
-    sessionId: string;
-    overrides: Record<string, unknown>;
-  }): Promise<void> {
-    await writeSessionStoreFast(params.storePath, {
-      [params.sessionKey]: {
-        sessionId: params.sessionId,
-        updatedAt: Date.now(),
-        ...params.overrides,
-      },
-    });
-  }
-
   it("rejects replacement of a restart-tombstoned model-locked session", async () => {
     const storePath = await makeStorePath("openclaw-reset-tombstone-model-locked-");
     const sessionKey = "agent:main:telegram:dm:tombstone-model-locked";
@@ -2561,22 +2519,17 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
     };
     for (const { name, result, stored } of cases) {
       expect(result, name).toMatchObject({ isNewSession: true, resetTriggered: true, sessionId });
-      expectEntryFields(result.sessionEntry, expected, name);
-      expect(result.sessionEntry).toMatchObject({
-        totalTokens: 0,
-        totalTokensFresh: true,
-        compactionCount: 0,
-      });
-      expect(stored[sessionKey]).toMatchObject({
-        totalTokens: 0,
-        totalTokensFresh: true,
-        compactionCount: 0,
-      });
-      expectEntryFields(
+      for (const entry of [
+        result.sessionEntry,
         expectDefined(stored[sessionKey], "stored model selection"),
-        expected,
-        name,
-      );
+      ]) {
+        expectEntryFields(entry, expected, name);
+        expect(entry, name).toMatchObject({
+          totalTokens: 0,
+          totalTokensFresh: true,
+          compactionCount: 0,
+        });
+      }
     }
   });
 
@@ -2585,11 +2538,8 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
     const sessionKey = "agent:main:telegram:dm:provider-authoritative";
     const existingSessionId = "existing-session-provider-authoritative";
 
-    await seedSessionStoreWithOverrides({
-      storePath,
-      sessionKey,
-      sessionId: existingSessionId,
-      overrides: {},
+    await writeSessionStoreFast(storePath, {
+      [sessionKey]: { sessionId: existingSessionId, updatedAt: Date.now() },
     });
 
     const cfg = {
@@ -2623,11 +2573,12 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
       const storePath = await makeStorePath(`openclaw-archive-old-${slug}-`);
       const sessionKey = `agent:main:telegram:dm:user-archive-${slug}`;
       const existingSessionId = `existing-session-archive-${slug}`;
-      await seedSessionStoreWithOverrides({
-        storePath,
-        sessionKey,
-        sessionId: existingSessionId,
-        overrides: { verboseLevel: "on" },
+      await writeSessionStoreFast(storePath, {
+        [sessionKey]: {
+          sessionId: existingSessionId,
+          updatedAt: Date.now(),
+          verboseLevel: "on",
+        },
       });
       await appendTranscriptMessage(
         { agentId: "main", sessionId: existingSessionId, sessionKey, storePath },
@@ -2686,17 +2637,7 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
       const result = await admission.run(
         async () =>
           await initSessionState({
-            ctx: {
-              Body: "/reset",
-              RawBody: "/reset",
-              CommandBody: "/reset",
-              From: "user-rollover-initiator",
-              To: "bot",
-              ChatType: "direct",
-              SessionKey: sessionKey,
-              Provider: "telegram",
-              Surface: "telegram",
-            },
+            ctx: telegramTurn(sessionKey, "/reset", "user-rollover-initiator"),
             cfg: { session: { store: storePath, idleMinutes: 999 } } as OpenClawConfig,
           }),
       );
@@ -2835,14 +2776,8 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
     });
     releaseReplacementAdmission = replacementAdmission.release;
 
-    let signalMutationStarted = () => {};
-    const mutationStarted = new Promise<void>((resolve) => {
-      signalMutationStarted = resolve;
-    });
-    let releaseMutation = () => {};
-    const mutationGate = new Promise<void>((resolve) => {
-      releaseMutation = resolve;
-    });
+    const { resolve: signalMutationStarted, promise: mutationStarted } = createDeferred();
+    const { resolve: releaseMutation, promise: mutationGate } = createDeferred();
     const blockingMutation = runSessionMutation({
       scope: storePath,
       identities: [sessionKey, staleSessionId],
@@ -2966,14 +2901,30 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
     }
   });
 
-  it("does not defer stale boundary append for the current turn's queued reservation", async () => {
+  it.each([
+    {
+      label: "the current turn's queued reservation",
+      prefix: "openclaw-queued-stale-archive-",
+      sessionKey: "agent:main:telegram:dm:queued-stale-user",
+      existingSessionId: "queued-stale-session",
+      from: "user-queued-stale",
+      phase: "queued",
+    },
+    {
+      label: "a different active session id",
+      prefix: "openclaw-active-other-stale-archive-",
+      sessionKey: "agent:main:telegram:dm:active-other-stale-user",
+      existingSessionId: "inactive-stale-session",
+      from: "user-active-other-stale",
+      phase: "running",
+    },
+  ] as const)("does not defer stale boundary append for $label", async (scenario) => {
     vi.useFakeTimers();
     let operation: ReturnType<typeof createReplyOperation> | undefined;
     try {
       vi.setSystemTime(new Date(2026, 0, 18, 5, 0, 0));
-      const storePath = await makeStorePath("openclaw-queued-stale-archive-");
-      const sessionKey = "agent:main:telegram:dm:queued-stale-user";
-      const existingSessionId = "queued-stale-session";
+      const storePath = await makeStorePath(scenario.prefix);
+      const { sessionKey, existingSessionId } = scenario;
       const transcriptPath = path.join(path.dirname(storePath), `${existingSessionId}.jsonl`);
 
       await writeSessionStoreFast(storePath, {
@@ -2985,91 +2936,32 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
       await fs.writeFile(transcriptPath, '{"type":"message"}\n', "utf8");
       operation = createReplyOperation({
         sessionKey,
-        sessionId: existingSessionId,
+        sessionId: scenario.phase === "queued" ? existingSessionId : "different-active-session",
         resetTriggered: false,
       });
+      if (scenario.phase === "running") {
+        operation.setPhase("running");
+      }
 
       const cfg = {
         session: { store: storePath, reset: { mode: "daily", atHour: 4 } },
       } as OpenClawConfig;
-      const initialization = runWithReplyOperationLifecycleAdmission(operation, () =>
+      const initialize = () =>
         initSessionState({
-          ctx: {
-            Body: "hello after boundary",
-            RawBody: "hello after boundary",
-            CommandBody: "hello after boundary",
-            From: "user-queued-stale",
-            To: "bot",
-            ChatType: "direct",
-            SessionKey: sessionKey,
-            Provider: "telegram",
-            Surface: "telegram",
-          },
+          ctx: telegramTurn(sessionKey, "hello after boundary", scenario.from),
           cfg,
-        }),
-      );
+        });
+      const initialization =
+        scenario.phase === "queued"
+          ? runWithReplyOperationLifecycleAdmission(operation, initialize)
+          : initialize();
       void initialization.catch(() => {});
-      await vi.advanceTimersByTimeAsync(0);
+      if (scenario.phase === "queued") {
+        await vi.advanceTimersByTimeAsync(0);
+      }
       const result = await initialization;
 
-      expect(operation.phase).toBe("queued");
-      expect(result.isNewSession).toBe(true);
-      expect(result.resetTriggered).toBe(false);
-      expect(result.sessionId).toBe(existingSessionId);
-      expect(result.previousSessionEntry?.sessionId).toBe(existingSessionId);
-      expect(await fs.stat(transcriptPath).catch(() => null)).not.toBeNull();
-      const archived = (await fs.readdir(path.dirname(storePath))).filter((entry) =>
-        entry.startsWith(`${existingSessionId}.jsonl.reset.`),
-      );
-      expect(archived).toHaveLength(0);
-    } finally {
-      operation?.complete();
-      vi.useRealTimers();
-    }
-  });
-
-  it("does not defer stale boundary append for a different active session id", async () => {
-    vi.useFakeTimers();
-    let operation: ReturnType<typeof createReplyOperation> | undefined;
-    try {
-      vi.setSystemTime(new Date(2026, 0, 18, 5, 0, 0));
-      const storePath = await makeStorePath("openclaw-active-other-stale-archive-");
-      const sessionKey = "agent:main:telegram:dm:active-other-stale-user";
-      const existingSessionId = "inactive-stale-session";
-      const transcriptPath = path.join(path.dirname(storePath), `${existingSessionId}.jsonl`);
-
-      await writeSessionStoreFast(storePath, {
-        [sessionKey]: {
-          sessionId: existingSessionId,
-          updatedAt: new Date(2026, 0, 18, 3, 0, 0).getTime(),
-        },
-      });
-      await fs.writeFile(transcriptPath, '{"type":"message"}\n', "utf8");
-      operation = createReplyOperation({
-        sessionKey,
-        sessionId: "different-active-session",
-        resetTriggered: false,
-      });
-      operation.setPhase("running");
-
-      const cfg = {
-        session: { store: storePath, reset: { mode: "daily", atHour: 4 } },
-      } as OpenClawConfig;
-      const result = await initSessionState({
-        ctx: {
-          Body: "hello after boundary",
-          RawBody: "hello after boundary",
-          CommandBody: "hello after boundary",
-          From: "user-active-other-stale",
-          To: "bot",
-          ChatType: "direct",
-          SessionKey: sessionKey,
-          Provider: "telegram",
-          Surface: "telegram",
-        },
-        cfg,
-      });
-
+      expect(operation.phase).toBe(scenario.phase);
       expect(result.isNewSession).toBe(true);
       expect(result.resetTriggered).toBe(false);
       expect(result.sessionId).toBe(existingSessionId);
@@ -3400,40 +3292,28 @@ describe("initSessionState internal channel routing preservation", () => {
 
     expect(result.sessionEntry.lastChannel).toBe("mattermost");
     expect(result.sessionEntry.lastTo).toBe("channel:CHAN1");
-    expect(result.sessionEntry.lastThreadId).toBeUndefined();
-    expect(result.sessionEntry.deliveryContext).toEqual({
-      channel: "mattermost",
-      to: "channel:CHAN1",
-      accountId: "default",
-    });
-    expect(result.sessionEntry.route).toEqual({
-      channel: "mattermost",
-      accountId: "default",
-      target: { to: "channel:CHAN1" },
-    });
-    expect(result.sessionEntry.origin).toEqual({
-      provider: "mattermost",
-      to: "channel:CHAN1",
-      accountId: "default",
-    });
-
     const persisted = readSessionStoreFast(storePath);
-    expect(persisted[sessionKey]?.lastThreadId).toBeUndefined();
-    expect(persisted[sessionKey]?.deliveryContext).toEqual({
-      channel: "mattermost",
-      to: "channel:CHAN1",
-      accountId: "default",
-    });
-    expect(persisted[sessionKey]?.route).toEqual({
-      channel: "mattermost",
-      accountId: "default",
-      target: { to: "channel:CHAN1" },
-    });
-    expect(persisted[sessionKey]?.origin).toEqual({
-      provider: "mattermost",
-      to: "channel:CHAN1",
-      accountId: "default",
-    });
+    for (const [source, entry] of [
+      ["result", result.sessionEntry],
+      ["persisted", persisted[sessionKey]],
+    ] as const) {
+      expect(entry?.lastThreadId, source).toBeUndefined();
+      expect(entry?.deliveryContext, source).toEqual({
+        channel: "mattermost",
+        to: "channel:CHAN1",
+        accountId: "default",
+      });
+      expect(entry?.route, source).toEqual({
+        channel: "mattermost",
+        accountId: "default",
+        target: { to: "channel:CHAN1" },
+      });
+      expect(entry?.origin, source).toEqual({
+        provider: "mattermost",
+        to: "channel:CHAN1",
+        accountId: "default",
+      });
+    }
   });
 
   it.each([
