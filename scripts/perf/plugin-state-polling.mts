@@ -32,7 +32,9 @@ const { values } = parseArgs({
     profile: { type: "boolean", default: false },
   },
 });
-if (!values.output || !values.observer) throw new Error("--output and --observer are required");
+if (!values.output || !values.observer) {
+  throw new Error("--output and --observer are required");
+}
 const seconds = Number(values.seconds);
 const messageCount = Number(values.messages);
 if (
@@ -141,13 +143,21 @@ const relay = createServer((req, res) => {
 const sockets = new WebSocketServer({ server: relay, path: "/v1/mail/ws" });
 sockets.on("connection", (socket) =>
   socket.on("message", (message) => {
-    if (message.toString() === "ping") socket.send("pong");
+    if (
+      new TextDecoder().decode(Array.isArray(message) ? Buffer.concat(message) : message) === "ping"
+    ) {
+      socket.send("pong");
+    }
   }),
 );
-await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+await new Promise<void>((resolve) => {
+  relay.listen(0, "127.0.0.1", resolve);
+});
 try {
   const address = relay.address();
-  if (!address || typeof address === "string") throw new Error("relay did not bind");
+  if (!address || typeof address === "string") {
+    throw new Error("relay did not bind");
+  }
   const relayUrl = `http://127.0.0.1:${address.port}`;
   const port = await getFreePort();
   const configPath = writeGatewayBenchConfig(
@@ -217,11 +227,14 @@ try {
       },
     );
     const reviews = seed("reviews", 2000);
-    for (const { review } of envelopes) await reviews.register(review.approvalDigest, { review });
-    if (values["expired-peer"])
+    for (const { review } of envelopes) {
+      await reviews.register(review.approvalDigest, { review });
+    }
+    if (values["expired-peer"]) {
       await seed("expired", 1, "synthetic-expired-peer", 1).register("expired", {
         synthetic: true,
       });
+    }
   } finally {
     await closeOpenClawStateDatabaseAsync();
   }
@@ -260,11 +273,19 @@ try {
       deadlineAt: performance.now() + 120_000,
       isDone: () => child.exitCode !== null || child.signalCode !== null,
     });
-    if (initial.status !== 200)
+    if (initial.status !== 200) {
       throw new Error("Gateway did not become healthy; inspect gateway.log");
+    }
     const deadline = Date.now() + 60_000;
-    while (!polls && Date.now() < deadline && child.exitCode === null) await delay(100);
-    if (!polls) throw new Error("Reef never polled the loopback relay; inspect gateway.log");
+    while (Date.now() < deadline) {
+      if (polls || child.exitCode !== null) {
+        break;
+      }
+      await delay(100);
+    }
+    if (!polls) {
+      throw new Error("Reef never polled the loopback relay; inspect gateway.log");
+    }
     // Let initial delivery and the startup reconcile finish before warm polling.
     await delay(40_000);
     const initialPolls = polls;
@@ -273,8 +294,9 @@ try {
     await delay(seconds * 1000);
     const durationMs = performance.now() - started;
     writeFileSync(path.join(sql, "phase"), "shutdown");
-    if (child.exitCode !== null || child.signalCode !== null)
+    if (child.exitCode !== null || child.signalCode !== null) {
       throw new Error("Gateway exited during measurement");
+    }
     const result = {
       messageCount,
       expiredPeer: values["expired-peer"],
@@ -293,20 +315,27 @@ try {
   const summary = new Map<string, number>();
   let requests = 0;
   let main = 0;
-  for (const file of readdirSync(sql).filter((file) => file.endsWith(".jsonl"))) {
+  for (const file of readdirSync(sql).filter((name) => name.endsWith(".jsonl"))) {
     const sites = new Map<number, { method: string; sql: string }>();
     let isMain = false;
     for (const line of readFileSync(path.join(sql, file), "utf8").trim().split("\n")) {
       const row = JSON.parse(line);
-      if (row.type === "process") isMain = row.isMainThread;
-      else if (row.type === "site") sites.set(row.id, row);
-      else if (row.type === "request" && row.phase === "steady") requests++;
-      else if (Array.isArray(row) && row[0] === "steady") {
+      if (row.type === "process") {
+        isMain = row.isMainThread;
+      } else if (row.type === "site") {
+        sites.set(row.id, row);
+      } else if (row.type === "request" && row.phase === "steady") {
+        requests++;
+      } else if (Array.isArray(row) && row[0] === "steady") {
         const site = sites.get(row[1]);
-        if (!site || site.method === "prepare") continue;
+        if (!site || site.method === "prepare") {
+          continue;
+        }
         const shape = site.sql.replace(/\s+/g, " ").trim();
         summary.set(shape, (summary.get(shape) ?? 0) + 1);
-        if (isMain) main++;
+        if (isMain) {
+          main++;
+        }
       }
     }
   }
@@ -317,14 +346,18 @@ try {
         requests,
         main,
         statements: [...summary.values()].reduce((sum, n) => sum + n, 0),
-        shapes: [...summary].sort((a, b) => b[1] - a[1]),
+        shapes: [...summary].toSorted((a, b) => b[1] - a[1]),
       },
       null,
       2,
     ),
   );
 } finally {
-  for (const socket of sockets.clients) socket.terminate();
+  for (const socket of sockets.clients) {
+    socket.terminate();
+  }
   sockets.close();
-  await new Promise<void>((resolve) => relay.close(() => resolve()));
+  await new Promise<void>((resolve) => {
+    relay.close(() => resolve());
+  });
 }
