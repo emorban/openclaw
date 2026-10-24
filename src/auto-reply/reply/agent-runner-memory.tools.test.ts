@@ -334,18 +334,16 @@ describe("provider-owned memory flush", () => {
     expect(runEmbeddedAgentMock).toHaveBeenCalledWith(
       expect.objectContaining({ provider: "fixture", model: "active" }),
     );
-    expect(runWithModelFallbackMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        provider: "fixture",
-        model: "active",
-        fallbacksOverride: undefined,
-        modelFallbackAvailability: {
-          kind: "active",
-          models: ["fixture/backup"],
-          source: "inherited",
+    expect(runWithModelFallbackMock.mock.calls[0]?.[0]).toMatchObject({
+      fallbacksOverride: undefined,
+      cfg: {
+        agents: {
+          defaults: {
+            model: { primary: "fixture/default", fallbacks: ["fixture/backup"] },
+          },
         },
-      }),
-    );
+      },
+    });
     expect(
       loadSessionEntry({ storePath: overrides.storePath, sessionKey: overrides.sessionKey }),
     ).toMatchObject({
