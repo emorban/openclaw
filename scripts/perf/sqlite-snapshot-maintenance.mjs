@@ -13,8 +13,9 @@ const { values } = parseArgs({
     out: { type: "string" },
   },
 });
-if (!values.harness || !values.out)
+if (!values.harness || !values.out) {
   throw new Error("Use --harness <frozen harness directory> --out <new directory>");
+}
 const repo = fs.realpathSync(new URL("../..", import.meta.url));
 const out = path.resolve(values.out);
 const internal = fs.realpathSync(path.join(homedir(), ".cache", "dbasync-campaign"));
@@ -30,7 +31,9 @@ for (const [name, expected] of Object.entries(hashes)) {
   }
 }
 const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" });
-if (head.status !== 0) throw new Error("Cannot resolve measured source head");
+if (head.status !== 0) {
+  throw new Error("Cannot resolve measured source head");
+}
 fs.mkdirSync(out, { mode: 0o700 });
 for (const name of ["home", "tmp", "cache", "state", "young-fixture", "empty-fixture"]) {
   fs.mkdirSync(path.join(out, name), { mode: 0o700 });
@@ -108,22 +111,27 @@ async function run(label, fixture) {
     child.once("close", (code, signal) => resolve({ code, signal }));
   }).finally(() => clearTimeout(timer));
   fs.writeFileSync(path.join(out, `${label}-stderr.log`), stderr);
-  if (exit.code !== 0) throw new Error(`${label} child failed; inspect its synthetic stderr log`);
+  if (exit.code !== 0) {
+    throw new Error(`${label} child failed; inspect its synthetic stderr log`);
+  }
   const result = JSON.parse(stdout);
-  if (!result.ok || !Array.isArray(result.warnings))
+  if (!result.ok || !Array.isArray(result.warnings)) {
     throw new Error(`${label} returned an invalid result`);
+  }
   const processes = [],
     counts = {},
     failures = [];
   let statements = 0,
     requests = 0;
-  for (const name of fs.readdirSync(ledger).filter((name) => /^sql-\d+-\d+\.jsonl$/.test(name))) {
+  for (const name of fs.readdirSync(ledger).filter((entry) => /^sql-\d+-\d+\.jsonl$/.test(entry))) {
     const sites = new Map();
     for (const line of fs.readFileSync(path.join(ledger, name), "utf8").trim().split("\n")) {
       const row = JSON.parse(line);
       if (Array.isArray(row)) {
         const site = sites.get(row[1]);
-        if (site.method === "prepare") continue;
+        if (site.method === "prepare") {
+          continue;
+        }
         if (!site.ok) {
           failures.push({ method: site.method, shape: shape(site.sql) });
           continue;
@@ -168,7 +176,9 @@ const preserved = snapshots.every(
     fs.readFileSync(path.join(directory, "first"), "utf8") === payload &&
     fs.existsSync(path.join(directory, "owner.sqlite")),
 );
-if (!preserved) throw new Error("Young snapshot preservation failed");
+if (!preserved) {
+  throw new Error("Young snapshot preservation failed");
+}
 const summary = {
   sourceHead: head.stdout.trim(),
   node: process.version,
