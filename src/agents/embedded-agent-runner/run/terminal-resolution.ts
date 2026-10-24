@@ -134,9 +134,8 @@ export function resolveSettledTurnFinalizationRequest(input: {
     payloads: input.payloadsWithToolMedia,
     attempt: input.attempt,
   });
-  const payloadCount = input.recoveredFinalAssistantPayloadsAfterPromptTimeout
-    ? input.recoveredFinalAssistantPayloadsAfterPromptTimeout.length
-    : preparedPayloadCount;
+  const payloadCount =
+    input.recoveredFinalAssistantPayloadsAfterPromptTimeout?.length ?? preparedPayloadCount;
   const emptyAssistantReplyIsSilent = shouldTreatEmptyAssistantReplyAsSilent({
     terminalReplyExpectation: resolveReplyExpectation(input.runParams),
     payloadCount,
@@ -375,13 +374,12 @@ export async function resolveEmbeddedRunTerminal(input: {
   sessionPromptState.clearCompactionContinuation();
 
   if (reasoningOnlyRetriesExhausted && !input.prepared.finalAssistantVisibleText) {
-    const incompletePayloadText = MISSING_REPLY_NOTICE_TEXT;
     log.warn(
       `reasoning-only retries exhausted: ${modelLogContext} attempts=${retryState.reasoningOnlyAttempts}/${DEFAULT_REASONING_ONLY_RETRY_LIMIT} — surfacing incomplete-turn error`,
     );
     return completeEmbeddedRun({
       ...input,
-      incompleteTurnText: incompletePayloadText,
+      incompleteTurnText: MISSING_REPLY_NOTICE_TEXT,
       payloadCount: 0,
       incompleteTurnFallbackSafe,
       terminalToolPresentation,
@@ -463,11 +461,12 @@ async function completeEmbeddedRun(
     terminalToolPresentation?: string;
   },
 ): Promise<TerminalResolution> {
-  const terminalAborted = isEmbeddedRunTerminalAbort(input.terminalState.outcome);
-  const terminalTimedOut = isEmbeddedRunTerminalTimeout(input.terminalState.outcome);
+  const { outcome: terminalOutcome } = input.terminalState;
+  const terminalAborted = isEmbeddedRunTerminalAbort(terminalOutcome);
+  const terminalTimedOut = isEmbeddedRunTerminalTimeout(terminalOutcome);
   const terminalFailure =
     projectAgentRunAttemptTerminal(input.attempt.terminal).promptError ??
-    input.terminalState.outcome.error ??
+    terminalOutcome.error ??
     input.incompleteTurnText ??
     MISSING_REPLY_NOTICE_TEXT;
   const storageFailureText = renderStorageFailureSummary(
@@ -477,7 +476,7 @@ async function completeEmbeddedRun(
   // must retain error metadata and must not enter successful auth/trace bookkeeping.
   const error =
     input.incompleteTurnText !== undefined ||
-    classifyAgentRunTerminalOutcome(input.terminalState.outcome) === "failure"
+    classifyAgentRunTerminalOutcome(terminalOutcome) === "failure"
       ? {
           kind: "incomplete_turn" as const,
           message: storageFailureText ?? formatErrorMessage(terminalFailure),
@@ -499,10 +498,10 @@ async function completeEmbeddedRun(
           attempt: input.attempt,
           incompleteTurnText,
         });
-  // Cancellation belongs to the runtime owner, not the last model tool-call message.
+  // The runtime owns interruption causes; a recovery answer does not replace them.
   const stopReason =
-    terminalAborted || terminalTimedOut
-      ? input.terminalState.outcome.stopReason
+    terminalAborted || terminalTimedOut || (error && terminalOutcome.stopReason === "length")
+      ? terminalOutcome.stopReason
       : error
         ? "error"
         : input.attempt.clientToolCalls
@@ -619,7 +618,8 @@ async function completeEmbeddedRun(
     ? sanitizeAgentRunTerminalReply(sourceFinal.text ?? "")
     : isMissingReplyNotice
       ? { disposition: "empty" as const }
-      : error || incompleteText !== undefined
+      : (error && input.settledTurnFinalizationOutcome !== "answered") ||
+          incompleteText !== undefined
         ? sanitizeAgentRunTerminalReply(incompleteText ?? error?.message ?? "")
         : input.emptyAssistantReplyIsSilent
           ? { disposition: "silent" as const }
@@ -648,6 +648,10 @@ async function completeEmbeddedRun(
         replayInvalid,
         livenessState,
         stopReason,
+        completion: {
+          ...(stopReason ? { stopReason, finishReason: stopReason } : {}),
+          ...(stopReason?.toLowerCase().includes("refusal") ? { refusal: true } : {}),
+        },
         agentHarnessResultClassification: input.attempt.agentHarnessResultClassification,
         terminalReply,
         terminalReplyExpectation: resolveReplyExpectation(input.runParams),
@@ -701,10 +705,6 @@ async function completeEmbeddedRun(
                 ...(input.runParams.blockReplyBreak
                   ? { blockStreaming: input.runParams.blockReplyBreak }
                   : {}),
-              },
-              completion: {
-                ...(stopReason ? { stopReason, finishReason: stopReason } : {}),
-                ...(stopReason?.toLowerCase().includes("refusal") ? { refusal: true } : {}),
               },
               contextManagement:
                 input.contextRecoveryState.autoCompactionCount > 0

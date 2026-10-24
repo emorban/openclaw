@@ -1,6 +1,7 @@
 import type OpenAI from "openai";
 import { describe, expect, it } from "vitest";
 import type { NormalizedUsage } from "../agents/usage.js";
+import { recordAgentRunTerminalOutcome } from "../channels/turn/agent-run-terminal-outcome.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
 import {
   collectSseEventTypes,
@@ -50,7 +51,11 @@ function mockUsageResult(usage: NormalizedUsage, lastCallUsage?: NormalizedUsage
   });
 }
 
-async function post(endpoint: "chat/completions" | "responses", body: Record<string, unknown>) {
+async function post(
+  endpoint: "chat/completions" | "responses",
+  body: Record<string, unknown>,
+  expectedStatus = 200,
+) {
   const res = await fetch(`http://127.0.0.1:${port}/v1/${endpoint}`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-openclaw-scopes": "operator.write" },
@@ -62,7 +67,7 @@ async function post(endpoint: "chat/completions" | "responses", body: Record<str
       ...body,
     }),
   });
-  expect(res.status).toBe(200);
+  expect(res.status).toBe(expectedStatus);
   return res;
 }
 
@@ -187,6 +192,120 @@ describe("OpenAI-compatible HTTP usage", () => {
       const usageChunk = chunksFrom(data).find((chunk) => "usage" in chunk);
       expect(usageChunk?.usage).toEqual(expected);
       expect(usageChunk?.choices).toStrictEqual([]);
+    },
+  );
+});
+
+const summary = "Recovered summary of the work so far.";
+const notice = "Warning: the turn reached its output limit before completion (#178525).";
+const finalText = `${summary}\n\n${notice}`;
+const surfaces = [
+  { endpoint: "chat/completions", stream: false, requiredTool: false },
+  { endpoint: "chat/completions", stream: true, requiredTool: false },
+  { endpoint: "responses", stream: false, requiredTool: false },
+  { endpoint: "responses", stream: true, requiredTool: false },
+  { endpoint: "chat/completions", stream: true, requiredTool: true },
+  { endpoint: "responses", stream: true, requiredTool: true },
+] as const;
+
+describe("OpenAI-compatible recovered incomplete turns", () => {
+  it.each(surfaces)(
+    "delivers recovery text with a failure on $endpoint (stream=$stream, requiredTool=$requiredTool)",
+    async ({ endpoint, stream, requiredTool }) => {
+      agentCommandMock.mockClear();
+      agentCommandMock.mockImplementationOnce(async (opts: unknown) => {
+        const { runId } = opts as { runId: string };
+        emitAgentEvent({ runId, stream: "assistant", data: { delta: summary } });
+        emitAgentEvent({
+          runId,
+          stream: "lifecycle",
+          data: { phase: "error", error: "Output limit reached" },
+        });
+        return recordAgentRunTerminalOutcome(
+          {
+            payloads: [{ text: summary }, { text: notice }],
+            meta: { stopReason: "length", error: { kind: "incomplete_turn", message: notice } },
+          },
+          "failed",
+        );
+      });
+      const tool = { name: "required_tool", description: "Complete the requested action" };
+      const res = await post(
+        endpoint,
+        {
+          stream,
+          ...(requiredTool
+            ? {
+                tools: [
+                  endpoint === "responses"
+                    ? { type: "function", ...tool }
+                    : { type: "function", function: tool },
+                ],
+                tool_choice: "required",
+              }
+            : {}),
+        },
+        stream ? 200 : 500,
+      );
+      const text = await res.text();
+      if (endpoint === "chat/completions") {
+        if (!stream) {
+          expect(JSON.parse(text)).toEqual({
+            error: { message: finalText, type: "api_error", code: "incomplete_turn" },
+          });
+        } else {
+          const chunks = chunksFrom(parseSseDataLines(text));
+          expect(
+            chunks
+              .flatMap((chunk) => chunk.choices ?? [])
+              .map((choice) => choice.delta.content ?? "")
+              .join(""),
+          ).toBe(requiredTool ? "" : finalText);
+          expect(chunks.at(-1)).toEqual({
+            error: { message: finalText, type: "api_error", code: "incomplete_turn" },
+          });
+          expect(
+            chunks
+              .flatMap((chunk) => chunk.choices ?? [])
+              .every((choice) => choice.finish_reason === null),
+          ).toBe(true);
+        }
+        return;
+      }
+      const events = stream ? parseSseEvents(text) : [];
+      const response = stream
+        ? (
+            JSON.parse(findSseEvent(events, "response.failed").data) as {
+              response: ResponseResource;
+            }
+          ).response
+        : (JSON.parse(text) as ResponseResource);
+      expect(response.status).toBe("failed");
+      expect(response.error?.code).toBe("incomplete_turn");
+      expect(response.output).toMatchObject([
+        {
+          type: "message",
+          status: "incomplete",
+          content: [{ type: "output_text", text: finalText }],
+        },
+      ]);
+      if (stream) {
+        expect(
+          events
+            .filter((event) => event.event === "response.output_text.delta")
+            .map((event) => JSON.parse(event.data).delta)
+            .join(""),
+        ).toBe(requiredTool ? "" : finalText);
+        expect(
+          events
+            .filter((event) =>
+              ["response.completed", "response.incomplete", "response.failed"].includes(
+                event.event,
+              ),
+            )
+            .map((event) => event.event),
+        ).toEqual(["response.failed"]);
+      }
     },
   );
 });
