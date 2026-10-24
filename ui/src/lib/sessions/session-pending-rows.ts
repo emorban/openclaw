@@ -41,6 +41,10 @@ export const optimisticSessionRowFields = [
   "label",
   "icon",
   "color",
+  "archived",
+  "archivedAt",
+  "archivedBy",
+  "archiveReason",
   "thinkingLevel",
   "fastMode",
   "effectiveFastMode",
@@ -359,6 +363,29 @@ export function createOptimisticPinPatches(host: PendingRowCopyHost) {
       )(target);
     },
   };
+}
+
+export function createOptimisticArchivePatches(host: PendingRowCopyHost) {
+  const fields = [
+    "archived",
+    "archivedAt",
+    "archivedBy",
+    "archiveReason",
+    "pinned",
+    "pinnedAt",
+  ] as const;
+  return createOptimisticRowPatches(host, {
+    read: (row): Pick<GatewaySessionRow, (typeof fields)[number]> =>
+      Object.fromEntries(fields.map((field) => [field, row?.[field]])),
+    write: (row, next) =>
+      fields.every((field) => row[field] === next[field]) ? row : host.copyRow(row, next),
+    observe: (previous, row, names) => ({
+      ...previous,
+      ...Object.fromEntries(
+        fields.filter((field) => names.includes(field)).map((field) => [field, row[field]]),
+      ),
+    }),
+  });
 }
 
 type SessionSettingsPatch = Pick<SessionPatch, "thinkingLevel" | "fastMode" | "contextWindow">;

@@ -1,4 +1,7 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { GatewayRequestError } from "../../api/gateway.ts";
 import type { GatewaySessionRow, SessionsListResult } from "../../api/types.ts";
+import type { ApplicationGateway } from "../../app/gateway.ts";
 import { t } from "../../i18n/index.ts";
 import { formatUiError } from "../format-error.ts";
 import { showToast } from "../toast.ts";
@@ -28,6 +31,7 @@ type Deletion = {
   owner: DeletionOwner;
   rows: WeakMap<object, { row: GatewaySessionRow; index: number }>;
   operation?: Promise<SessionDeleteOutcome>;
+  deferredToken?: symbol;
 };
 
 type DeletionOwner = {
@@ -38,6 +42,7 @@ type DeletionOwner = {
 };
 
 type DeletionHost = {
+  defer: ApplicationGateway["defer"];
   connection: SessionConnectionOwner;
   snapshot: () => SessionGateway["snapshot"];
   requestRevision: () => number;
@@ -57,6 +62,7 @@ type DeletionHost = {
 };
 
 export function createSessionDeletions(host: DeletionHost) {
+  let retainedOwner: { scope: SessionListScope } = { scope: {} };
   // Canonical generation and request order outlive an individual mutation,
   // including rollback. Retired IDs share this owner with the active claim.
   const deletions = new Map<string, DeletionOwner>();
@@ -182,11 +188,31 @@ export function createSessionDeletions(host: DeletionHost) {
   const perform = (
     deletion: Deletion,
     scope: NonNullable<ReturnType<SessionConnectionOwner["capture"]>>,
+    allowAbsent = false,
   ): Promise<SessionDeleteOutcome> => {
     if (deletion.operation) {
       return deletion.operation;
     }
     const { target } = deletion;
+    const confirmAbsent = async () => {
+      if (!allowAbsent || !host.connection.isCurrent(scope)) {
+        return false;
+      }
+      try {
+        const result = await scope.client.request<{ session: GatewaySessionRow | null }>(
+          "sessions.describe",
+          { key: target.key, agentId: target.agentId },
+        );
+        if (result.session !== null || !host.connection.isCurrent(scope) || !owns(deletion)) {
+          return false;
+        }
+        confirm(deletion, target.key);
+        return true;
+      } catch {
+        // A failed read is not proof that the target is gone.
+        return false;
+      }
+    };
     deletion.operation = (async () => {
       try {
         const response = await requestSessionDelete(scope.client, target.key, target);
@@ -194,7 +220,16 @@ export function createSessionDeletions(host: DeletionHost) {
           return { deleted: false };
         }
         if (!response.deleted && deletion.phase !== "confirmed") {
+          if (await confirmAbsent()) {
+            return { deleted: true };
+          }
+          if (!owns(deletion)) {
+            return { deleted: false };
+          }
           rollback(deletion);
+          if (allowAbsent) {
+            reportError(t("sessionsView.deleteSessionStale", { session: target.key }));
+          }
           return { deleted: false };
         }
         confirm(deletion, target.key);
@@ -203,6 +238,21 @@ export function createSessionDeletions(host: DeletionHost) {
           ...(response.worktreePreserved ? { worktreePreserved: response.worktreePreserved } : {}),
         };
       } catch (error) {
+        if (!owns(deletion)) {
+          return { deleted: false };
+        }
+        // A missing expected incarnation (or missing archived row) can reject
+        // before deletion. Permission and other failures must still roll back.
+        if (
+          error instanceof GatewayRequestError &&
+          error.gatewayCode === "INVALID_REQUEST" &&
+          ((isRecord(error.details) && error.details.reason === "session-changed") ||
+            error.message ===
+              `Session ${target.key} is not archived. Archive it first, then delete it.`) &&
+          (await confirmAbsent())
+        ) {
+          return { deleted: true };
+        }
         if (!owns(deletion)) {
           return { deleted: false };
         }
@@ -219,7 +269,81 @@ export function createSessionDeletions(host: DeletionHost) {
   ): Promise<SessionDeleteBatchResult> => {
     const scope = host.connection.capture();
     const result: SessionDeleteBatchResult = { deleted: [], errors: [], preservedWorktrees: [] };
-    if (!scope || targets.length === 0) {
+    if (targets.length === 0) {
+      return result;
+    }
+    const snapshot = host.snapshot();
+    if (!scope || snapshot.deferredIntentCount || snapshot.deferredIntentDraining) {
+      for (const target of targets) {
+        const record = begin({ ...target });
+        if (!record.sessionId?.trim()) {
+          rollback(record);
+          continue;
+        }
+        record.target.expectedSessionId ??= record.sessionId;
+        const token = Symbol("delete");
+        record.deferredToken = token;
+        // Superseded fields roll back before deletion captures the row to hide.
+        record.phase = "rollback";
+        const conversation = resolveUiConversationIdentity(snapshot, target.key, target.agentId);
+        const agentId = conversation.agentId ?? normalizeAgentId(target.agentId);
+        const lifecycleKey = `sessions.lifecycle:${agentId}:${conversation.sessionKey}`;
+        const accepted = host.defer({
+          key: lifecycleKey,
+          group: lifecycleKey,
+          discardGroup: true,
+          preservePosition: true,
+          run: async () => {
+            const current = host.connection.capture();
+            if (!current) {
+              rollback(record);
+              return;
+            }
+            try {
+              const outcome = await perform(record, current, true);
+              if (outcome.worktreePreserved) {
+                const { formatPreservedWorktreesNotice } =
+                  await import("./worktree-preservation.ts");
+                if (host.connection.isCurrent(current)) {
+                  showToast({
+                    message: formatPreservedWorktreesNotice([outcome.worktreePreserved]),
+                  });
+                }
+              }
+              if (outcome.deleted && host.connection.isCurrent(current)) {
+                await host.reconcileMutation(target.agentId);
+              }
+            } catch (error) {
+              // Rejected writes already retired their claim and reported the error.
+              if (owns(record)) {
+                rollback(record);
+                reportError(formatUiError(error));
+              }
+            }
+          },
+          discard: () => {
+            if (record.deferredToken === token) {
+              rollback(record);
+            }
+          },
+        });
+        if (accepted) {
+          const row = host.publishedRow(
+            (candidate) =>
+              candidate.key === conversation.sessionKey && candidate.sessionId === record.sessionId,
+          );
+          // A replaced offline archive never reached the Gateway. Do not send
+          // its optimistic archive-only precondition with the winning delete.
+          if (row && !row.archived) {
+            record.target.archivedOnly = undefined;
+          }
+          record.phase = "pending";
+          (result.queued ??= []).push(target.key);
+        } else {
+          rollback(record);
+        }
+      }
+      publish();
       return result;
     }
     // Claim the complete selection before the first RPC. Cloud teardown may
@@ -276,7 +400,7 @@ export function createSessionDeletions(host: DeletionHost) {
     return result;
   };
 
-  return {
+  const api = {
     acceptsGeneration: (key: string, sessionId?: string, agentId?: string | null) =>
       acceptsGeneration(deletions.get(identity(key, agentId)), sessionId),
     deletionState: (key: string, agentId?: string | null, sessionId?: string) =>
@@ -293,10 +417,21 @@ export function createSessionDeletions(host: DeletionHost) {
       }
       return {
         deleted: result.deleted.includes(key),
+        ...(result.queued?.includes(key) ? { queued: true as const } : {}),
         ...(result.preservedWorktrees[0]
           ? { worktreePreserved: result.preservedWorktrees[0] }
           : {}),
       };
+    },
+    applyRetained(
+      result: SessionsListResult | null,
+      agentId: string | null,
+    ): SessionsListResult | null {
+      // Stable query identity preserves the hidden row across reconnect for rollback.
+      if (retainedOwner.scope.agentId !== (agentId ?? undefined)) {
+        retainedOwner = { scope: { agentId: agentId ?? undefined } };
+      }
+      return api.apply(result, retainedOwner);
     },
     apply(
       result: SessionsListResult | null,
@@ -405,6 +540,26 @@ export function createSessionDeletions(host: DeletionHost) {
         }
       }
     },
+    retireConnection(retainDeferred: boolean) {
+      for (const [key, owner] of deletions) {
+        for (const record of owner.records) {
+          // Only unsent intents follow a replacement client; old RPC receipts retire as before.
+          if (!retainDeferred || !record.deferredToken || record.operation) {
+            if (retainDeferred) {
+              rollback(record);
+            }
+            owner.records.delete(record);
+          }
+        }
+        if (owner.active && !owner.records.has(owner.active)) {
+          owner.active = undefined;
+        }
+        if (owner.records.size === 0) {
+          deletions.delete(key);
+        }
+      }
+    },
     clear: () => deletions.clear(),
   };
+  return api;
 }

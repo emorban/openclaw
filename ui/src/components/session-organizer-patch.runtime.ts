@@ -1,4 +1,4 @@
-import { isSessionDisplayMetadataPatch } from "../lib/sessions/patch.ts";
+import { isSessionDeferredPatch } from "../lib/sessions/patch.ts";
 import { resolveUiSessionRowAgentId } from "../lib/sessions/session-key.ts";
 import type {
   SidebarSessionMutationResult,
@@ -45,7 +45,7 @@ export async function patchSession(
     !requireSessionMutationAccess(host, scope, {
       method: "sessions.patch",
       params: requestParams,
-      allowDeferred: isSessionDisplayMetadataPatch(patch),
+      allowDeferred: isSessionDeferredPatch(patch),
       sessionScope: refresh.sessionScope,
       session,
     })
@@ -53,11 +53,18 @@ export async function patchSession(
     return "failed";
   }
   try {
+    const snapshot = scope.gateway.snapshot;
+    const queuedArchive =
+      patch.archived === true &&
+      (snapshot.phase !== "connected" ||
+        snapshot.deferredIntentCount ||
+        snapshot.deferredIntentDraining);
     const request = () =>
       scope.sessions.patch(session.key, patch, {
         agentId,
         ...(session.sessionId ? { expectedSessionId: session.sessionId } : {}),
         ...(refresh.deferListRefresh ? { deferListRefresh: true } : {}),
+        ...(queuedArchive ? { onConfirmed: () => host.pruneSidebarSessionEntry(session.key) } : {}),
       });
     const patched =
       patch.archived === true
@@ -81,8 +88,6 @@ export async function patchSession(
     if ("queued" in patched) {
       return "completed";
     }
-    // Personal pin references are independent of the shared session's pinnedAt.
-    // Retire this profile's reference only after the archive commits.
     if (patch.pinned === false || patch.archived === true) {
       host.pruneSidebarSessionEntry(session.key);
     }

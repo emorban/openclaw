@@ -70,6 +70,19 @@ export async function confirmSessionArchive(
   if (!isCurrent()) {
     return null;
   }
+  if (session.hasArchiveDescendants && scope.gateway.snapshot.phase !== "connected") {
+    // Complete subtree discovery requires live reads. Offline intent targets
+    // only the selected row, with the same explicit nested-session warning.
+    const confirmed = await showConfirmDialog({
+      title: t("sessionsView.archiveSessionTitle"),
+      message:
+        t("sessionsView.archiveSessionNestedOffline", { session: session.label }) +
+        (hasActiveArchiveWork(session) ? "\n\n" + t("sessionsView.archiveRunningSessions") : ""),
+      confirmLabel: t("sessionsView.archiveThisSession"),
+      signal: scope.signal,
+    });
+    return confirmed && isCurrent() ? { kind: "single" } : null;
+  }
   if (session.hasArchiveDescendants) {
     const { session: root } = await scope.sessions.describe(
       {
@@ -366,7 +379,11 @@ export function captureSessionArchivePins(
   const connection = scope.sessions.captureConnectionScope();
   const pins = keys.filter((key) => navigation.snapshot.sidebarEntries.includes("session:" + key));
   return async (restore: () => Promise<readonly string[]>): Promise<void> => {
-    if (!connection || !scope.sessions.isConnectionScopeCurrent(connection)) {
+    if (!connection) {
+      await restore();
+      return;
+    }
+    if (!scope.sessions.isConnectionScopeCurrent(connection)) {
       return;
     }
     const changed = new Set<string>();
@@ -414,7 +431,9 @@ function sessionUndoHost(
     sessionData: {
       refreshSidebarSessions: (agentId) => host.sessionData.refreshSidebarSessions(agentId),
       isSessionMutationScopeCurrent: () =>
-        connection !== null && scope.sessions.isConnectionScopeCurrent(connection),
+        connection !== null
+          ? scope.sessions.isConnectionScopeCurrent(connection)
+          : host.sessionData.isSessionMutationScopeCurrent(scope),
       publishSessionMutationError: (candidate, error) => {
         if (host.sessionData.isSessionMutationScopeCurrent(candidate)) {
           host.sessionData.publishSessionMutationError(candidate, error);
@@ -433,13 +452,20 @@ async function restoreArchivedSessions(
   scope: SidebarSessionMutationScope,
 ): Promise<readonly string[]> {
   let restoredKeys: string[];
+  const snapshot = scope.gateway.snapshot;
+  const deferred =
+    snapshot.phase !== "connected" ||
+    Boolean(snapshot.deferredIntentCount || snapshot.deferredIntentDraining);
   const rows = archived.map((entry) => entry.session);
   if (archived.length === 1) {
     const { session, pinned } = archived[0]!;
     const restored = await patchSession(
       host,
       session,
-      { archived: false, ...(pinned ? { pinned: true } : {}) },
+      {
+        archived: false,
+        ...(pinned && !deferred ? { pinned: true } : {}),
+      },
       scope,
       { deferListRefresh: true, sessionScope: true },
     );
@@ -459,7 +485,7 @@ async function restoreArchivedSessions(
     const repinRows = archived.flatMap(({ session, pinned }) =>
       pinned && restored.includes(session) ? [session] : [],
     );
-    if (repinRows.length > 0) {
+    if (repinRows.length > 0 && !deferred) {
       const repinned = await patchSessionRows(host, repinRows, { pinned: true }, scope, {
         deferListRefresh: true,
         sessionScope: true,
@@ -471,6 +497,9 @@ async function restoreArchivedSessions(
   }
   if (!host.sessionData.isSessionMutationScopeCurrent(scope)) {
     return [];
+  }
+  if (deferred) {
+    return restoredKeys;
   }
   scope.sessions.invalidate();
   try {

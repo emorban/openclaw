@@ -21,7 +21,7 @@ import type {
 } from "./patch.ts";
 import { mapSessionResultRows } from "./reconcile.ts";
 import { createSessionArchiveState, projectSessionArchiveFields } from "./session-archive-state.ts";
-import { deferSessionMetadataPatch } from "./session-deferred-metadata.ts";
+import { deferSessionPatch } from "./session-deferred-patch.ts";
 import { createSessionModelOverrides } from "./session-model-overrides.ts";
 import {
   createSessionMutationRefresh,
@@ -32,6 +32,7 @@ import { projectSessionPatchRowFields } from "./session-patch-row-facts.ts";
 import {
   capturePendingRowReplacement,
   createOptimisticRowField,
+  createOptimisticArchivePatches,
   createOptimisticPinPatches,
   createOptimisticSettingsPatches,
   resolvePendingConversation,
@@ -49,6 +50,7 @@ import {
 import { createSessionRowLocalPatch } from "./session-row-local-patch.ts";
 import type {
   SessionConnectionScope,
+  SessionArchiveVisibility,
   SessionCreateReconciliation,
   SessionRefreshOutcome,
   SessionResetOptions,
@@ -79,10 +81,12 @@ export function createSessionMutations(host: SessionMutationsHost) {
     category: optimisticCategories,
   };
   const optimisticUnread = createOptimisticRowField(host, "unread");
+  const optimisticArchive = createOptimisticArchivePatches(host);
   const settingsPatches = createOptimisticSettingsPatches(host);
   const rowPatches = [
     optimisticPins,
     optimisticUnread,
+    optimisticArchive,
     ...Object.values(metadataFields),
     ...settingsPatches.owners,
   ];
@@ -491,8 +495,15 @@ export function createSessionMutations(host: SessionMutationsHost) {
   };
 
   const patch: SessionPatchRoute = async (key, patchParams, options = {}) =>
-    deferSessionMetadataPatch(host, metadataFields, patchNow, key, patchParams, options) ??
-    patchNow(key, patchParams, options);
+    deferSessionPatch(
+      host,
+      metadataFields,
+      optimisticArchive,
+      patchNow,
+      key,
+      patchParams,
+      options,
+    ) ?? patchNow(key, patchParams, options);
 
   const patchMany = async (
     targets: SessionsPatchManyParams["targets"],
@@ -681,7 +692,15 @@ export function createSessionMutations(host: SessionMutationsHost) {
     confirmArchiveState: archiveState.confirm,
     reset,
     retireModelOverride: modelOverrides.retire,
-    archiveVisibility: archiveState.visibility,
+    archiveVisibility(this: void, key: string): SessionArchiveVisibility | undefined {
+      const target = resolvePendingConversation(host.snapshot(), key);
+      const pending = target ? optimisticArchive.read(target.identity) : undefined;
+      return pending
+        ? pending.next.archived
+          ? "archived"
+          : undefined
+        : archiveState.visibility(key);
+    },
     beginArchive: archiveState.beginPending,
     isPreparedWorkSession: (key: string) => preparedWorkSessionKeys.has(key.trim()),
     settlePrepared(result: SessionsListResult | null) {
@@ -692,19 +711,20 @@ export function createSessionMutations(host: SessionMutationsHost) {
         }
       }
     },
-    retireConnection(retainMetadata = false) {
+    retireConnection(retainDeferredIntents = false) {
       modelOverrides.clear();
       for (const owner of rowPatches) {
         if (
-          !retainMetadata ||
-          !Object.values(metadataFields).some((metadata) => metadata === owner)
+          !retainDeferredIntents ||
+          (owner !== optimisticArchive &&
+            !Object.values(metadataFields).some((metadata) => metadata === owner))
         ) {
           owner.clear();
         }
       }
       archiveState.clearAll();
       preparedWorkSessionKeys.clear();
-      // Same-owner reconnect keeps queued metadata over the retained presentation.
+      // Same-owner reconnect keeps queued row changes over the retained presentation.
       const state = host.readState();
       host.publish({ ...state, modelOverrides: {} });
     },

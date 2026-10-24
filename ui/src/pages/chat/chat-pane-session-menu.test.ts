@@ -538,7 +538,7 @@ describe("chat pane session menu boundary", () => {
     pane.applyGatewaySnapshot({ ...connected, phase: "reconnecting" });
     expect(draw(row)).toBe("Retained conversation");
     expect(draw({ ...row, label: "Older scoped label" })).toBe("Retained conversation");
-    expect(container.querySelector("openclaw-chat-header-session-menu")).toBeNull();
+    expect(container.querySelector("openclaw-chat-header-session-menu")).not.toBeNull();
     pane.applyGatewaySnapshot(connected);
     expect(draw(row)).toBe("Retained conversation");
     const menu = container.querySelector<HTMLElement & { session: { label: string } }>(

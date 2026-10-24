@@ -66,13 +66,15 @@ export type SessionPatchOptions = {
 export type SessionPatchResult = SessionsPatchResult & { listRefreshError?: string };
 export type SessionPatchOutcome = SessionPatchResult | { queued: true };
 
-export function isSessionDisplayMetadataPatch(patch: Record<string, unknown>): boolean {
+export function isSessionDeferredPatch(patch: Record<string, unknown>): boolean {
   const fields = Object.keys(patch);
   return (
-    fields.length > 0 &&
-    fields.every(
-      (field) => field === "label" || field === "icon" || field === "color" || field === "category",
-    )
+    (fields.length === 1 && typeof patch.archived === "boolean") ||
+    (fields.length > 0 &&
+      fields.every(
+        (field) =>
+          field === "label" || field === "icon" || field === "color" || field === "category",
+      ))
   );
 }
 

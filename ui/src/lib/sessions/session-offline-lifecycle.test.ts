@@ -1,0 +1,463 @@
+// @vitest-environment node
+import { afterEach, beforeEach, expect, it, onTestFinished, vi } from "vitest";
+import { createDeferred } from "../../../../test/helpers/promise.js";
+import { GatewayRequestError } from "../../api/gateway.ts";
+import type { GatewaySessionRow } from "../../api/types.ts";
+import {
+  createGatewayStoreTestStore,
+  stubGatewayStoreTestGlobals,
+} from "../../app/gateway-store.test-support.ts";
+import { projectSidebarArchiveVisibility } from "../../components/app-sidebar-session-archive-visibility.ts";
+import { gatewayHelloForMethods } from "../../test-helpers/gateway-methods.ts";
+import { readSessionMethodAccess } from "../session-method-access.ts";
+import { showToast } from "../toast.ts";
+import { createTestSessionCapability, sessionsResult } from "./session-capability.test-support.ts";
+
+vi.mock("../toast.ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../toast.ts")>()),
+  showToast: vi.fn(),
+}));
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  stubGatewayStoreTestGlobals();
+});
+afterEach(() => vi.unstubAllGlobals());
+
+async function setup(archived = false) {
+  const store = createGatewayStoreTestStore();
+  store.gateway.start();
+  const client = store.current();
+  client.testOptions.offlineRecoveryScope = "lifecycle-owner";
+  Object.assign(client, { recoveryScope: "lifecycle-owner", recoveryScopeReady: true });
+  const hello = {
+    ...gatewayHelloForMethods([
+      "sessions.patch",
+      "sessions.delete",
+      "sessions.describe",
+      "sessions.list",
+      "sessions.subscribe",
+    ]),
+    auth: { role: "operator", scopes: ["operator.admin"], recoveryScope: "lifecycle-owner" },
+  };
+  let row: GatewaySessionRow | null = {
+    key: "agent:main:offline",
+    sessionId: "incarnation",
+    kind: "direct",
+    label: "Original",
+    archived,
+    pinned: !archived,
+    sharingRole: "owner",
+    updatedAt: 1,
+  };
+  let reject = false;
+  let missingReject = false;
+  client.request.mockImplementation(async (method, params) => {
+    if (method === "sessions.list") {
+      return sessionsResult(row ? [{ ...row }] : []);
+    }
+    if (method === "sessions.describe") {
+      return { session: row };
+    }
+    if (method === "sessions.patch") {
+      if (reject) {
+        throw new Error("Lifecycle denied");
+      }
+      row = { ...row!, ...(params as Partial<GatewaySessionRow>), updatedAt: 2 };
+      return { ok: true, key: row.key, path: "", entry: { ...row } };
+    }
+    if (method === "sessions.delete") {
+      if (reject) {
+        throw new Error("Lifecycle denied");
+      }
+      if (!row && missingReject) {
+        throw new GatewayRequestError({
+          code: "INVALID_REQUEST",
+          message: "Session changed before deletion. Retry.",
+          details: { reason: "session-changed" },
+        });
+      }
+      if ((params as { archivedOnly?: boolean }).archivedOnly && !row?.archived) {
+        throw new Error("Not archived");
+      }
+      const deleted = row !== null;
+      row = null;
+      return { ok: true, key: "agent:main:offline", deleted, archived: [] };
+    }
+    return {};
+  });
+  client.testOptions.onHello?.(hello);
+  const sessions = createTestSessionCapability(store.gateway);
+  await sessions.refresh({ agentId: "main" });
+  onTestFinished(() => {
+    sessions.dispose();
+    store.gateway.stop();
+  });
+  const target = { agentId: "main", expectedSessionId: "incarnation" };
+  return {
+    ...store,
+    sessions,
+    target,
+    offline: () => client.testOptions.onClose?.({ code: 1006, reason: "lost", willRetry: true }),
+    reconnect: () => store.current().testOptions.onHello?.(hello),
+    replace: () => {
+      store.gateway.connect();
+      Object.assign(store.current(), {
+        recoveryScope: "lifecycle-owner",
+        recoveryScopeReady: true,
+      });
+      store.current().request.mockImplementation(client.request.getMockImplementation()!);
+    },
+    reject: () => {
+      reject = true;
+    },
+    gone: (rejectMissing = false) => {
+      missingReject = rejectMissing;
+      row = null;
+    },
+    row: () => sessions.presentation.result?.sessions[0],
+    patch: (nextArchived: boolean) =>
+      sessions.patch("agent:main:offline", { archived: nextArchived }, target),
+    delete: () =>
+      sessions.delete("agent:main:offline", {
+        ...target,
+        ...(sessions.presentation.result?.sessions[0]?.archived ? { archivedOnly: true } : {}),
+      }),
+    writes: () =>
+      store
+        .current()
+        .request.mock.calls.filter(
+          ([method]) => method === "sessions.patch" || method === "sessions.delete",
+        ),
+  };
+}
+
+it.each(["identity", "retirement", "stop"])(
+  "admits lifecycle work while reconnecting but not after %s",
+  async (cause) => {
+    const h = await setup();
+    h.offline();
+    const requests = [
+      { method: "sessions.patch", params: { key: "agent:main:offline", archived: true } },
+      { method: "sessions.delete", params: { key: "agent:main:offline", ...h.target } },
+    ];
+    for (const request of requests) {
+      expect(
+        readSessionMethodAccess(h.gateway.snapshot, { ...request, allowDeferred: true }).allowed,
+      ).toBe(true);
+    }
+    if (cause === "identity") {
+      h.gateway.connect({ token: "different-synthetic-identity" });
+    } else if (cause === "retirement") {
+      h.current().retireOfflineRecoveryScope();
+    } else {
+      h.gateway.stop();
+    }
+    for (const request of requests) {
+      expect(
+        readSessionMethodAccess(h.gateway.snapshot, { ...request, allowDeferred: true }).allowed,
+      ).toBe(false);
+    }
+  },
+);
+
+it.each([false, true])(
+  "projects and replays an offline archive across replacement=%s",
+  async (replace) => {
+    const h = await setup();
+    h.offline();
+    await expect(h.patch(true)).resolves.toEqual({ queued: true });
+    expect(h.row()).toMatchObject({ archived: true, pinned: false });
+    const visibility = (statusFilter: "active" | "archived") =>
+      projectSidebarArchiveVisibility({
+        sourceRows: h.sessions.presentation.result?.sessions ?? [],
+        sessionData: {
+          childSessionRowsByParent: {},
+          loadedChildSessionKeys: new Set(),
+          loadingChildSessionKeys: new Set(),
+          childSessionErrorsByParent: new Map(),
+        },
+        selectedAgentId: "main",
+        statusFilter,
+        now: 1,
+        deletionState: h.sessions.deletionState,
+        archiveVisibility: h.sessions.archiveVisibility,
+      });
+    expect(visibility("active").rows).toHaveLength(0);
+    expect(visibility("archived").rows.map((row) => row.key)).toEqual(["agent:main:offline"]);
+    expect(h.gateway.snapshot.deferredIntentCount).toBe(1);
+    expect(h.writes()).toHaveLength(0);
+    if (replace) {
+      h.replace();
+    }
+    expect(h.row()?.archived).toBe(true);
+    h.reconnect();
+    await vi.waitFor(() => expect(h.gateway.snapshot.deferredIntentDraining).toBe(false));
+    expect(h.writes()).toHaveLength(1);
+    expect(h.writes()[0]?.[0]).toBe("sessions.patch");
+    expect(h.writes()[0]?.[1]).toMatchObject({ ...h.target, archived: true });
+    expect(h.row()?.archived).toBe(true);
+  },
+);
+
+it.each(["archive", "delete"])("rolls back a rejected offline %s", async (kind) => {
+  const h = await setup();
+  h.offline();
+  await (kind === "archive" ? h.patch(true) : h.delete());
+  h.reject();
+  h.reconnect();
+  await vi.waitFor(() => expect(showToast).toHaveBeenCalledWith({ message: "Lifecycle denied" }));
+  expect(h.row()).toMatchObject({ label: "Original", archived: false, pinned: true });
+});
+
+it.each(["present", "replacement client", "gone", "missing incarnation"])(
+  "hides and replays offline deletion when the target is %s",
+  async (target) => {
+    const h = await setup();
+    h.offline();
+    await h.delete();
+    expect(h.row()).toBeUndefined();
+    expect(h.gateway.snapshot.deferredIntentCount).toBe(1);
+    if (target === "replacement client") {
+      h.replace();
+      expect(h.row()).toBeUndefined();
+    }
+    if (target === "gone") {
+      h.gone();
+    }
+    if (target === "missing incarnation") {
+      h.gone(true);
+    }
+    h.reconnect();
+    await vi.waitFor(() =>
+      expect(h.sessions.deletionState("agent:main:offline", "main", "incarnation")).toBe(
+        "confirmed",
+      ),
+    );
+    expect(h.writes()).toHaveLength(1);
+    expect(h.row()).toBeUndefined();
+    expect(showToast).not.toHaveBeenCalled();
+  },
+);
+
+it.each(["unarchive", "delete"])(
+  "coalesces archive then %s into one lifecycle intent",
+  async (last) => {
+    const h = await setup();
+    h.offline();
+    await h.patch(true);
+    await (last === "delete" ? h.delete() : h.patch(false));
+    expect(h.gateway.snapshot.deferredIntentCount).toBe(1);
+    expect(h.row()?.archived).toBe(last === "delete" ? undefined : false);
+    h.reconnect();
+    await vi.waitFor(() => expect(h.gateway.snapshot.deferredIntentDraining).toBe(false));
+    expect(h.writes()).toHaveLength(1);
+    expect(h.writes()[0]?.[0]).toBe(last === "delete" ? "sessions.delete" : "sessions.patch");
+  },
+);
+
+it("discards metadata before hiding a delete, and restores it when archive replaces delete", async () => {
+  const h = await setup();
+  h.offline();
+  await h.sessions.patch("agent:main:offline", { label: "Unsent name" }, h.target);
+  await h.delete();
+  expect(h.gateway.snapshot.deferredIntentCount).toBe(1);
+  expect(h.row()).toBeUndefined();
+  await h.patch(true);
+  expect(h.row()).toMatchObject({ label: "Original", archived: true });
+  expect(h.gateway.snapshot.deferredIntentCount).toBe(1);
+  h.reconnect();
+  await vi.waitFor(() => expect(h.gateway.snapshot.deferredIntentDraining).toBe(false));
+  expect(h.writes()).toHaveLength(1);
+  expect(h.writes()[0]?.[0]).toBe("sessions.patch");
+});
+
+it.each(["archive", "delete"])(
+  "rolls back discarded offline %s without another error toast",
+  async (kind) => {
+    const h = await setup();
+    h.offline();
+    await (kind === "archive" ? h.patch(true) : h.delete());
+    h.gateway.connect({ token: "new-synthetic-owner" });
+    expect(h.gateway.snapshot.deferredIntentCount).toBe(0);
+    expect(h.sessions.deletionState("agent:main:offline", "main", "incarnation")).toBeUndefined();
+    expect(showToast).toHaveBeenCalledExactlyOnceWith({ message: "Offline changes discarded: 1" });
+    expect(h.writes()).toHaveLength(0);
+  },
+);
+
+it("queues one delete per selected session", async () => {
+  const h = await setup();
+  h.offline();
+  const result = await h.sessions.deleteMany([
+    { key: "agent:main:offline", ...h.target },
+    { key: "agent:main:second", agentId: "main", expectedSessionId: "second-id" },
+  ]);
+  expect(result.queued).toEqual(["agent:main:offline", "agent:main:second"]);
+  expect(h.gateway.snapshot.deferredIntentCount).toBe(2);
+});
+
+it("moves an offline unarchive to active and restores the archive on rejection", async () => {
+  const h = await setup(true);
+  h.offline();
+  await h.patch(false);
+  expect(h.row()?.archived).toBe(false);
+  expect(h.sessions.archiveVisibility("agent:main:offline")).toBeUndefined();
+  h.reject();
+  h.reconnect();
+  await vi.waitFor(() => expect(showToast).toHaveBeenCalledWith({ message: "Lifecycle denied" }));
+  expect(h.row()?.archived).toBe(true);
+});
+
+it("keeps repeated offline deletes hidden and restores one row on rejection", async () => {
+  const h = await setup();
+  h.offline();
+  await h.delete();
+  await h.delete();
+  expect(h.row()).toBeUndefined();
+  expect(h.gateway.snapshot.deferredIntentCount).toBe(1);
+  h.reject();
+  h.reconnect();
+  await vi.waitFor(() => expect(showToast).toHaveBeenCalledWith({ message: "Lifecycle denied" }));
+  expect(h.sessions.presentation.result?.sessions).toHaveLength(1);
+});
+
+it("releases a dispatched archive when transport replacement rejects the old request", async () => {
+  const h = await setup();
+  const reply = createDeferred();
+  const dispatched = createDeferred();
+  const request = h.current().request.getMockImplementation()!;
+  h.current().request.mockImplementation((method, params) => {
+    if (method === "sessions.patch" && (params as { archived?: boolean }).archived) {
+      dispatched.resolve();
+      return reply.promise;
+    }
+    return request(method, params);
+  });
+  h.offline();
+  await h.patch(true);
+  await h.sessions.patch(
+    "agent:main:other",
+    { label: "Other" },
+    {
+      agentId: "main",
+      expectedSessionId: "other-id",
+    },
+  );
+  h.reconnect();
+  await dispatched.promise;
+  expect(h.row()?.archived).toBe(true);
+  expect(h.gateway.snapshot.deferredIntentCount).toBe(1);
+  // GatewayProtocolClient.stop flushes every pending request before replacement.
+  vi.spyOn(h.current(), "stop").mockImplementationOnce(() =>
+    reply.reject(new Error("gateway client stopped")),
+  );
+  h.replace();
+  await vi.waitFor(() => expect(h.row()?.archived).toBe(false));
+  expect(h.sessions.archiveVisibility("agent:main:offline")).toBeUndefined();
+  expect(h.gateway.snapshot.deferredIntentCount).toBe(1);
+  expect(showToast).not.toHaveBeenCalled();
+});
+
+it("retires an old client's in-flight delete even when unrelated metadata is queued", async () => {
+  const h = await setup();
+  const reply = createDeferred<{ deleted: boolean }>();
+  onTestFinished(() => reply.resolve({ deleted: false }));
+  const request = h.current().request.getMockImplementation()!;
+  h.current().request.mockImplementation((method, params) =>
+    method === "sessions.delete" ? reply.promise : request(method, params),
+  );
+  const deletion = h.delete();
+  expect(h.row()).toBeUndefined();
+  h.offline();
+  await h.sessions.patch(
+    "agent:main:other",
+    { label: "Other" },
+    {
+      agentId: "main",
+      expectedSessionId: "other-id",
+    },
+  );
+  expect(h.gateway.snapshot.deferredIntentCount).toBe(1);
+  h.replace();
+  expect(h.sessions.deletionState("agent:main:offline", "main", "incarnation")).toBeUndefined();
+  expect(h.row()).toMatchObject({ label: "Original", archived: false });
+  reply.resolve({ deleted: true });
+  await deletion;
+  expect(h.sessions.deletionState("agent:main:offline", "main", "incarnation")).toBeUndefined();
+});
+
+it("reports a preserved worktree after deferred deletion without removing it", async () => {
+  const h = await setup();
+  const request = h.current().request.getMockImplementation()!;
+  h.current().request.mockImplementation(async (method, params) => {
+    const result = await request(method, params);
+    return method === "sessions.delete"
+      ? {
+          ok: true,
+          key: "agent:main:offline",
+          deleted: true,
+          archived: [],
+          worktreePreserved: {
+            id: "synthetic-worktree",
+            branch: "feature/offline",
+            path: "/synthetic/worktree",
+            reason: "busy",
+          },
+        }
+      : result;
+  });
+  h.offline();
+  await h.delete();
+  h.reconnect();
+  await vi.waitFor(() => expect(h.gateway.snapshot.deferredIntentDraining).toBe(false));
+  expect(showToast).toHaveBeenCalledExactlyOnceWith({
+    message: "Managed Worktrees:\nfeature/offline — live run or cleanup active",
+  });
+  expect(h.row()).toBeUndefined();
+  expect(h.current().request.mock.calls.some(([method]) => method === "worktrees.remove")).toBe(
+    false,
+  );
+});
+
+it.each([false, true])(
+  "does not publish a retired delete's absence-check error (missing incarnation=%s)",
+  async (missingIncarnation) => {
+    const h = await setup();
+    const described = createDeferred<{ session: null }>();
+    const describing = createDeferred();
+    const replayed = createDeferred();
+    onTestFinished(() => described.resolve({ session: null }));
+    const request = h.current().request.getMockImplementation()!;
+    h.current().request.mockImplementation((method, params) => {
+      if (method === "sessions.describe") {
+        describing.resolve();
+        return described.promise;
+      }
+      return request(method, params);
+    });
+    const defer = h.gateway.defer;
+    vi.spyOn(h.gateway, "defer").mockImplementation((intent) =>
+      defer({
+        ...intent,
+        run: async (client) => {
+          try {
+            await intent.run(client);
+          } finally {
+            replayed.resolve();
+          }
+        },
+      }),
+    );
+    h.offline();
+    await h.delete();
+    h.gone(missingIncarnation);
+    h.reconnect();
+    await describing.promise;
+    h.gateway.connect({ token: "replacement-synthetic-account" });
+    described.resolve({ session: null });
+    await replayed.promise;
+    expect(h.sessions.state.error).toBeNull();
+    expect(showToast).not.toHaveBeenCalled();
+  },
+);

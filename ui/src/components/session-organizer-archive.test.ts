@@ -67,6 +67,21 @@ function guardedTarget(index: number) {
 }
 
 describe("session organizer nested archive choice", () => {
+  it("confirms only the selected offline parent without discovering or archiving its subtree", async () => {
+    const h = createHarness({ phase: "reconnecting" });
+    h.scope.allowDeferred = true;
+    const root = sessionRow(0, { hasArchiveDescendants: true });
+    const tree = prepareArchiveTree(h, [gatewayRow(0), gatewayRow(1)]);
+    const modal = createModalDialogTestFixture();
+    onTestFinished(() => modal.cleanup());
+    const pending = modal.track(confirmSessionArchive(root, h.scope, () => true));
+    const dialog = await waitForConfirmDialogActions(document.body);
+    expect(document.body.textContent).toContain("Reconnect to archive the complete subtree.");
+    answerConfirmDialog(dialog, "confirm");
+    await expect(pending).resolves.toEqual({ kind: "single" });
+    expect(tree.describeSession).not.toHaveBeenCalled();
+    expect(tree.refreshList).not.toHaveBeenCalled();
+  });
   it("includes unexpanded persistent descendants through workers but excludes independent branches", async () => {
     const modal = createModalDialogTestFixture();
     onTestFinished(() => modal.cleanup());
@@ -254,6 +269,25 @@ describe("session organizer nested archive choice", () => {
 });
 
 describe("personal pin archive Undo", () => {
+  it("undoes an offline bulk archive without attempting a pin write", async () => {
+    const h = createHarness({ phase: "reconnecting" });
+    h.scope.sessions.captureConnectionScope = () => null;
+    h.scope.sessions.invalidate = vi.fn();
+    h.scope.sessions.refreshReplacement = vi.fn(async () => null);
+    h.scope.sessions.patch = vi.fn(async () => ({ queued: true as const }));
+    const rows = [sessionRow(0), sessionRow(100)];
+    await archiveConfirmedSessionsWithUndo(h.host, rows, h.scope);
+    vi.mocked(showToast).mock.calls.at(-1)![0].onAction!();
+    await waitForFast(() => expect(h.scope.sessions.patch).toHaveBeenCalledTimes(4));
+    expect(vi.mocked(h.scope.sessions.patch).mock.calls.map(([, patch]) => patch)).toEqual([
+      { archived: true },
+      { archived: true },
+      { archived: false },
+      { archived: false },
+    ]);
+    expect(h.request).not.toHaveBeenCalled();
+    expect(h.publishSessionMutationError).not.toHaveBeenCalled();
+  });
   it.each(["success", "failure", "profile", "manual"] as const)(
     "settles a personal pin receipt without replacing newer intent (%s)",
     async (outcome) => {

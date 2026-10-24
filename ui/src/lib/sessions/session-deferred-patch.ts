@@ -1,15 +1,17 @@
 import { formatUiError } from "../format-error.ts";
 import { showToast } from "../toast.ts";
 import {
-  isSessionDisplayMetadataPatch,
+  isSessionDeferredPatch,
   type SessionPatch,
   type SessionPatchOptions,
   type SessionPatchOutcome,
   type SessionPatchRoute,
 } from "./patch.ts";
+import { projectSessionArchiveFields } from "./session-archive-state.ts";
 import type { SessionMutationsHost } from "./session-mutations-host.ts";
 import {
   type createOptimisticRowField,
+  type createOptimisticArchivePatches,
   resolvePendingConversation,
   resolvePendingRowTarget,
 } from "./session-pending-rows.ts";
@@ -17,9 +19,10 @@ import {
 type MetadataField = "label" | "icon" | "color" | "category";
 type MetadataFieldOwner = ReturnType<typeof createOptimisticRowField<MetadataField>>;
 
-export function deferSessionMetadataPatch(
+export function deferSessionPatch(
   host: SessionMutationsHost,
   metadataFields: Record<MetadataField, MetadataFieldOwner>,
+  archive: ReturnType<typeof createOptimisticArchivePatches>,
   patch: SessionPatchRoute,
   key: string,
   patchParams: SessionPatch,
@@ -27,7 +30,7 @@ export function deferSessionMetadataPatch(
 ): SessionPatchOutcome | null {
   const snapshot = host.snapshot();
   if (
-    !isSessionDisplayMetadataPatch(patchParams) ||
+    !isSessionDeferredPatch(patchParams) ||
     (snapshot.phase === "connected" &&
       !snapshot.deferredIntentCount &&
       !snapshot.deferredIntentDraining) ||
@@ -46,7 +49,15 @@ export function deferSessionMetadataPatch(
     return null;
   }
   const claims: Array<readonly [MetadataFieldOwner, symbol | null]> = [];
+  const archived = patchParams.archived;
+  const lifecycle = typeof archived === "boolean";
+  let archiveToken = lifecycle
+    ? archive.prepare(() => projectSessionArchiveFields(archived))(target)
+    : null;
   const settle = () => {
+    if (archiveToken) {
+      archive.settle(target, archiveToken, false, true);
+    }
     for (const [owner, token] of claims) {
       if (token) {
         owner.settle(target, token, false, true);
@@ -60,8 +71,13 @@ export function deferSessionMetadataPatch(
       claims.push([owner, owner.prepare(() => patchParams[field]?.trim() || undefined)(target)]);
     }
   }
+  const lifecycleKey = `sessions.lifecycle:${target.agentId}:${target.key}`;
   const accepted = host.defer({
-    key: `sessions.patch:${target.agentId}:${target.key}:${Object.keys(patchParams).toSorted().join(",")}`,
+    key: lifecycle
+      ? lifecycleKey
+      : `sessions.patch:${target.agentId}:${target.key}:${Object.keys(patchParams).toSorted().join(",")}`,
+    group: lifecycleKey,
+    preservePosition: lifecycle,
     run: async () => {
       try {
         const result = await patch(target.key, patchParams, {
@@ -86,6 +102,10 @@ export function deferSessionMetadataPatch(
   if (!accepted) {
     settle();
     return null;
+  }
+  // A superseded delete restores its hidden row during admission.
+  if (!archiveToken && lifecycle) {
+    archiveToken = archive.prepare(() => projectSessionArchiveFields(archived))(target);
   }
   return { queued: true };
 }
