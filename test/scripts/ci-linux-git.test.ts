@@ -136,28 +136,25 @@ linuxIt("manual timeouts never fall back to another ref", async ({ signal }) => 
   );
 });
 
-linuxIt(
-  "preflight pins a moved exact SHA and retries only its parent metadata",
-  async ({ signal }) => {
-    const report = await runCheckout(signal, "preflight", [0, 0, 23, 0], {
-      env: { GITHUB_EVENT_NAME: "workflow_dispatch" },
-      poisonPython: true,
-    });
-    expect(report.code).toBe(0);
-    expect(lastArgs(report.fetches)).toEqual([
-      "+refs/heads/main:refs/remotes/origin/checkout",
-      `+${candidate}:refs/remotes/origin/checkout`,
-      candidate,
-      candidate,
-    ]);
-    for (const fetch of report.fetches.slice(2)) {
-      expect(fetch.args).toEqual(expect.arrayContaining(["--depth=2", "--filter=blob:none"]));
-    }
-    expect(argsOf(report.checkouts)).toEqual([
-      command("checkout --detach refs/remotes/origin/checkout"),
-    ]);
-  },
-);
+linuxIt("pins preflight SHA while retrying parent metadata", async ({ signal }) => {
+  const report = await runCheckout(signal, "preflight", [0, 0, 23, 0], {
+    env: { GITHUB_EVENT_NAME: "workflow_dispatch" },
+    poisonPython: true,
+  });
+  expect(report.code).toBe(0);
+  expect(lastArgs(report.fetches)).toEqual([
+    "+refs/heads/main:refs/remotes/origin/checkout",
+    `+${candidate}:refs/remotes/origin/checkout`,
+    candidate,
+    candidate,
+  ]);
+  for (const fetch of report.fetches.slice(2)) {
+    expect(fetch.args).toEqual(expect.arrayContaining(["--depth=2", "--filter=blob:none"]));
+  }
+  expect(argsOf(report.checkouts)).toEqual([
+    command("checkout --detach refs/remotes/origin/checkout"),
+  ]);
+});
 
 linuxIt("manual security never refetches an unavailable equal fallback", async ({ signal }) => {
   const report = await runCheckout(signal, "security-fast", [128], {
@@ -169,20 +166,17 @@ linuxIt("manual security never refetches an unavailable equal fallback", async (
   expect(report.checkouts).toEqual([]);
 });
 
-linuxIt(
-  "preflight rejects a fallback that cannot satisfy the requested exact SHA",
-  async ({ signal }) => {
-    const report = await runCheckout(signal, "preflight", [128, 0], {
-      env: { GITHUB_EVENT_NAME: "workflow_dispatch", CHECKOUT_REF: moved },
-    });
-    expect(report.code).toBe(1);
-    expect(lastArgs(report.fetches)).toEqual([
-      `+${moved}:refs/remotes/origin/checkout`,
-      `+${candidate}:refs/remotes/origin/checkout`,
-    ]);
-    expect(report.checkouts).toEqual([]);
-  },
-);
+linuxIt("rejects a fallback for a different exact SHA", async ({ signal }) => {
+  const report = await runCheckout(signal, "preflight", [128, 0], {
+    env: { GITHUB_EVENT_NAME: "workflow_dispatch", CHECKOUT_REF: moved },
+  });
+  expect(report.code).toBe(1);
+  expect(lastArgs(report.fetches)).toEqual([
+    `+${moved}:refs/remotes/origin/checkout`,
+    `+${candidate}:refs/remotes/origin/checkout`,
+  ]);
+  expect(report.checkouts).toEqual([]);
+});
 
 const preflightCases: (ReturnType<typeof fetchCase> & { env: Record<string, string> })[] = [
   {
@@ -253,33 +247,30 @@ linuxIt.for(historyProfiles)(
   },
 );
 
-linuxIt(
-  "ratchet retries a stale merge parent before checkout and base publication",
-  async ({ signal }) => {
-    const report = await runCheckout(signal, "checks-fast-core", [0, 0], {
-      step: "Prepare release-gate ratchet merge tree",
-      mergeSnapshots: [
-        { sha: "f".repeat(40), head: moved },
-        { sha: merge, head: candidate },
-      ],
-      prepare: true,
-    });
-    expect(report.code).toBe(0);
-    expect(lastArgs(report.fetches)).toEqual([
-      "+refs/pull/17/merge:refs/remotes/origin/ci-ratchet-merge",
-      "+refs/pull/17/merge:refs/remotes/origin/ci-ratchet-merge",
-    ]);
-    expect(
-      report.boundaries
-        .filter(
-          ({ name }) => name.startsWith("fetch:") || name === "show-parents" || name === "checkout",
-        )
-        .map(({ name }) => name),
-    ).toEqual(["fetch:1", "show-parents", "fetch:2", "show-parents", "checkout"]);
-    expect(lastArgs(report.checkouts)).toEqual([merge]);
-    expect(report.githubEnv).toBe(`RATCHET_BASE_REF=${base}\n`);
-  },
-);
+linuxIt("retries stale ratchet parents before publishing", async ({ signal }) => {
+  const report = await runCheckout(signal, "checks-fast-core", [0, 0], {
+    step: "Prepare release-gate ratchet merge tree",
+    mergeSnapshots: [
+      { sha: "f".repeat(40), head: moved },
+      { sha: merge, head: candidate },
+    ],
+    prepare: true,
+  });
+  expect(report.code).toBe(0);
+  expect(lastArgs(report.fetches)).toEqual([
+    "+refs/pull/17/merge:refs/remotes/origin/ci-ratchet-merge",
+    "+refs/pull/17/merge:refs/remotes/origin/ci-ratchet-merge",
+  ]);
+  expect(
+    report.boundaries
+      .filter(
+        ({ name }) => name.startsWith("fetch:") || name === "show-parents" || name === "checkout",
+      )
+      .map(({ name }) => name),
+  ).toEqual(["fetch:1", "show-parents", "fetch:2", "show-parents", "checkout"]);
+  expect(lastArgs(report.checkouts)).toEqual([merge]);
+  expect(report.githubEnv).toBe(`RATCHET_BASE_REF=${base}\n`);
+});
 
 posixIt("fetches only the harness bloblessly", async ({ signal }) => {
   const report = await runCiGitStep({ signal, job: "checks-fast-core", fetchResults: [0, 0] });
@@ -360,77 +351,72 @@ const mantisCases = [
   mismatch?: boolean;
 }[];
 
-posixIt.for(mantisCases)(
-  "Mantis ref Git owner drains before trust probes and publication: $label",
-  async (profile, { signal }) => {
-    const { shared } = profile;
-    const baseline = "baseline" in profile && profile.baseline;
-    const release = "release" in profile && profile.release;
-    const mismatch = "mismatch" in profile && profile.mismatch;
-    const fetches = release ? [qaMainFetch, mantisReleaseFetch] : [qaMainFetch];
-    const report = await runCiGitStep({
-      signal,
-      ...(shared
-        ? ({ action: "mantis-validate-trusted-ref", step: "Validate refs are trusted" } as const)
-        : {
-            workflow: {
-              file: ".github/workflows/mantis-discord-smoke.yml",
-              job: "validate_selected_ref",
-              step: "Validate selected ref",
-            },
-          }),
-      fetchResults: fetches.map(() => 0),
-      realClock: true,
-      realDrain: false,
-      poisonPython: true,
-      env: {
-        BASELINE_REF: baseline ? "baseline" : "",
-        CANDIDATE_REF: "candidate",
-        INPUT_REF: release ? mantisReleaseRef : "main",
-      },
-      revisions: {
-        "baseline^{commit}": base,
-        "candidate^{commit}": candidate,
-        [`refs/heads/${mantisReleaseRef}`]: mismatch ? moved : candidate,
-      },
-      mergeBase: { ancestor: !release, revision: base },
-    });
-    const code = mismatch ? 1 : 0;
-    expect(report).toMatchObject({
-      code,
-      readyAttempts: attempts(fetches),
-      githubEnv: "",
-      githubPath: "",
-    });
-    expect(argsOf(report.fetches)).toEqual(fetches);
-    expect(
-      report.fetches.every(
-        ({ cwd, configuration }) => cwd === report.workspace && configuration?.length === 0,
-      ),
-    ).toBe(true);
-    expect(toolArgs(report, "gh")).toEqual([]);
-    if (baseline) {
-      expect(toolArgs(report, "git").filter((args) => args[0] === "rev-parse")).toEqual([
-        command("rev-parse baseline^{commit}"),
-        command("rev-parse candidate^{commit}"),
-      ]);
-    }
-    const reason = release ? "release-branch-head" : "main-ancestor";
-    expect(report.githubOutput).toBe(
-      code !== 0
-        ? ""
-        : shared
-          ? `${baseline ? `baseline_revision=${base}\n` : ""}candidate_revision=${candidate}\n`
-          : `selected_revision=${candidate}\ntrusted_reason=${reason}\n`,
-    );
-    if (mismatch) {
-      expect(report.githubSummary).toBe("");
-    }
-    if (mismatch) {
-      expect(report.output).toContain("not trusted for this secret-bearing Mantis run");
-    }
-  },
-);
+posixIt.for(mantisCases)("validates Mantis trust: $label", async (profile, { signal }) => {
+  const { shared } = profile;
+  const baseline = "baseline" in profile && profile.baseline;
+  const release = "release" in profile && profile.release;
+  const mismatch = "mismatch" in profile && profile.mismatch;
+  const fetches = release ? [qaMainFetch, mantisReleaseFetch] : [qaMainFetch];
+  const report = await runCiGitStep({
+    signal,
+    ...(shared
+      ? ({ action: "mantis-validate-trusted-ref", step: "Validate refs are trusted" } as const)
+      : {
+          workflow: {
+            file: ".github/workflows/mantis-discord-smoke.yml",
+            job: "validate_selected_ref",
+            step: "Validate selected ref",
+          },
+        }),
+    fetchResults: fetches.map(() => 0),
+    realClock: true,
+    realDrain: false,
+    poisonPython: true,
+    env: {
+      BASELINE_REF: baseline ? "baseline" : "",
+      CANDIDATE_REF: "candidate",
+      INPUT_REF: release ? mantisReleaseRef : "main",
+    },
+    revisions: {
+      "baseline^{commit}": base,
+      "candidate^{commit}": candidate,
+      [`refs/heads/${mantisReleaseRef}`]: mismatch ? moved : candidate,
+    },
+    mergeBase: { ancestor: !release, revision: base },
+  });
+  const code = mismatch ? 1 : 0;
+  expect(report).toMatchObject({
+    code,
+    readyAttempts: attempts(fetches),
+    githubEnv: "",
+    githubPath: "",
+  });
+  expect(argsOf(report.fetches)).toEqual(fetches);
+  expect(
+    report.fetches.every(
+      ({ cwd, configuration }) => cwd === report.workspace && configuration?.length === 0,
+    ),
+  ).toBe(true);
+  expect(toolArgs(report, "gh")).toEqual([]);
+  if (baseline) {
+    expect(toolArgs(report, "git").filter((args) => args[0] === "rev-parse")).toEqual([
+      command("rev-parse baseline^{commit}"),
+      command("rev-parse candidate^{commit}"),
+    ]);
+  }
+  const reason = release ? "release-branch-head" : "main-ancestor";
+  expect(report.githubOutput).toBe(
+    code !== 0
+      ? ""
+      : shared
+        ? `${baseline ? `baseline_revision=${base}\n` : ""}candidate_revision=${candidate}\n`
+        : `selected_revision=${candidate}\ntrusted_reason=${reason}\n`,
+  );
+  if (mismatch) {
+    expect(report.githubSummary).toBe("");
+    expect(report.output).toContain("not trusted for this secret-bearing Mantis run");
+  }
+});
 
 function mantisWorktree(workflow: string, job: string, offline: boolean, build: boolean) {
   return {
@@ -451,7 +437,7 @@ posixIt.for([
   ...mantisWorktrees.map((profile) => ({ ...profile, failure: false })),
   { ...mantisWorktrees[0]!, failure: true },
 ])(
-  "Mantis worktree Git owner drains before next worktree/install/build: $workflow (cleanup failure=$failure)",
+  "prepares $workflow worktrees (cleanup failure=$failure)",
   async ({ workflow, job, lanes, offline, build, failure }, { signal }) => {
     const report = await runCiGitStep({
       signal,
@@ -483,28 +469,24 @@ posixIt.for([
       ...noOutputs,
     });
     const lanePath = (lane: string) => `.artifacts/qa-e2e/mantis/${workflow}-worktrees/${lane}`;
-    const record = (tool: string, args: string[]) => ({ tool, cwd: report.workspace, args });
-    expect(report.worktrees).toEqual(
-      attempted.map((lane) => ({
-        ...record(
-          "git",
-          command("worktree add --detach", lanePath(lane), lane === "baseline" ? base : candidate),
-        ),
-        configuration: [],
-      })),
+    expect(report.commands.every(({ cwd }) => cwd === report.workspace)).toBe(true);
+    expect(argsOf(report.worktrees)).toEqual(
+      attempted.map((lane) =>
+        command("worktree add --detach", lanePath(lane), lane === "baseline" ? base : candidate),
+      ),
     );
-    expect(report.commands.filter(({ tool }) => tool === "pnpm")).toEqual(
+    expect(toolArgs(report, "pnpm")).toEqual(
       failure
         ? []
         : lanes.flatMap((lane) => [
-            record("pnpm", [
+            [
               "--dir",
               lanePath(lane),
               "install",
               "--frozen-lockfile",
               ...(offline ? ["--prefer-offline"] : []),
-            ]),
-            ...(build ? [record("pnpm", ["--dir", lanePath(lane), "build"])] : []),
+            ],
+            ...(build ? [["--dir", lanePath(lane), "build"]] : []),
           ]),
     );
     expect(report.commands).toHaveLength(
@@ -584,22 +566,19 @@ posixIt.for(["directory", "file", "symlink"] as const)(
   },
 );
 
-posixIt(
-  "docs clone cleanup uncertainty is terminal before another deletion or clone",
-  async ({ signal }) => {
-    const report = await runDocs(signal, docsClone, {
-      cloneResults: ["cleanup-failure"],
-    });
-    expect(report).toMatchObject({ code: 125, clones: length(1) });
-    expect(boundaryNames(report)).toEqual(["delete", "clone:1", "exit"]);
-    expect(backoffs(report)).toEqual([]);
-    expect(report.output).toContain("Git ownership/setup failed");
-    expect(report.output).not.toContain("fixture-docs-token");
-  },
-);
+posixIt("stops cloning before deletion when cleanup is uncertain", async ({ signal }) => {
+  const report = await runDocs(signal, docsClone, {
+    cloneResults: ["cleanup-failure"],
+  });
+  expect(report).toMatchObject({ code: 125, clones: length(1) });
+  expect(boundaryNames(report)).toEqual(["delete", "clone:1", "exit"]);
+  expect(backoffs(report)).toEqual([]);
+  expect(report.output).toContain("Git ownership/setup failed");
+  expect(report.output).not.toContain("fixture-docs-token");
+});
 
 posixIt.for([125, "hang"] satisfies FetchResult[])(
-  "docs advisory fetch drains before config/add/commit and still continues (%s)",
+  "continues after an advisory docs fetch failure (%s)",
   async (failure, { signal }) => {
     const report = await runDocs(signal, docsCommit, {
       fetchResults: [failure, 0],
@@ -624,7 +603,7 @@ posixIt.for([
   { operation: "rebase", failure: 125, lockChange: false },
   { operation: "push", failure: 143, lockChange: false },
 ])(
-  "docs publication drains failed $operation ($failure) before abort/next fetch and then succeeds",
+  "retries docs $operation ($failure) after aborting the rebase",
   async ({ operation, failure, lockChange }, { signal }) => {
     const report = await runDocs(signal, docsCommit, {
       env: lockChange ? { FIXTURE_DOCS_LOCK_AFTER_REBASE: "1" } : {},
@@ -643,21 +622,18 @@ posixIt.for([
   },
 );
 
-posixIt(
-  "docs publication rejects invalid content introduced by the final rebase",
-  async ({ signal }) => {
-    const report = await runDocs(signal, docsCommit, {
-      env: { FIXTURE_DOCS_MDX_AFTER_REBASE: "# Rebased page\n\n{unfinished\n" },
-    });
-    expect(report.code, report.output).toBe(125);
-    expect(report.output).toContain("Docs MDX check failed");
-    expect(report.pushes).toEqual([]);
-    expect(argsOf(report.rebases)).toEqual([rebase]);
-  },
-);
+posixIt("rejects invalid rebased docs before push", async ({ signal }) => {
+  const report = await runDocs(signal, docsCommit, {
+    env: { FIXTURE_DOCS_MDX_AFTER_REBASE: "# Rebased page\n\n{unfinished\n" },
+  });
+  expect(report.code, report.output).toBe(125);
+  expect(report.output).toContain("Docs MDX check failed");
+  expect(report.pushes).toEqual([]);
+  expect(argsOf(report.rebases)).toEqual([rebase]);
+});
 
 posixIt.for([docsClone, docsCommit])(
-  "docs %s preserves five attempts and every backoff including the terminal one",
+  "exhausts docs %s retries with terminal backoff",
   async (step, { signal }) => {
     const cloning = step === docsClone;
     const report = await runDocs(signal, step, {
@@ -747,23 +723,20 @@ posixIt.for([
     validates: true,
     error: "docs sync changed unrelated publisher dependencies",
   },
-])(
-  "docs publication rejects $label before push without Git retries",
-  async ({ text, validates, error }, { signal }) => {
-    const report = await runDocs(signal, docsCommit, {
-      objects: {
-        [sourceObject]: { text: JSON.stringify({ sha: candidate }) },
-        [dependencyReads[0]![1]!]: { text },
-      },
-    });
-    expect(report.code, report.output).toBe(125);
-    expect(report.pushes).toEqual([]);
-    expect(argsOf(report.rebases)).toEqual([rebase]);
-    expect(report.commands.filter(({ tool }) => tool === "node")).toHaveLength(validates ? 1 : 0);
-    expect(report.output).toContain(error);
-    expect(backoffs(report)).toEqual([]);
-  },
-);
+])("rejects $label before push or retry", async ({ text, validates, error }, { signal }) => {
+  const report = await runDocs(signal, docsCommit, {
+    objects: {
+      [sourceObject]: { text: JSON.stringify({ sha: candidate }) },
+      [dependencyReads[0]![1]!]: { text },
+    },
+  });
+  expect(report.code, report.output).toBe(125);
+  expect(report.pushes).toEqual([]);
+  expect(argsOf(report.rebases)).toEqual([rebase]);
+  expect(report.commands.filter(({ tool }) => tool === "node")).toHaveLength(validates ? 1 : 0);
+  expect(report.output).toContain(error);
+  expect(backoffs(report)).toEqual([]);
+});
 
 posixIt.for([0, 23, "cleanup-failure"] satisfies FetchResult[])(
   "docs ClawHub HEAD is owned before Node consumption (%s)",
@@ -818,20 +791,17 @@ function runDocsAgent(signal: AbortSignal, step: string, options: GitOptions = {
   });
 }
 
-posixIt.for([0, 128, 125])(
-  "Docs Agent manual gate owns HEAD and parent before exact outputs (parent=%s)",
-  async (code, { signal }) => {
-    const report = await runDocsAgent(signal, agentGate, {
-      env: { EVENT_NAME: "workflow_dispatch" },
-      commandResults: { "rev-parse HEAD": { code: 0 }, [`rev-parse ${candidate}^`]: { code } },
-    });
-    expectGit(report, 0, [command("rev-parse HEAD"), command(`rev-parse ${candidate}^`)]);
-    expect(toolArgs(report, "gh")).toEqual([]);
-    expect(report.githubOutput).toBe(agentOutput(code === 0 ? base : candidate));
-  },
-);
+posixIt.for([0, 128, 125])("admits manual Docs Agent with parent=%s", async (code, { signal }) => {
+  const report = await runDocsAgent(signal, agentGate, {
+    env: { EVENT_NAME: "workflow_dispatch" },
+    commandResults: { "rev-parse HEAD": { code: 0 }, [`rev-parse ${candidate}^`]: { code } },
+  });
+  expectGit(report, 0, [command("rev-parse HEAD"), command(`rev-parse ${candidate}^`)]);
+  expect(toolArgs(report, "gh")).toEqual([]);
+  expect(report.githubOutput).toBe(agentOutput(code === 0 ? base : candidate));
+});
 
-posixIt("Docs Agent superseded gate drains before false output without gh", async ({ signal }) => {
+posixIt("skips superseded Docs Agent before GitHub reads", async ({ signal }) => {
   const report = await runDocsAgent(signal, agentGate, { revisions: { "origin/main": moved } });
   expectGit(report, 0, [agentFetch, ["rev-parse", "origin/main"]]);
   expect(report.githubOutput).toBe("run_agent=false\n");
@@ -846,7 +816,7 @@ posixIt.for([
   { probe: 128, parent: 128, code: 0, reviewBase: candidate },
   { probe: 0, parent: 0, code: 0, reviewBase: moved },
 ] satisfies { probe: FetchResult; parent: FetchResult; code: number; reviewBase: string }[])(
-  "Docs Agent review base only falls back after ordinary Git failure ($probe/$parent)",
+  "resolves Docs Agent review base ($probe/$parent)",
   async ({ probe, parent, code, reviewBase }, { signal }) => {
     const report = await runDocsAgent(signal, agentGate, {
       workflowRuns: [
@@ -895,7 +865,7 @@ posixIt.for([
   },
 );
 
-posixIt("Docs Agent no-change commit owns diff before successful exit", async ({ signal }) => {
+posixIt("skips unchanged Docs Agent commits", async ({ signal }) => {
   const report = await runDocsAgent(signal, agentCommit, {
     commandResults: { "diff HEAD --quiet": { code: 0 } },
   });
@@ -904,7 +874,7 @@ posixIt("Docs Agent no-change commit owns diff before successful exit", async ({
 });
 
 posixIt.for([false, true])(
-  "Docs Agent push failure drains before owned read and retry/stale success (advanced=%s)",
+  "handles rejected Docs Agent pushes (main advanced=%s)",
   async (advanced, { signal }) => {
     const report = await runDocsAgent(signal, agentCommit, {
       pushResults: [143, 0],
@@ -927,7 +897,7 @@ posixIt.for([false, true])(
 );
 
 posixIt.for(["gate", "commit fetch", "commit push"])(
-  "Docs Agent %s preserves five attempts and terminal backoff contract",
+  "exhausts Docs Agent %s retries",
   async (phase, { signal }) => {
     const gate = phase === "gate";
     const report = await runDocsAgent(signal, gate ? agentGate : agentCommit, {
@@ -960,7 +930,7 @@ const agentProducers = [
   ["diff", "--cached", "HEAD", "--name-only"],
 ];
 posixIt.for(agentProducers.map((args, index) => ({ args, index })))(
-  "Docs Agent enforcement stops on failed producer $args before consuming partial output",
+  "rejects partial docs output from failed $args",
   async ({ args, index }, { signal }) => {
     const report = await runDocsAgent(signal, "Enforce existing-docs-only patch", {
       commandResults: { [args.join(" ")]: { code: 23, output: "src/forbidden.ts\n" } },
