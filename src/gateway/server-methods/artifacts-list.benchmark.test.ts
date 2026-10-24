@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { DatabaseSync } from "node:sqlite";
 import { expect, it, vi } from "vitest";
+import { seedTeamShapeSessions } from "../../../scripts/perf/team-shape-sessions.js";
 import { captureRuntimeConfigAsyncReader } from "../../config/config.js";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import {
@@ -106,16 +107,25 @@ it.each(["default", "custom", "configured alias", "selected alias"] as const)(
 );
 
 it.runIf(process.env.OPENCLAW_DB_WORKER_BENCH === "1")(
-  "measures artifacts.list over 500 URL artifacts and persisted transcript metadata",
+  "measures artifacts.list and branches over 5000 sessions with 500 artifacts and branches",
   async () => {
-    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       await captureRuntimeConfigAsyncReader()();
+      const now = Date.UTC(2026, 9, 24);
+      const seeded = await seedTeamShapeSessions({
+        stateDir: state.stateDir,
+        sessions: 4999,
+        retainedRuns: 0,
+        transcriptBytes: 0,
+        seed: "artifact-branches-benchmark",
+        now,
+      });
       const scope = {
         agentId: "main",
         sessionKey: "agent:main:artifact-bench",
         sessionId: "artifact-bench",
       };
-      await replaceSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+      await replaceSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: now });
       const files = Array.from({ length: 500 }, (_, index) => ({
         type: "file",
         title: `result-${index}.txt`,
@@ -133,6 +143,12 @@ it.runIf(process.env.OPENCLAW_DB_WORKER_BENCH === "1")(
             role: "assistant",
             content: [{ type: "text", text: "context ".repeat(2048) }, file],
           },
+        })),
+        ...Array.from({ length: 500 }, (_, index) => ({
+          type: "message",
+          id: `branch-${index}`,
+          parentId: "message-499",
+          message: { role: "assistant", content: `Preserved branch ${index}` },
         })),
       ]);
       await waitForSessionTranscriptProjection(scope);
@@ -167,7 +183,7 @@ it.runIf(process.env.OPENCLAW_DB_WORKER_BENCH === "1")(
         expect(first?.[0]).toBe(true);
         const golden = JSON.stringify(first?.[1]);
         const field = method === "artifacts.list" ? "artifacts" : "branches";
-        expect(JSON.parse(golden)[field]).toHaveLength(method === "artifacts.list" ? 500 : 1);
+        expect(JSON.parse(golden)[field]).toHaveLength(500);
         const workerResult =
           method === "artifacts.list"
             ? await readSessionArtifacts(scope, {
@@ -196,6 +212,8 @@ it.runIf(process.env.OPENCLAW_DB_WORKER_BENCH === "1")(
         console.log(
           JSON.stringify({
             method,
+            sessions: seeded.sessions.length + 1,
+            branches: 500,
             files: files.length,
             coldMs,
             samples: samples.length,
