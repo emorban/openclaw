@@ -1,5 +1,6 @@
 import type OpenAI from "openai";
 import { describe, expect, it } from "vitest";
+import type { AgentCommandDeliveryResult } from "../agents/command/delivery-result.js";
 import type { NormalizedUsage } from "../agents/usage.js";
 import { recordAgentRunTerminalOutcome } from "../channels/turn/agent-run-terminal-outcome.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
@@ -223,9 +224,16 @@ describe("OpenAI-compatible recovered incomplete turns", () => {
         });
         return recordAgentRunTerminalOutcome(
           {
-            payloads: [{ text: summary }, { text: notice }],
-            meta: { stopReason: "length", error: { kind: "incomplete_turn", message: notice } },
-          },
+            payloads: [
+              { text: summary, mediaUrl: null },
+              { text: notice, mediaUrl: null },
+            ],
+            meta: {
+              durationMs: 0,
+              stopReason: "length",
+              error: { kind: "incomplete_turn", message: notice },
+            },
+          } satisfies AgentCommandDeliveryResult,
           "failed",
         );
       });
@@ -298,10 +306,12 @@ describe("OpenAI-compatible recovered incomplete turns", () => {
         ).toBe(requiredTool ? "" : finalText);
         expect(
           events
-            .filter((event) =>
-              ["response.completed", "response.incomplete", "response.failed"].includes(
-                event.event,
-              ),
+            .filter(
+              (event) =>
+                event.event !== undefined &&
+                ["response.completed", "response.incomplete", "response.failed"].includes(
+                  event.event,
+                ),
             )
             .map((event) => event.event),
         ).toEqual(["response.failed"]);
