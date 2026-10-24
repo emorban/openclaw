@@ -12,6 +12,7 @@ import {
 } from "./plugin-instance-error.js";
 import { pluginInstanceInvocation as invocation } from "./plugin-instance-invocation.js";
 import { PluginCallToken } from "./plugin-instance-owned-values.js";
+import { PluginReplacementReservation } from "./plugin-instance-replacement.js";
 import {
   pluginInstanceState,
   pluginInvocationContext,
@@ -48,7 +49,6 @@ export class PluginInstance {
   private captureModuleRecovery?: () => PluginModuleLoaderRecovery;
   private moduleSourceExists?: false | ((source: string) => boolean);
   private accepting = true;
-  private replacementReserved = false;
   private readonly retainedWork = new Set<object>();
   private readonly calls = new Map<object, { registry?: PluginRegistry; cleanup: boolean }>();
   private forcedRetirement = false;
@@ -82,6 +82,7 @@ export class PluginInstance {
     <T>(run: () => T) => this.runConsumer(run),
   );
   private disposal?: Promise<PluginInstanceDisposalResult>;
+  private readonly replacement = new PluginReplacementReservation(this.pluginId);
   readonly owner?: PluginInstanceOwner;
   private readonly runtimeScope: Parameters<typeof withPluginRuntimePluginScope>[0];
 
@@ -146,11 +147,11 @@ export class PluginInstance {
 
   /** A reload has reserved this instance and is draining its admitted work. */
   get replacementPending(): boolean {
-    return this.replacementReserved;
+    return this.replacement.pending;
   }
 
   holdsPendingReplacement(token: object): boolean {
-    return this.replacementReserved && this.hasToken(token);
+    return this.replacement.pending && this.hasToken(token);
   }
 
   run<T>(run: () => T): T {
@@ -163,7 +164,7 @@ export class PluginInstance {
       return scoped.run(run);
     }
     if (!this.accepting || this.owner?.revoked) {
-      throw new PluginInstanceUnavailableError(this.pluginId);
+      throw this.replacement.refuseFreshCall(this.accepting);
     }
     return this.invoke(run);
   }
@@ -179,7 +180,7 @@ export class PluginInstance {
     }
     // Fresh ordinary calls never inherit a scope's retained-consumer admission.
     if (!this.accepting || this.owner?.revoked) {
-      throw new PluginInstanceUnavailableError(this.pluginId);
+      throw this.replacement.refuseFreshCall(this.accepting);
     }
     return this.invoke(run, this.lease({ registry, joinDisposal: options?.joinDisposal }));
   }
@@ -224,7 +225,7 @@ export class PluginInstance {
 
   /** Track finite host work without granting invocation authority or joining disposal. */
   retainWork(): () => void {
-    if (this.replacementReserved) {
+    if (this.replacement.pending) {
       throw new Error(`Plugin ${this.pluginId} replacement is in progress`);
     }
     const token = {};
@@ -279,17 +280,7 @@ export class PluginInstance {
         `Plugin ${this.pluginId} cannot replace itself from its own active call; retry after the call finishes.`,
       );
     }
-    if (this.replacementReserved) {
-      throw new Error(`Plugin ${this.pluginId} replacement is in progress`);
-    }
-    this.replacementReserved = true;
-    let released = false;
-    return () => {
-      if (!released) {
-        released = true;
-        this.replacementReserved = false;
-      }
-    };
+    return this.replacement.reserve();
   }
 
   /** Retain executable use or idle donor custody through its physical completion. */
@@ -302,10 +293,11 @@ export class PluginInstance {
     const parent = current && this.consumers.get(current.token);
     // Only an exact live retained consumer can derive admission after ordinary closure.
     if (
-      (this.replacementReserved && parent?.kind !== "work") ||
+      (this.replacement.pending && parent?.kind !== "work") ||
       ((!this.accepting || this.owner?.revoked) && !parent?.active)
     ) {
-      throw new Error(`Plugin ${this.pluginId} is retiring`);
+      const refusal = parent ? undefined : this.replacement.refuseFreshCall(this.accepting);
+      throw refusal?.replacement ? refusal : new Error(`Plugin ${this.pluginId} is retiring`);
     }
     const released = createDeferredCore();
     const token = { active: true, completion: released.promise, registry, kind };

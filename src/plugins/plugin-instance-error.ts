@@ -2,7 +2,14 @@ import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 
 /** A retired instance cannot admit a fresh invocation. */
 export class PluginInstanceUnavailableError extends Error {
-  constructor(pluginId?: string) {
+  /**
+   * @param replacement Settles when the reload that refused this fresh host call
+   * finishes; absent when waiting could join the reload's own drain.
+   */
+  constructor(
+    pluginId?: string,
+    readonly replacement?: Promise<void>,
+  ) {
     super(
       pluginId
         ? `Plugin ${pluginId} was reloaded or disabled; use its current tools.`

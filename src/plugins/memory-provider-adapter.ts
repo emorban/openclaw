@@ -47,14 +47,17 @@ export function bindMemoryProvider(
   const instance =
     getPluginValueInstance(provider) ??
     (runtimeOwner ? getPluginValueInstance(runtimeOwner) : undefined);
-  const assertCurrent = () => {
+  // Quiesce closes admission only: a call admitted before it may still complete.
+  const assertCurrent = (admitting: boolean) => {
     if (closed) {
       throw new Error("memory provider handle is closed");
     }
     assertMemoryCallerCurrent(context);
     if (
       instance &&
-      (!instance.acceptingCalls || instance.owner?.revoked || instance.lifecycle.signal.aborted)
+      ((admitting && !instance.acceptingCalls) ||
+        instance.owner?.revoked ||
+        instance.lifecycle.signal.aborted)
     ) {
       throw new Error("memory provider instance is no longer current");
     }
@@ -64,13 +67,13 @@ export function bindMemoryProvider(
     if (before) {
       await racePromiseWithAbortSignal(before, context.signal);
     }
-    assertCurrent();
+    assertCurrent(true);
     const result = await run();
     const after = prepareMemoryCallerRead(context);
     if (after) {
       await racePromiseWithAbortSignal(after, context.signal);
     }
-    assertCurrent();
+    assertCurrent(false);
     return result;
   };
   const assertReference = (reference: MemoryReference) => {
