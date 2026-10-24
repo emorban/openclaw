@@ -30,6 +30,7 @@ import {
   openFixtureReceiptChannel,
 } from "../helpers/fixture-receipts.js";
 import { isProcessAlive } from "../helpers/process-wait.js";
+import { startProcessWatchdogFixture } from "../helpers/process-watchdog.js";
 import { awaitGateBeforeSettlement, withinTest } from "../helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
@@ -91,29 +92,22 @@ function recordsFor(
     typeof durations === "function"
       ? durations
       : () => ({ baselineMs: 100, candidateMs: 100 * durations });
-  return manifest.lanes.flatMap((lane) =>
-    [...Array.from({ length: manifest.rounds }, (_, i) => i + 1), null].flatMap((round) => {
-      const pair = round === null ? `cold-${lane.id}` : `measured-${round}-${lane.id}`;
-      const pairDurations = durationsFor(lane.id, round);
-      return (["baseline", "candidate"] as const).map((side): BenchmarkRunRecord => ({
-        id: `${pair}-${side}`,
-        phase: round === null ? "cold" : "measured",
-        side,
-        lane: lane.id,
-        round,
-        pair,
-        cacheMode: round === null ? "fresh" : "warm",
+  return buildBenchmarkSchedule(manifest)
+    .filter(({ phase }) => phase === "measured" || phase === "cold")
+    .map((plan) => {
+      const times = durationsFor(plan.lane.id, plan.round);
+      return Object.assign({}, plan, {
+        lane: plan.lane.id,
         command: ["node"],
         packageManager,
         startedAt: "2026-09-05T00:00:00.000Z",
-        durationMs: side === "baseline" ? pairDurations.baselineMs : pairDurations.candidateMs,
+        durationMs: plan.side === "baseline" ? times.baselineMs : times.candidateMs,
         userCpuMs: 50,
         systemCpuMs: 10,
         execution,
         exitCode: 0,
-      }));
-    }),
-  );
+      });
+    });
 }
 
 function inventoryPaths(lane: BenchmarkManifest["lanes"][number]): string[] {
@@ -420,62 +414,45 @@ describe("Vitest pair benchmark", () => {
           "setInterval(() => {}, 1000);",
         ].join("\n");
         const ready = observation.receipts.waitFor(pidFile, "ready");
-        const scheduleTimeout = globalThis.setTimeout;
-        // Eager deadline checks and its timer share one clock until the real child is ready.
+        // Hold eager expiry and the watchdog until the real child reports readiness.
         const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
-        let fireDeadline: (() => void) | undefined;
-        const timerSpy = vi
-          .spyOn(globalThis, "setTimeout")
-          .mockImplementation((callback, ms, ...args) => {
-            const timer = scheduleTimeout(callback, ms, ...args);
-            if (ms === 500 && !fireDeadline) {
-              clearTimeout(timer);
-              fireDeadline = () => {
-                fireDeadline = undefined;
-                callback(...args);
-              };
-            }
-            return timer;
-          });
         const commands: Array<ReturnType<typeof runOwnedCommand>> = [];
-        try {
-          await expect(
-            withTerminalManifest(output, () =>
-              withVitestPairDeadline(async (deadline) => {
-                const start = (name: string, args: string[]) => {
-                  const command = deadlineFixtureLifetime.track(
-                    runScript(root, args, {
-                      logPath: path.join(root, `${name}.log`),
-                      deadline,
-                    }),
-                  );
-                  commands.push(command);
-                  return command;
-                };
-                const active = start("active", ["--input-type=module", "-e", activeScript]);
-                await withinTest(
-                  awaitGateBeforeSettlement(
-                    ready,
-                    active,
-                    "benchmark child exited before readiness",
-                  ),
-                  signal,
+        const release = startProcessWatchdogFixture(() =>
+          withTerminalManifest(output, () =>
+            withVitestPairDeadline(async (deadline) => {
+              const start = (name: string, args: string[]) => {
+                const command = deadlineFixtureLifetime.track(
+                  runScript(root, args, {
+                    logPath: path.join(root, `${name}.log`),
+                    deadline,
+                  }),
                 );
-                timerSpy.mockRestore();
-                clock.mockRestore();
-                if (!fireDeadline) {
-                  throw new Error("aggregate deadline was not armed before child readiness");
-                }
-                fireDeadline();
-                await Promise.allSettled([active]);
-                const next = start("successor", [
+                commands.push(command);
+                return command;
+              };
+              await Promise.allSettled([
+                start("active", ["--input-type=module", "-e", activeScript]),
+              ]);
+              await Promise.allSettled([
+                start("successor", [
                   "-e",
                   `require("node:fs").writeFileSync(${JSON.stringify(successor)}, "started")`,
-                ]);
-                await Promise.allSettled([next]);
-              }, 500),
+                ]),
+              ]);
+            }, 500),
+          ),
+        );
+        try {
+          await withinTest(
+            awaitGateBeforeSettlement(
+              ready,
+              commands[0]!,
+              "benchmark child exited before readiness",
             ),
-          ).rejects.toThrow("Vitest pair aggregate deadline exceeded");
+            signal,
+          );
+          clock.mockRestore();
+          await expect(release()).rejects.toThrow("Vitest pair aggregate deadline exceeded");
 
           // Assert outside the deadline owner, which normalizes task errors after cancellation.
           expect(commands).toHaveLength(2);
@@ -493,9 +470,8 @@ describe("Vitest pair benchmark", () => {
           expect(existsSync(successor)).toBe(false);
           expectTerminalFailure(output, "Vitest pair aggregate deadline exceeded after 500ms");
         } finally {
-          timerSpy.mockRestore();
           clock.mockRestore();
-          fireDeadline?.();
+          await release().catch(() => {});
           await Promise.allSettled(commands);
           await observation.cleanup();
         }

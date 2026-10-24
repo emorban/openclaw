@@ -16,6 +16,10 @@ const TOOLING = "a".repeat(40);
 const TARGET = "b".repeat(40);
 const PUBLISHER = "Seal full release child evidence / Seal child receipt";
 const NOW = Date.parse("2026-09-23T12:00:00Z");
+const FAILED = "failure";
+const OTHER_SHA = "c".repeat(40);
+const WRONG_WORKFLOW = ".github/workflows/unrelated.yml";
+const EXPIRED = "2026-09-22T00:00:00Z";
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => vi.unstubAllEnvs());
 
@@ -208,6 +212,11 @@ async function fixture(
 type ReuseFixture = Awaited<ReturnType<typeof fixture>>;
 type Selection = NonNullable<Awaited<ReturnType<typeof discoverReusableReleaseChild>>>;
 type Mutation = (data: ReuseFixture, selection: Selection) => void | Promise<void>;
+async function select(data: ReuseFixture) {
+  const selection = await discoverReusableReleaseChild(data.request, data.deps);
+  expect(selection).not.toBeNull();
+  return selection!;
+}
 const attemptError = "current successful attempt";
 const artifactError = "artifact identity, digest, or expiry";
 const publisherError = "publisher step did not succeed";
@@ -219,8 +228,7 @@ describe("independent release child reuse", () => {
     const workflowRef = `release-ci/${TARGET.slice(0, 12)}-123`;
     data.lineage.status = "diverged";
 
-    const selection = await discoverReusableReleaseChild(data.request, data.deps);
-    expect(selection).not.toBeNull();
+    const selection = await select(data);
     await expect(
       validateReusableReleaseChild(selection!, data.request, data.deps),
     ).resolves.toMatchObject({ receipt: { workflowSha: TARGET, workflowRef } });
@@ -231,8 +239,7 @@ describe("independent release child reuse", () => {
     const data = await fixture();
     const inputs = { ...data.request.inputs, optional: "" };
     data.request.inputs = inputs;
-    const selection = await discoverReusableReleaseChild(data.request, data.deps);
-    expect(selection).not.toBeNull();
+    const selection = await select(data);
     expect(selection!.inputs).toEqual(data.receipt.inputs);
     await expect(
       validateReusableReleaseChild({ ...selection, inputs }, data.request, data.deps),
@@ -248,7 +255,7 @@ describe("independent release child reuse", () => {
     { workflowSha: "c".repeat(40), reason: "same tooling is required" },
   ])("rejects invalid current-parent tooling: $reason", async ({ workflowSha, reason }) => {
     const data = await fixture();
-    const selection = await discoverReusableReleaseChild(data.request, data.deps);
+    const selection = await select(data);
     data.request.workflowSha = workflowSha;
     await expect(validateReusableReleaseChild(selection, data.request, data.deps)).rejects.toThrow(
       reason,
@@ -276,7 +283,7 @@ describe("independent release child reuse", () => {
   ])("reuses sealed green work despite unrelated failures (%#)", async (mutate) => {
     const data = await fixture();
     mutate(data);
-    const selection = await discoverReusableReleaseChild(data.request, data.deps);
+    const selection = await select(data);
     expect(selection).toMatchObject({
       role: "normalCi",
       runId: "101",
@@ -321,8 +328,7 @@ describe("independent release child reuse", () => {
       jobs: data.receipt.jobs,
     });
     await data.seal();
-    const selection = await discoverReusableReleaseChild(data.request, data.deps);
-    expect(selection).not.toBeNull();
+    const selection = await select(data);
     expect(selection?.runAttempt).toBe(2);
     expect(selection?.inputs).not.toHaveProperty("candidate_artifact_json");
     expect(
@@ -331,42 +337,18 @@ describe("independent release child reuse", () => {
   });
 
   it.each<[string, Mutation, string]>([
-    [
-      "non-main-ancestor tooling",
-      (d) => void (d.lineage.status = "diverged"),
-      "not a main ancestor",
-    ],
-    ["failed child", (data) => void (data.run.conclusion = "failure"), attemptError],
-    [
-      "different workflow",
-      (d) => void (d.run.path = ".github/workflows/fake.yml"),
-      "provenance changed",
-    ],
-    [
-      "foreign repository",
-      (d) => void (d.run.head_repository.full_name = "other/repo"),
-      attemptError,
-    ],
-    [
-      "expired artifact",
-      (d) => void (d.artifact.expires_at = "2026-09-22T00:00:00Z"),
-      artifactError,
-    ],
+    ["ancestry", (d) => void (d.lineage.status = "diverged"), "not a main ancestor"],
+    ["failed child", (d) => void (d.run.conclusion = FAILED), attemptError],
+    ["workflow", (d) => void (d.run.path = WRONG_WORKFLOW), "provenance changed"],
+    ["repository", (d) => void (d.run.head_repository.full_name = "other/repo"), attemptError],
+    ["expiry", (d) => void (d.artifact.expires_at = EXPIRED), artifactError],
     ["counterfeit artifact owner", (d) => void (d.artifact.workflow_run.id = 999), artifactError],
-    ["failed upload", (d) => void (d.jobs[2]!.steps[2]!.conclusion = "failure"), publisherError],
-    [
-      "changed workload",
-      (d) => void (d.jobs[0]!.conclusion = "failure"),
-      "complete live composite",
-    ],
-    ["omitted job", (data) => void data.jobs.splice(0, 1), "complete live composite"],
-    [
-      "counterfeit parent origin",
-      (d) => void (d.parent.path = ".github/workflows/unrelated.yml"),
-      originError,
-    ],
-    ["parent SHA", (data) => void (data.parent.head_sha = "c".repeat(40)), originError],
-    ["parent ref", (data) => void (data.parent.head_branch = "other-transport"), originError],
+    ["failed upload", (d) => void (d.jobs[2]!.steps[2]!.conclusion = FAILED), publisherError],
+    ["workload", (d) => void (d.jobs[0]!.conclusion = FAILED), "complete live composite"],
+    ["omitted job", (d) => void d.jobs.splice(0, 1), "complete live composite"],
+    ["parent workflow", (d) => void (d.parent.path = WRONG_WORKFLOW), originError],
+    ["parent SHA", (d) => void (d.parent.head_sha = OTHER_SHA), originError],
+    ["parent ref", (d) => void (d.parent.head_branch = "other-transport"), originError],
     [
       "canonical receipt mutation with updated artifact digest",
       async (data, selection) => {
@@ -404,8 +386,7 @@ describe("independent release child reuse", () => {
     ],
   ])("rejects %s at revalidation and discovery", async (_name, mutate, error) => {
     const data = await fixture();
-    const selection = await discoverReusableReleaseChild(data.request, data.deps);
-    expect(selection).not.toBeNull();
+    const selection = await select(data);
     await mutate(data, selection!);
     await expect(validateReusableReleaseChild(selection, data.request, data.deps)).rejects.toThrow(
       error,
@@ -429,7 +410,7 @@ describe("independent release child reuse", () => {
 
   it("reads binary archives through configured gh auth and rejects failed transfers", async () => {
     const data = await fixture();
-    const selection = await discoverReusableReleaseChild(data.request, data.deps);
+    const selection = await select(data);
     const root = tempDirs.make("frv-child-gh-archive-");
     const archivePath = join(root, "receipt.zip");
     writeFileSync(archivePath, (await data.deps.downloadArchive()).archiveBytes);

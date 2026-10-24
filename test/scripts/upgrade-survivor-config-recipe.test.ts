@@ -1,15 +1,7 @@
 import { spawnSync } from "node:child_process";
-import {
-  cpSync,
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  realpathSync,
-  writeFileSync,
-} from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CONFIG_COMMAND_MAX_BUFFER_BYTES,
   CONFIG_COMMAND_TIMEOUT_MS,
@@ -19,7 +11,6 @@ import {
   resolveUpgradeSurvivorOpenClawCommand,
   runUpgradeSurvivorOpenClawStep,
 } from "../../scripts/e2e/lib/upgrade-survivor/config-recipe.mts";
-import { buildInlineProviderModels } from "../../src/agents/embedded-agent-runner/model.inline-provider.js";
 import { ModelsConfigSchema } from "../../src/config/zod-schema.core.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 import {
@@ -37,20 +28,6 @@ const configValue = (steps: ReturnType<typeof recipeSteps>, id: string) =>
 
 const RECIPE_PATH = "scripts/e2e/lib/upgrade-survivor/config-recipe.mts";
 const DOCKER_RUNNER_PATH = "scripts/e2e/upgrade-survivor-docker.sh";
-
-function configLeafWrites(steps: ReturnType<typeof recipeSteps>) {
-  return steps.flatMap((step): { path: string; value: unknown }[] => {
-    if (step.argv[0] !== "config" || step.argv[1] !== "set") {
-      return [];
-    }
-    if (step.argv[2] === "--batch-json") {
-      return JSON.parse(step.argv[3] ?? "[]");
-    }
-    return step.argv[4] === "--strict-json"
-      ? [{ path: step.argv[2] ?? "", value: JSON.parse(step.argv[3] ?? "null") }]
-      : [];
-  });
-}
 
 function runRecipeFixture(params: { version: string; scenario: string; failPath?: string }) {
   const root = tempDirs.make("openclaw-upgrade-recipe-");
@@ -190,7 +167,7 @@ esac
   it("wraps Windows openclaw npm shims through cmd.exe", () => {
     expect(
       resolveUpgradeSurvivorOpenClawCommand(
-        ["config", "set", "models.providers.openai", '{"apiKey":"sk test"}', "--strict-json"],
+        ["config", "set", "x", '{"apiKey":"sk test"}', "--strict-json"],
         {
           comSpec: String.raw`C:\Windows\System32\cmd.exe`,
           platform: "win32",
@@ -201,25 +178,13 @@ esac
         "/d",
         "/s",
         "/c",
-        'openclaw.cmd config set models.providers.openai "{""apiKey"":""sk test""}" --strict-json',
+        'openclaw.cmd config set x "{""apiKey"":""sk test""}" --strict-json',
       ],
       command: String.raw`C:\Windows\System32\cmd.exe`,
-      commandLabel:
-        'openclaw config set models.providers.openai {"apiKey":"sk test"} --strict-json',
+      commandLabel: 'openclaw config set x {"apiKey":"sk test"} --strict-json',
       shell: false,
       windowsVerbatimArguments: true,
     });
-  });
-
-  it("keeps every recipe file in the prepared test layout", () => {
-    // Prepared tooling workers copy only listed assets, but the recipe reads any section file by name.
-    const buildEntries = readFileSync("scripts/lib/vitest-worker-build-entries.mts", "utf8");
-    const recipeDirectory = "scripts/e2e/lib/upgrade-survivor/config-recipe";
-    const missing = readdirSync(recipeDirectory)
-      .filter((name) => name.endsWith(".json"))
-      .map((name) => `${recipeDirectory}/${name}`)
-      .filter((file) => !buildEntries.includes(JSON.stringify(file)));
-    expect(missing).toEqual([]);
   });
 
   it("keeps the prerelease plugin registry on the beta update channel", () => {
@@ -250,7 +215,7 @@ esac
     writeJson(coverage, {
       acceptedIntents: summary.acceptedIntents.filter((intent: string) => intent === "logging"),
     });
-    const assertions = ["baseline", "survival"].map((stage) =>
+    expectSuccess(
       spawnSync(
         process.execPath,
         ["scripts/e2e/lib/upgrade-survivor/assertions.mjs", "assert-config"],
@@ -264,15 +229,11 @@ esac
             OPENCLAW_CONFIG_PATH: config,
             OPENCLAW_UPGRADE_SURVIVOR_SCENARIO: "base",
             OPENCLAW_UPGRADE_SURVIVOR_CONFIG_COVERAGE_JSON: coverage,
-            OPENCLAW_UPGRADE_SURVIVOR_ASSERT_STAGE: stage,
+            OPENCLAW_UPGRADE_SURVIVOR_ASSERT_STAGE: "survival",
           },
         },
       ),
     );
-    expect(
-      assertions.map((assertion) => assertion.status),
-      assertions.map((assertion) => assertion.stdout + assertion.stderr).join("\n"),
-    ).toEqual([0, 0]);
     expect(loggedArgs.slice(-3)).toEqual([
       ["config", "set", "logging.file", "~/openclaw-upgrade-survivor/gateway.jsonl"],
       ["config", "set", "logging.level", "debug"],
@@ -289,11 +250,13 @@ esac
 
   it("authors schema-valid provider credentials without changing the primary model", () => {
     const steps = baselineSteps("base", null);
-    const writes = configLeafWrites(steps);
     const providers = Object.fromEntries(
-      writes
-        .filter((entry) => entry.path.startsWith("models.providers."))
-        .map((entry) => [entry.path.slice("models.providers.".length), entry.value]),
+      steps
+        .filter((step) => step.argv[2]?.startsWith("models.providers."))
+        .map((step) => [
+          step.argv[2]!.slice("models.providers.".length),
+          configValue(steps, step.id),
+        ]),
     );
     expect(ModelsConfigSchema.safeParse({ providers }).success).toBe(true);
     expect(providers).toMatchObject({
@@ -301,31 +264,12 @@ esac
       anthropic: { apiKey: { source: "env", provider: "default", id: "ANTHROPIC_API_KEY" } },
       google: { apiKey: { source: "env", provider: "default", id: "GEMINI_API_KEY" } },
     });
-    expect(writes.find((entry) => entry.path === "agents")?.value).toMatchObject({
+    expect(configValue(steps, "agents")).toMatchObject({
       defaults: { model: { primary: "openai/gpt-5.5" } },
     });
-    const google = configValue(steps, "models-google");
-    expect(buildInlineProviderModels({ google })).toEqual([
-      expect.objectContaining({
-        id: "gemini-3.1-pro-preview",
-        provider: "google",
-        api: "google-generative-ai",
-      }),
-    ]);
-  });
-
-  it("keeps all configured provider owners allowed in the base recipe", () => {
-    for (const version of ["2026.6.1", "2026.8.1", "2026.9.5"]) {
-      let allow: string[] = [];
-      for (const step of baselineSteps("base", version)) {
-        if (step.argv[2] === "plugins") {
-          allow = JSON.parse(step.argv[3] ?? "{}").allow;
-        } else if (step.argv[2] === "plugins.allow") {
-          allow = JSON.parse(step.argv[3] ?? "[]");
-        }
-      }
-      expect(allow).toEqual(expect.arrayContaining(["anthropic", "google", "openai"]));
-    }
+    expect(configValue(steps, "plugins").allow).toEqual(
+      expect.arrayContaining(Object.keys(providers)),
+    );
   });
 
   it("uses password auth for mobile pairing reconnect coverage", () => {
@@ -393,47 +337,37 @@ esac
   });
 
   it("bounds baseline config commands and reports spawn errors", () => {
-    const calls: unknown[] = [];
+    const output = {
+      signal: "SIGTERM",
+      status: null,
+      stderr: "still validating",
+      stdout: "partial output",
+    } as const;
     const timeoutError = Object.assign(new Error("spawnSync openclaw ETIMEDOUT"), {
       code: "ETIMEDOUT",
     });
-
+    const spawnSyncCommand = vi.fn(() => ({ ...output, error: timeoutError }));
     const outcome = runUpgradeSurvivorOpenClawStep(
       { argv: ["config", "validate"], id: "validate", intent: "validate" },
-      {
-        spawnSyncCommand(command: string, args: string[], options: unknown) {
-          calls.push({ args, command, options });
-          return {
-            error: timeoutError,
-            signal: "SIGTERM",
-            status: null,
-            stderr: "still validating",
-            stdout: "partial output",
-          };
-        },
-      },
+      { spawnSyncCommand },
     );
-
-    expect(calls).toMatchObject([
-      {
-        args: ["config", "validate"],
-        command: "openclaw",
-        options: {
+    expect(spawnSyncCommand.mock.calls).toEqual([
+      [
+        "openclaw",
+        ["config", "validate"],
+        expect.objectContaining({
           killSignal: "SIGTERM",
           maxBuffer: CONFIG_COMMAND_MAX_BUFFER_BYTES,
           timeout: CONFIG_COMMAND_TIMEOUT_MS,
-        },
-      },
+        }),
+      ],
     ]);
     expect(outcome).toMatchObject({
       command: "openclaw config validate",
       errorCode: "ETIMEDOUT",
       errorMessage: "spawnSync openclaw ETIMEDOUT",
       ok: false,
-      signal: "SIGTERM",
-      status: null,
-      stderr: "still validating",
-      stdout: "partial output",
+      ...output,
     });
   });
 

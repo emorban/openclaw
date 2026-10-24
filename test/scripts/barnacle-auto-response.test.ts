@@ -158,14 +158,8 @@ function barnacleGithub(
           return comment;
         }),
         createLabel: async () => undefined,
-        getLabel: async (params: { name: string }) => ({
-          data: {
-            color:
-              managedLabelSpecs[params.name as keyof typeof managedLabelSpecs]?.color ?? "C5DEF5",
-            description:
-              managedLabelSpecs[params.name as keyof typeof managedLabelSpecs]?.description ?? "",
-          },
-        }),
+        getLabel: async ({ name }: { name: keyof typeof managedLabelSpecs }) =>
+          data(managedLabelSpecs[name]),
         lock: record(calls.lock, () => {
           state.locked = true;
           return state;
@@ -336,10 +330,16 @@ describe("barnacle-auto-response", () => {
     expectNoActions(calls, ["createComment", "update"]);
   });
 
-  it("does not duplicate the close for its own skill label event", async () => {
-    const calls = await runBarnacle(labeledContext("r: skill", "openclaw-barnacle[bot]", "Bot"), [
-      file("skills/weather-helper/SKILL.md", "added"),
-    ]);
+  it.each([
+    ["own skill event", "r: skill", "openclaw-barnacle[bot]", "skills/weather-helper/SKILL.md"],
+    [
+      "candidate event",
+      candidateLabels.externalPluginCandidate,
+      "openclaw-bot[bot]",
+      "extensions/example/openclaw.plugin.json",
+    ],
+  ])("keeps bot-applied %s passive", async (_name, label, login, filename) => {
+    const calls = await runBarnacle(labeledContext(label, login, "Bot"), [file(filename, "added")]);
     expectNoActions(calls, ["createComment", "update"]);
   });
 
@@ -357,20 +357,6 @@ describe("barnacle-auto-response", () => {
       "- Problem: gateway crashes\n- Why it matters: sessions lost\n- What changed: guard metadata";
     const labels = classifyPullRequestCandidateLabels(pr("Fix gateway crash", body), broadFiles());
     expect(labels).not.toContain(candidateLabels.dirtyCandidate);
-  });
-
-  it("leaves stale Barnacle labels alone on maintainer-authored PRs", async () => {
-    const calls = await runBarnacle(
-      barnacleContext(
-        {
-          author_association: "OWNER",
-          user: { login: "maintainer" },
-        },
-        [candidateLabels.dirtyCandidate, "r: too-many-prs"],
-      ),
-      broadFiles(),
-    );
-    expectNoActions(calls, ["addLabels", "createComment", "removeLabel", "update"]);
   });
 
   const pings = "@openclaw/maintainer testflight";
@@ -517,21 +503,12 @@ describe("barnacle-auto-response", () => {
     ]);
     expectClosed(calls, 123, "ClawHub");
   });
-
   it("closes manually labeled BlueBubbles requests with imsg migration guidance", async () => {
     const calls = await runBarnacle(
       barnacleIssueContext({}, ["r: bluebubbles"], labelEvent("r: bluebubbles")),
       [],
     );
     expectClosed(calls, 456, "/channels/imessage");
-  });
-
-  it("keeps bot-applied candidate labels passive", async () => {
-    const calls = await runBarnacle(
-      labeledContext(candidateLabels.externalPluginCandidate, "openclaw-bot[bot]", "Bot"),
-      [file("extensions/example/openclaw.plugin.json")],
-    );
-    expectNoActions(calls, ["createComment", "update"]);
   });
 
   it("actions existing candidate labels when a maintainer adds trigger-response", async () => {

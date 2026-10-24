@@ -52,19 +52,18 @@ const ANDROID_PROTECTED_REF = `release-publish/${ANDROID_TOOLING_SHA.slice(0, 12
 const ANDROID_ASSETS = ["OpenClaw-Android.apk", "OpenClaw-Android-SHA256SUMS.txt"];
 const FAILED_PARENT = { status: "completed", conclusion: "failure" };
 type Fields = Record<string, unknown>;
-type Publication = Partial<
-  Record<
-    | "afterAdmission"
-    | "afterFirstUpload"
-    | "afterToolingRead"
-    | "nativeCiAfterAdmission"
-    | "nativeCiAfterAssetLookup"
-    | "nativeCiAfterFirstUpload"
-    | "nativeCiAfterToolingRead"
-    | "release",
-    Fields
-  >
-> & { beforeProvenance?: boolean; targetSha?: string };
+type Publication = {
+  afterAdmission?: Fields;
+  afterFirstUpload?: Fields;
+  afterToolingRead?: Fields;
+  nativeCiAfterAdmission?: Fields;
+  nativeCiAfterAssetLookup?: Fields;
+  nativeCiAfterFirstUpload?: Fields;
+  nativeCiAfterToolingRead?: Fields;
+  release?: Fields;
+  beforeProvenance?: boolean;
+  targetSha?: string;
+};
 
 function workflowStep(file: string, name: string): string {
   const workflow = parse(fs.readFileSync(file, "utf8"));
@@ -106,12 +105,10 @@ function runAndroidApproval({
   publication?: Publication;
 } = {}) {
   const tempRoot = tempRoots.make("openclaw-android-approval-");
-  fs.mkdirSync(path.join(tempRoot, ".release-harness"));
-  fs.symlinkSync(
-    path.join(process.cwd(), "scripts"),
-    path.join(tempRoot, ".release-harness/scripts"),
-    "dir",
-  );
+  const at = (name: string) => path.join(tempRoot, name);
+  const scripts = path.resolve("scripts");
+  fs.mkdirSync(at(".release-harness"));
+  fs.symlinkSync(scripts, at(".release-harness/scripts"), "dir");
   const fullRef = `${ref.startsWith("release-publish/") ? "refs/tags" : "refs/heads"}/${ref}`;
   const approvalPath = path.join(tempRoot, "android-release-approval/approval.json");
   const env = {
@@ -278,7 +275,7 @@ if (JSON.stringify(args) === JSON.stringify(["rev-parse", "v2026.8.1^{commit}"])
       release: { ...target.release, ...publication.release },
     });
     fs.writeFileSync(path.join(tempRoot, "publishing"), "");
-    fs.symlinkSync(path.join(process.cwd(), "scripts"), path.join(tempRoot, "scripts"), "dir");
+    fs.symlinkSync(scripts, at("scripts"), "dir");
     fs.mkdirSync(path.join(tempRoot, "dist"));
     for (const name of ANDROID_ASSETS) {
       fs.writeFileSync(path.join(tempRoot, "dist", name), "fixture");
@@ -303,6 +300,7 @@ function rejectAndroid(options: Parameters<typeof runAndroidApproval>[0]) {
   expect(result.uploads).toEqual([]);
   return result;
 }
+type AndroidOptions = NonNullable<Parameters<typeof runAndroidApproval>[0]>;
 
 function approvalRun(overrides: Record<string, unknown> = {}) {
   return {
@@ -357,43 +355,33 @@ function runClawHubApproval(
 }
 
 describe("scripts/validate-release-publish-approval.mjs", () => {
-  it.each<[Record<string, unknown>, Partial<typeof approvalEnv>, string]>([
-    [
-      { headBranch: "main" },
-      {},
-      "Referenced release publish run 123 must have headBranch=release/2026.6.21, got main.",
-    ],
-    [
-      { conclusion: "success", status: "completed" },
-      {},
-      "Referenced release publish run 123 must still be in_progress, got completed.",
-    ],
+  it.each<[Fields, Partial<typeof approvalEnv>, number]>([
+    [{ headBranch: "main" }, {}, 1],
+    [{ conclusion: "success", status: "completed" }, {}, 1],
     [
       { conclusion: "failure", status: "completed" },
       { ALLOW_COMPLETED_SUCCESSFUL_PARENT: "true" },
-      "Referenced release publish run 123 must still be in_progress, got completed.",
+      1,
     ],
-  ])("rejects unauthorized parent %j with options %j", (run, env, message) => {
+    [
+      { conclusion: "success", status: "completed" },
+      { ALLOW_COMPLETED_SUCCESSFUL_PARENT: "true" },
+      0,
+    ],
+  ])("validates parent %j with options %j", (run, env, status) => {
     const result = runApprovalScript(approvalRun(run), env);
     expect(result).toMatchObject({
-      status: 1,
-      stdout: "",
-      stderr: expect.stringContaining(message),
+      status,
+      stdout: status
+        ? ""
+        : expect.stringContaining("https://github.com/openclaw/openclaw/actions/runs/123"),
+      stderr: status ? expect.stringContaining("Referenced release publish run 123") : "",
     });
-  });
-
-  it("accepts a successful completed parent for detached publication", () => {
-    const result = runApprovalScript(approvalRun({ conclusion: "success", status: "completed" }), {
-      ALLOW_COMPLETED_SUCCESSFUL_PARENT: "true",
-    });
-
-    expect(result).toMatchObject({
-      status: 0,
-      stderr: "",
-      stdout: expect.stringContaining(
-        "Using successful completed release publish run 123: https://github.com/openclaw/openclaw/actions/runs/123",
-      ),
-    });
+    if (status) {
+      expect(result.stderr).toContain(
+        run.headBranch ? "must have headBranch=" : "must still be in_progress",
+      );
+    }
   });
 
   androidIt.each([
@@ -405,28 +393,6 @@ describe("scripts/validate-release-publish-approval.mjs", () => {
       expect(result.status).toBe(1);
       expect(result.uploads).toHaveLength(phase === "afterAdmission" ? 0 : 1);
     }
-  });
-
-  androidIt.each<[string, Parameters<typeof runAndroidApproval>[0]]>([
-    ["parent after live tooling reads", { publication: { afterToolingRead: FAILED_PARENT } }],
-    [
-      "native qualification after final asset lookup",
-      {
-        nativeCi: {},
-        publication: {
-          nativeCiAfterAssetLookup: { run_attempt: 2, status: "queued", conclusion: null },
-        },
-      },
-    ],
-    [
-      "native qualification before provenance",
-      {
-        nativeCi: {},
-        publication: { beforeProvenance: true, nativeCiAfterAdmission: { run_attempt: 2 } },
-      },
-    ],
-  ])("rechecks %s", (_name, options) => {
-    rejectAndroid(options);
   });
 
   androidIt.each([
@@ -464,13 +430,6 @@ describe("scripts/validate-release-publish-approval.mjs", () => {
     expect(result.uploads).toEqual(ANDROID_ASSETS.map((name) => `dist/${name}#${name}`));
   });
 
-  androidIt.each([
-    ["source", { display_title: `CI release-native-android-123-2-${"b".repeat(40)}` }],
-    ["actor", { actor: { login: "other" } }],
-  ])("rejects another native qualification %s", (_name, nativeCi) => {
-    rejectAndroid({ nativeCi });
-  });
-
   androidIt("rechecks failure parent authority immediately before provenance", () => {
     const workflow = parse(fs.readFileSync(".github/workflows/android-release.yml", "utf8"));
     const steps = workflow.jobs.publish_signed_android_apk.steps;
@@ -488,57 +447,60 @@ describe("scripts/validate-release-publish-approval.mjs", () => {
     });
   });
 
-  androidIt.each([
-    ["moved target", { targetSha: "b".repeat(40) }],
-    ["prerelease target", { release: { isPrerelease: true } }],
-  ])("fences asset publication after the release becomes a %s", (_name, publication) => {
-    rejectAndroid({ publication });
-  });
-
   androidIt("rejects an Android handoff whose attestation fails", () => {
     const result = runAndroidApproval({ attestationExitCode: 1 });
     expect(result.status).toBe(1);
     expect(result.stdout).not.toContain("Using attested Android");
   });
 
-  androidIt.each<[string, Parameters<typeof runAndroidApproval>[0], string]>([
-    [
-      "different live parent SHA",
-      { run: { head_sha: "e".repeat(40) } },
-      "release publish parent run",
-    ],
-    [
-      "moved tooling tag",
-      {
-        identity: {
-          ref: `refs/tags/${ANDROID_PROTECTED_REF}`,
-          object: { type: "commit", sha: "e".repeat(40) },
-        },
+  androidIt.each<AndroidOptions & { diagnostic?: string }>([
+    { publication: { afterToolingRead: FAILED_PARENT } },
+    {
+      nativeCi: {},
+      publication: {
+        nativeCiAfterAssetLookup: { run_attempt: 2, status: "queued", conclusion: null },
       },
-      "protected release tooling tag",
-    ],
-    [
-      "parent unreachable from main",
-      { ref: "main", identity: { status: "diverged" } },
-      "not reachable from current main",
-    ],
-    [
-      "malformed attested native tuple",
-      {
-        nativeCi: {},
-        approval: {
-          nativeCi: { runId: "91", runAttempt: 2, workflowRef: ANDROID_PROTECTED_REF },
-        },
+    },
+    {
+      nativeCi: {},
+      publication: {
+        beforeProvenance: true,
+        nativeCiAfterAdmission: { run_attempt: 2 },
       },
-      "exact native CI qualification tuple",
-    ],
-    [
-      "different attested target SHA",
-      { approval: { targetSha: "b".repeat(40) } },
-      "Attested Android release approval does not match this run request.",
-    ],
-  ])("rejects Android approval with %s", (_name, options, message) => {
-    expect(rejectAndroid(options).stderr).toContain(message);
+    },
+    { nativeCi: { display_title: `CI release-native-android-123-2-${"b".repeat(40)}` } },
+    { nativeCi: { actor: { login: "other" } } },
+    { publication: { targetSha: "b".repeat(40) } },
+    { publication: { release: { isPrerelease: true } } },
+    { run: { head_sha: "e".repeat(40) }, diagnostic: "release publish parent run" },
+    {
+      identity: {
+        ref: `refs/tags/${ANDROID_PROTECTED_REF}`,
+        object: { type: "commit", sha: "e".repeat(40) },
+      },
+      diagnostic: "protected release tooling tag",
+    },
+    {
+      ref: "main",
+      identity: { status: "diverged" },
+      diagnostic: "not reachable from current main",
+    },
+    {
+      nativeCi: {},
+      approval: {
+        nativeCi: { runId: "91", runAttempt: 2, workflowRef: ANDROID_PROTECTED_REF },
+      },
+      diagnostic: "exact native CI qualification tuple",
+    },
+    {
+      approval: { targetSha: "b".repeat(40) },
+      diagnostic: "Attested Android release approval does not match",
+    },
+  ])("rejects unauthorized Android approval: %j", ({ diagnostic, ...options }) => {
+    const result = rejectAndroid(options);
+    if (diagnostic) {
+      expect(result.stderr).toContain(diagnostic);
+    }
   });
 
   androidIt("rejects cancelled parents even during explicit recovery", () => {

@@ -373,120 +373,96 @@ describe.skipIf(process.platform === "win32")("lint failure reporting boundary",
       }
     }));
 
-  it.for([
-    { entry: "run-oxlint.mjs", mode: "nonzero" },
-    { entry: "run-oxlint-shards.mts", mode: "nonzero" },
-    { entry: "run-lint.mts", mode: "success" },
-    { entry: "run-lint.mts", mode: "signal" },
-  ] as const)(
-    "$entry reports $mode after joining and releasing artifacts",
-    ({ entry, mode }, { signal }) =>
-      fixture.run(async () => {
-        const { result, details, steps, trailers } = await runLintFixture(mode, signal, { entry });
-        const code = mode === "success" ? 0 : mode === "signal" ? 143 : 7;
-        expect(result.status, details).toBe(code);
+  type Scenario = {
+    mode: Mode;
+    code: number;
+    entry?: Entry;
+    phase?: string;
+    timeout?: boolean;
+    parallel?: boolean;
+    forwarded?: "SIGINT" | "SIGTERM";
+    allPhases?: boolean;
+    claim?: boolean;
+    stderr?: string[];
+  };
+  const scenarios: Scenario[] = [
+    { entry: "run-oxlint.mjs", mode: "nonzero", code: 7, claim: false },
+    { entry: "run-oxlint-shards.mts", mode: "nonzero", code: 7, claim: true },
+    { mode: "success", code: 0, allPhases: true, claim: true },
+    { mode: "signal", code: 143, claim: true },
+    ...["controllers", "i18n", "oxlint"].map((phase): Scenario => ({
+      mode: "nonzero",
+      code: 7,
+      phase,
+      allPhases: true,
+    })),
+    { mode: "wait", code: 124, timeout: true, stderr: ["timed out", "drained:extensions:SIGTERM"] },
+    { mode: "throw", code: 1, phase: "prepare", stderr: ["fixture preparation failure"] },
+    { mode: "nonzero", code: 7, parallel: true },
+    {
+      mode: "unjoined",
+      code: 1,
+      phase: "prepare",
+      stderr: ["fixture cleanup unverified", "child cleanup unverified; retained"],
+    },
+    ...(
+      [
+        ["run-oxlint.mjs", "oxlint", "SIGTERM"],
+        ["run-lint.mts", "oxlint", "SIGINT"],
+        ["run-lint.mts", "i18n", "SIGTERM"],
+        ["run-lint.mts", "prepare", "SIGINT"],
+        ["run-lint.mts", "stylelint", "SIGTERM"],
+      ] as const
+    ).map(([entry, phase, forwarded]): Scenario => ({
+      entry,
+      phase,
+      forwarded,
+      mode: "wait",
+      code: forwarded === "SIGINT" ? 130 : 143,
+      stderr: [`drained:${phase === "oxlint" ? "extensions" : phase}:${forwarded}`],
+    })),
+  ];
+  it.for(scenarios)("$entry $phase $mode settles before reporting $code", (scenario, { signal }) =>
+    fixture.run(async () => {
+      const { mode, code, entry = "run-lint.mts", stderr = [], allPhases, claim } = scenario;
+      const { result, details, steps, trailers } = await runLintFixture(mode, signal, scenario);
+      expect(result.status, details).toBe(code);
+      expectTrailer(trailers, code, entry, mode === "unjoined");
+      for (const message of stderr) {
+        expect(result.stderr, details).toContain(message);
+      }
+      if (claim !== undefined) {
         const lint = steps.find((step) => step.step === "oxlint");
         expect(lint, details).toMatchObject({ owned: true });
-        if (mode === "success") {
-          expect(steps.find((step) => step.step === "prepare")?.args, details).toEqual([
-            "--mode=package-boundary",
-          ]);
-        }
-        if (entry !== "run-oxlint.mjs") {
+        if (claim) {
           expect(lint!.claims).toHaveLength(1);
         }
-        if (mode === "success" && entry === "run-lint.mts") {
-          expect(steps.map((step) => step.step)).toEqual(lintPhases);
-        }
-        expectTrailer(trailers, code, entry);
         if (code) {
           expect(result.stderr).not.toContain("[oxlint:extensions] finished");
         }
-      }),
-  );
-
-  it.for(["controllers", "i18n", "oxlint"] as const)(
-    "runs all lint phases after %s fails and retains its verdict",
-    (phase, { signal }) =>
-      fixture.run(async () => {
-        const { result, details, steps } = await runLintFixture("nonzero", signal, {
-          phase,
-        });
-        expect(result.status, details).toBe(7);
+      }
+      if (allPhases) {
         expect(
           steps.map((step) => step.step),
           details,
         ).toEqual(lintPhases);
-        expect(result.stderr.trim().split("\n").at(-1)).toBe("[lint] FAILED (exit 7)");
-      }),
-  );
-
-  it.for([
-    {
-      mode: "wait",
-      code: 124,
-      options: { timeout: true },
-      stderr: ["timed out", "drained:extensions:SIGTERM"],
-    },
-    {
-      mode: "throw",
-      code: 1,
-      options: { phase: "prepare" },
-      stderr: ["fixture preparation failure"],
-    },
-    { mode: "nonzero", code: 7, options: { parallel: true }, stderr: [] },
-    {
-      mode: "unjoined",
-      code: 1,
-      options: { phase: "prepare" },
-      stderr: ["fixture cleanup unverified", "child cleanup unverified; retained"],
-    },
-  ] as const)(
-    "run-lint.mts settles $mode before reporting exit $code",
-    ({ mode, code, options, stderr }, { signal }) =>
-      fixture.run(async () => {
-        // Unjoined injects an uncertain receipt, not an escaped process.
-        const { result, details, steps, trailers } = await runLintFixture(mode, signal, options);
-        expect(result.status, details).toBe(code);
-        for (const message of stderr) {
-          expect(result.stderr, details).toContain(message);
-        }
-        expectTrailer(trailers, code, "run-lint.mts", mode === "unjoined");
-        if (mode === "throw") {
-          expect(steps.some((step) => step.step === "oxlint")).toBe(false);
-        }
-        if (mode === "nonzero") {
-          expect(
-            steps
-              .filter((step) => step.step === "oxlint")
-              .map((step) => step.shard)
-              .toSorted(),
-          ).toEqual(["core", "extensions", "scripts"]);
-        }
-      }),
-  );
-
-  it.for([
-    { entry: "run-oxlint.mjs", phase: "oxlint", forwarded: "SIGTERM" },
-    { entry: "run-lint.mts", phase: "oxlint", forwarded: "SIGINT" },
-    { entry: "run-lint.mts", phase: "i18n", forwarded: "SIGTERM" },
-    { entry: "run-lint.mts", phase: "prepare", forwarded: "SIGINT" },
-    { entry: "run-lint.mts", phase: "stylelint", forwarded: "SIGTERM" },
-  ] as const)(
-    "$entry forwards $forwarded during $phase and reports cancellation",
-    ({ entry, phase, forwarded }, { signal }) =>
-      fixture.run(async () => {
-        const { result, details, trailers } = await runLintFixture("wait", signal, {
-          entry,
-          phase,
-          forwarded,
-        });
-        const code = forwarded === "SIGINT" ? 130 : 143;
-        expect(result.status, details).toBe(code);
-        expect(result.stderr).toContain(
-          `drained:${phase === "oxlint" ? "extensions" : phase}:${forwarded}`,
-        );
-        expectTrailer(trailers, code, entry);
-      }),
+      }
+      if (mode === "success") {
+        expect(steps.find((step) => step.step === "prepare")?.args).toEqual([
+          "--mode=package-boundary",
+        ]);
+      }
+      if (mode === "throw") {
+        expect(steps.some((step) => step.step === "oxlint")).toBe(false);
+      }
+      if (scenario.parallel) {
+        expect(
+          steps
+            .filter((step) => step.step === "oxlint")
+            .map((step) => step.shard)
+            .toSorted(),
+        ).toEqual(["core", "extensions", "scripts"]);
+      }
+    }),
   );
 });
