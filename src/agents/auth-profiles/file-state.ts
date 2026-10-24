@@ -9,7 +9,7 @@ import {
 import { hasErrnoCode } from "../../infra/errno.js";
 import { observeOwnedDirectory } from "../../infra/owned-directory-observation.js";
 import {
-  captureSqliteReadOnlyWorkerScope,
+  createSqliteReadOnlyWorkerScope,
   readOnlyWorkerScope,
 } from "../../infra/sqlite-readonly-worker-context.js";
 import {
@@ -40,6 +40,8 @@ type DirectoryState = {
 };
 
 const directories = new Map<string, DirectoryState>();
+// Directory observation outlives the caller that first discovers its files.
+let observationReaders = createSqliteReadOnlyWorkerScope();
 export const authProfileFileChanges: {
   onChange?: (change: FileChange) => void | Promise<void>;
 } = {};
@@ -54,7 +56,7 @@ function retireDirectory(directory: string, state: DirectoryState): void {
   directories.delete(directory);
 }
 
-registerOpenClawStateDatabaseAsyncResource({ close: async () => closeAuthProfileFileState() });
+registerOpenClawStateDatabaseAsyncResource({ close: closeAuthProfileFileState });
 registerAgentDatabaseReaderCloser((candidates, retainedPaths) => {
   for (const [directory, state] of directories) {
     for (const databasePath of state.identities.keys()) {
@@ -146,8 +148,8 @@ function refreshDirectory(directory: string, state: DirectoryState): Promise<voi
 
 function captureFileChangePublisher(): DirectoryState["publishChange"] {
   const broker = getSpawnBroker();
-  const runWithReaders = captureSqliteReadOnlyWorkerScope();
-  const signal = readOnlyWorkerScope.getStore()?.controller.signal;
+  const readers = observationReaders;
+  const signal = readers.run(() => readOnlyWorkerScope.getStore()?.controller.signal);
   // Restore only host readers at publication, after physical file facts settle.
   // A scan spanning a restart uses the current publisher, never old request authority.
   return async (change) => {
@@ -155,12 +157,12 @@ function captureFileChangePublisher(): DirectoryState["publishChange"] {
       return;
     }
     await runWithSpawnBroker(broker, () =>
-      runWithReaders(() => authProfileFileChanges.onChange?.(change)),
+      readers.run(() => authProfileFileChanges.onChange?.(change)),
     );
   };
 }
 
-/** Retained shared state survives a restart; its observers must use the new Gateway readers. */
+/** Retained observers must use the current Gateway's host bindings after a restart. */
 export function bindAuthProfileFileObservationReaders(): void {
   for (const state of directories.values()) {
     state.publishChange = captureFileChangePublisher();
@@ -267,8 +269,11 @@ export async function refreshAuthProfileFileState(): Promise<void> {
   );
 }
 
-function closeAuthProfileFileState(): void {
+async function closeAuthProfileFileState(): Promise<void> {
   for (const [directory, state] of directories) {
     retireDirectory(directory, state);
   }
+  const readers = observationReaders;
+  observationReaders = createSqliteReadOnlyWorkerScope();
+  await readers.close();
 }
