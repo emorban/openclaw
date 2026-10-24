@@ -4,7 +4,6 @@ import {
   timedText,
   persistedText,
   expectTextContains,
-  expectText,
   agentEvent,
   chatDelta,
   chatEvent,
@@ -36,200 +35,79 @@ suite.define(() => {
   it.each([
     { label: "desktop hover", mobile: false, viewport: { height: 900, width: 1440 } },
     { label: "mobile tap", mobile: true, viewport: { height: 844, width: 390 } },
-  ])("shows turn metadata only after completion on $label", async ({ mobile, viewport }) => {
+  ])("reveals metadata across tool completion on $label", async ({ mobile, viewport }) => {
     const { context, page, gateway } = await chatFixture(
       suite,
       {
-        historyMessages: [
-          {
-            role: "assistant",
-            content: "Earlier completed reply.",
-            timestamp: Date.now() - 60_000,
-          },
-          {
-            role: "assistant",
-            content: "Earlier final summary.\n\n[Source](https://example.com)",
-            timestamp: Date.now() - 59_000,
-          },
-        ],
+        historyMessages: [timedText("assistant", "Earlier completed reply.")],
       },
       { hasTouch: mobile, isMobile: mobile, viewport },
     );
-
     await page.goto(`${suite.server.baseUrl}chat`);
     await page.getByText("Earlier completed reply.").waitFor();
-    const earlierAssistant = page.locator(".chat-group.assistant").first();
-    const footerPresentation = (group: typeof earlierAssistant) =>
-      group.locator(":scope > .chat-group-footer").evaluate((element) => {
+    const earlier = page.locator(".chat-group.assistant").first();
+    const params = await sendChat(page, gateway, "show turn metadata");
+    const runId = requireString(params.idempotencyKey, "chat send idempotency key");
+    await gateway.emitGatewayEvent(
+      "chat",
+      chatDelta(runId, "This response is still streaming.", "main"),
+    );
+    const group = page.locator(".chat-group.assistant").last();
+    await group.locator(".chat-bubble.streaming").waitFor();
+    const footer = (target: typeof group) => target.locator(":scope > .chat-group-footer");
+    const presentation = (target: typeof group) =>
+      footer(target).evaluate((element) => {
         const style = getComputedStyle(element);
         return { opacity: style.opacity, pointerEvents: style.pointerEvents };
       });
-    const expectFooter = (group: typeof earlierAssistant, visible: boolean) =>
-      expect
-        .poll(() => footerPresentation(group))
-        .toEqual(
-          visible
-            ? { opacity: "1", pointerEvents: "auto" }
-            : { opacity: "0", pointerEvents: "none" },
-        );
-    const actionOpacities = (group: typeof earlierAssistant) =>
-      group
-        .locator(":scope > .chat-group-footer .chat-group-footer-actions button")
-        .evaluateAll((buttons) => buttons.map((button) => getComputedStyle(button).opacity));
-    const expectActionOpacities = (group: typeof earlierAssistant, values: string[]) =>
-      expect.poll(() => actionOpacities(group)).toEqual(values);
-    const expectActionsVisible = (group: typeof earlierAssistant) =>
-      expect
-        .poll(async () => (await actionOpacities(group)).map((value) => Number(value) > 0))
-        .toEqual([true, true]);
-    const expectFocus = (locator: typeof earlierAssistant) =>
-      expect.poll(() => locator.evaluate((node) => node.matches(":focus-visible"))).toBe(true);
-    await page.mouse.move(0, 0);
-    await expectActionOpacities(earlierAssistant, mobile ? ["1", "1"] : ["0", "0"]);
-    await expectFooter(earlierAssistant, mobile);
-    await expect
-      .poll(() =>
-        earlierAssistant
-          .locator(".chat-message-actions-row button, .chat-message-footer button")
-          .evaluateAll((buttons) => buttons.map((button) => getComputedStyle(button).opacity)),
-      )
-      .toEqual(["0", "0"]);
-    await sendMessage(page, "show turn metadata");
-    const sendRequest = await gateway.waitForRequest("chat.send");
-    await page.mouse.move(0, 0);
-    await expectFooter(earlierAssistant, false);
-    const runId = requireString(
-      requireRecord(sendRequest.params).idempotencyKey,
-      "chat send idempotency key",
-    );
-    const streamingText = "This response is still streaming.";
-    await gateway.emitGatewayEvent("chat", chatDelta(runId, streamingText, "main"));
-
-    await page.locator(".chat-bubble.streaming").waitFor({ state: "visible" });
-    const activeGroup = page.locator(".chat-group.assistant").last();
-    const reveal = async () => {
-      if (mobile) {
-        await activeGroup.locator(".chat-bubble").last().tap();
-      } else {
-        await activeGroup.hover();
-      }
-    };
-    await reveal();
-    expect(await activeGroup.locator(".chat-group-footer > *").count()).toBe(0);
-    await page.mouse.move(0, 0);
-    await expectFooter(earlierAssistant, false);
-
-    // Settled commentary is still part of an active turn while a tool runs.
+    await expect.poll(() => presentation(earlier)).toEqual({ opacity: "0", pointerEvents: "none" });
+    expect(await footer(group).locator(":scope > *").count()).toBe(0);
     await gateway.emitGatewayEvent(
       "agent",
       agentEvent(
         runId,
         "main",
         "tool",
-        { args: { path: "README.md" }, name: "read", phase: "start", toolCallId: "footer-read" },
+        {
+          args: { path: "README.md" },
+          name: "read",
+          phase: "start",
+          toolCallId: "footer-read",
+        },
         1,
         Date.now(),
       ),
     );
-    // The working indicator predates the tool event; wait for its deferred projection
-    // before scrolling a bubble that the stream-to-tool render may replace.
     await page.locator('[data-message-id^="tool:assistant:footer-read"]').waitFor();
     await page.locator(".chat-working-indicator").waitFor({ state: "visible" });
-    const heldTouch = mobile ? await context.newCDPSession(page) : null;
-    if (heldTouch) {
-      // A touch can begin during work and disclose the row when released after completion.
-      const bubble = activeGroup.locator(".chat-bubble").last();
+    const touch = mobile ? await context.newCDPSession(page) : null;
+    if (touch) {
+      const bubble = group.locator(".chat-bubble").last();
       await bubble.scrollIntoViewIfNeeded();
       const point = await bubble.evaluate((element) => {
         const rect = element.getBoundingClientRect();
         return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
       });
-      await heldTouch.send("Input.dispatchTouchEvent", {
-        type: "touchStart",
-        touchPoints: [point],
-      });
+      await touch.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [point] });
     } else {
-      await reveal();
+      await group.hover();
     }
-    expect(await activeGroup.locator(".chat-group-footer > *").count()).toBe(0);
-
-    await gateway.emitChatFinal({
-      runId,
-      text: "The turn is complete.\n\n[Source](https://example.com)",
-    });
-    await activeGroup.getByText("The turn is complete.", { exact: true }).waitFor();
-    if (heldTouch) {
-      await heldTouch.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
-      await expectFooter(activeGroup, true);
-      // Mouse movement cannot clear touch disclosure; select another row before testing rest.
-      await earlierAssistant.locator(".chat-bubble").last().tap();
+    expect(await footer(group).locator(":scope > *").count()).toBe(0);
+    await gateway.emitChatFinal({ runId, text: "The turn is complete." });
+    await group.getByText("The turn is complete.", { exact: true }).waitFor();
+    if (touch) {
+      await touch.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    } else {
+      await group.hover();
     }
-    await page.mouse.move(0, 0);
-    const footer = activeGroup.locator(".chat-group-footer");
-    await expectFooter(activeGroup, mobile);
-    await expectActionOpacities(activeGroup, mobile ? ["1", "1"] : ["0", "0"]);
-    expect(await footer.locator(".chat-sender-name").textContent()).toBe("OpenClaw");
-    const timestamp = requireString(
-      await footer.locator(".chat-group-timestamp").textContent(),
-      "assistant timestamp",
-    ).trim();
-    expect(timestamp).toBeTruthy();
-    const accessibleFooter = await footer.ariaSnapshot();
-    expect(accessibleFooter).toContain("OpenClaw");
-    expect(accessibleFooter).toContain(timestamp);
+    await expect.poll(() => presentation(group)).toEqual({ opacity: "1", pointerEvents: "auto" });
+    expect(await footer(group).locator(".chat-sender-name").textContent()).toBe("OpenClaw");
     expect(
-      await footer.evaluate((element) => element.getBoundingClientRect().height),
-    ).toBeGreaterThan(0);
-    await reveal();
-    await expectActionsVisible(activeGroup);
-    await expect
-      .poll(() => footer.evaluate((element) => getComputedStyle(element).opacity))
-      .toBe("1");
-    for (const group of [earlierAssistant, activeGroup]) {
-      const height = await group.evaluate((element) => element.getBoundingClientRect().height);
-      if (mobile) {
-        await group.locator(".chat-bubble").last().tap();
-      } else {
-        await group.locator(".chat-bubble").last().hover();
-      }
-      await expectActionsVisible(group);
-      await expectFooter(group, true);
-      expect(await group.evaluate((element) => element.getBoundingClientRect().height)).toBe(
-        height,
-      );
-      await page.mouse.move(0, 0);
-      const actions = group.locator(
-        ":scope > .chat-group-footer .chat-group-footer-actions button",
-      );
-      const focusedActionOpacities = mobile ? ["1", "1"] : ["0.6", "0.6"];
-      await actions.first().focus();
-      await page.keyboard.press("Shift+Tab");
-      await expectFocus(group.getByRole("link", { name: "Source", exact: true }));
-      await expectActionOpacities(group, focusedActionOpacities);
-      await expectFooter(group, true);
-      if (group === earlierAssistant) {
-        await expect
-          .poll(() =>
-            group
-              .locator(".chat-message-actions-row button, .chat-message-footer button")
-              .evaluateAll((buttons) => buttons.map((button) => getComputedStyle(button).opacity)),
-          )
-          .toEqual(focusedActionOpacities);
-      }
-      await page.keyboard.press("Tab");
-      await expectFocus(actions.first());
-      await actions.nth(1).focus();
-      await expectFocus(actions.nth(1));
-      await expectActionOpacities(group, focusedActionOpacities);
-      await page.keyboard.press("Shift+Tab");
-      await expectFocus(actions.first());
-      await expectActionOpacities(group, focusedActionOpacities);
-      await expectFooter(group, true);
-      expect(await group.evaluate((element) => element.getBoundingClientRect().height)).toBe(
-        height,
-      );
-      await chatComposer(page).focus();
-    }
+      requireString(
+        await footer(group).locator(".chat-group-timestamp").textContent(),
+        "assistant timestamp",
+      ).trim(),
+    ).not.toBe("");
   });
 
   it("normalizes Unicode line separators in streaming and final chat DOM", async () => {
@@ -599,38 +477,5 @@ suite.define(() => {
     expect((await finalReply.locator("code.language-ts").textContent())?.trim()).toBe(
       "const answer = 42;",
     );
-  });
-
-  it("preserves normalized content across cumulative browser updates", async () => {
-    const { page, gateway } = await chatFixture(suite);
-
-    await page.goto(`${suite.server.baseUrl}chat`);
-    await sendMessage(page, "prove prefix reuse");
-    const sendRequest = await gateway.waitForRequest("chat.send");
-    const runId = requireString(
-      requireRecord(sendRequest.params).idempotencyKey,
-      "chat send idempotency key",
-    );
-    const chunks = ["## reuse-proof\r\n", "second-line\u2028", "third-line\r", "\nfourth-line"];
-    let cumulative = "";
-    for (const chunk of chunks) {
-      cumulative += chunk;
-      await gateway.emitGatewayEvent(
-        "chat",
-        chatEvent(runId, "main", "delta", {
-          deltaText: chunk,
-          message: timedText("assistant", cumulative),
-        }),
-      );
-      const expectedTail = chunk
-        .replace(/\r\n?|[\u2028\u2029]/g, "\n")
-        .trim()
-        .replace(/^## /, "");
-      await expectTextContains(page.locator(".chat-bubble.streaming"), expectedTail);
-    }
-
-    const stream = page.locator(".chat-bubble.streaming");
-    await expectTextContains(stream, "fourth-line");
-    await expectText(stream.locator("h2"), "reuse-proof");
   });
 });

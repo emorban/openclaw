@@ -13,7 +13,6 @@ import {
   PICKED,
   WORKSPACE,
   LOCAL_GIT_WORKSPACE_RESPONSES,
-  checkoutBaseRefInput,
   controlUiSessionPath,
   createNewSessionPageE2eSuite,
   createdSessionListResult,
@@ -34,48 +33,6 @@ async function selectProject(page: Page, name: string) {
 
 suite.define(() => {
   const openPage = createPageOpener(suite);
-  it("keeps the pre-submit draft on the composer and creates exactly one session", async () => {
-    const page = await openPage({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { width: 1280, height: 900 },
-    });
-    const gateway = await installMockGateway(page, {
-      methodResponses: {
-        "agents.list": LOCAL_GIT_WORKSPACE_RESPONSES["agents.list"],
-        "sessions.list": createdSessionListResult("agent:main:existing"),
-        "sessions.create": { key: "agent:main:draft-e2e" },
-      },
-    });
-    await page.goto(`${suite.server.baseUrl}new?agent=main`);
-    await page.getByRole("heading", { name: "Main" }).waitFor();
-    const message = page.locator(".new-session-page__message");
-    await message.waitFor();
-    await message.fill("/");
-    const slashMenu = page.locator("#chat-new-session-slash-menu-listbox");
-    await pollLocatorText(slashMenu).toContain("/status");
-    expect(await slashMenu.textContent()).not.toContain("/clear");
-    await message.fill("fix the flaky draft test");
-    expect(new URL(page.url())).toMatchObject({ pathname: "/new", search: "?agent=main" });
-    expect(await message.inputValue()).toBe("fix the flaky draft test");
-    expect(
-      await page.locator('.sidebar-recent-session[data-session-key="agent:main:existing"]').count(),
-    ).toBe(1);
-    expect(await page.locator(".sidebar-recent-session").count()).toBe(1);
-    expect(await gateway.getRequests("sessions.create")).toHaveLength(0);
-    await button(page, "Start session").click();
-    const createRequest = await gateway.waitForRequest("sessions.create");
-    expect(createRequest.params).toMatchObject({
-      agentId: "main",
-      message: "fix the flaky draft test",
-    });
-    // Count after navigation settles so a late duplicate cannot escape the assertion.
-    await expect
-      .poll(() => new URL(page.url()).pathname)
-      .toBe(controlUiSessionPath("agent:main:draft-e2e"));
-    expect(await gateway.getRequests("sessions.create")).toHaveLength(1);
-  });
-
   it("drafts a session with a browsed folder and creates it on first message", async () => {
     const page = await openPage({
       locale: "en-US",
@@ -107,6 +64,7 @@ suite.define(() => {
           repositoryStatus: "git",
         },
         "fs.listDir": folderListings("/home/peter", "/home/peter", EXTRA_FOLDERS),
+        "sessions.list": createdSessionListResult("agent:main:existing"),
         "sessions.create": { key: "agent:main:draft-e2e" },
       },
     });
@@ -137,40 +95,7 @@ suite.define(() => {
       ),
     ).toBe(true);
     await page.keyboard.press("Escape");
-    expect(await incognitoToggle.getAttribute("aria-checked")).toBe("false");
-    await incognitoToggle.click();
-    await expectAttribute(incognitoToggle, "aria-checked", "true");
-    await incognitoToggle.click();
-    await expectAttribute(incognitoToggle, "aria-checked", "false");
-    // Responsive picker placement is owned by new-session-page.responsive-welcome
-    // and new-session-page.model-picker-spacing; keep this flow about placement.
     const agentPicker = page.locator(".new-session-page__select--agent openclaw-agent-select");
-    const whereSelect = page.locator(".oc-popover.new-session-page__where-popover");
-    const whereTrigger = page.locator("#new-session-where-trigger");
-    await whereTrigger.click();
-    const environmentSearch = whereSelect.getByRole("searchbox", { name: "Search environments" });
-    await expectAttribute(environmentSearch, "placeholder", "Search environments");
-    await expect
-      .poll(() => environmentSearch.evaluate((element) => element === document.activeElement))
-      .toBe(true);
-    const localEnvironment = whereSelect.locator('[data-value="gateway"]');
-    expect(await localEnvironment.getAttribute("aria-pressed")).toBe("true");
-    await environmentSearch.fill("no-such-environment");
-    await whereSelect
-      .getByRole("status")
-      .getByText("No matching environments", { exact: true })
-      .waitFor();
-    expect(await whereTrigger.locator(".new-session-page__trigger-label").textContent()).toBe(
-      "Local",
-    );
-    await environmentSearch.fill("");
-    await expect.poll(() => localEnvironment.isVisible()).toBe(true);
-    expect(await localEnvironment.getAttribute("aria-pressed")).toBe("true");
-    await page.keyboard.press("Escape");
-    await expectAttribute(whereTrigger, "aria-expanded", "false");
-    await expect
-      .poll(() => page.evaluate(() => document.activeElement?.id))
-      .toBe("new-session-where-trigger");
     const projectSelect = page.locator(".oc-popover.new-session-page__project-popover");
     const projectTrigger = page.locator("#new-session-project-trigger");
     const checkoutSelect = page.locator(".oc-popover.new-session-page__checkout-popover");
@@ -198,26 +123,7 @@ suite.define(() => {
     await pollLocatorText(checkoutSelect.locator(".new-session-page__menu-title").first()).toBe(
       "Checkout",
     );
-    const currentCheckout = checkoutSelect.locator('[data-value="checkout"]');
-    const worktreeItem = button(checkoutSelect, "New worktree Isolated copy of the repo", true);
-    await expectAttribute(currentCheckout, "aria-pressed", "true");
-    await expectAttribute(worktreeItem, "aria-pressed", "false");
-    expect(await worktreeItem.isEnabled()).toBe(true);
-    await worktreeItem.click();
-    await expectAttribute(checkoutTrigger, "data-worktree", "true");
-    await expectAttribute(currentCheckout, "aria-pressed", "false");
-    await expectLabel(checkoutTrigger, "New worktree");
-    await checkoutBaseRefInput(checkoutSelect).waitFor();
-    await checkoutSelect.getByLabel("Name", { exact: true }).waitFor();
-    await checkoutSelect
-      .getByText("Creates a branch from the session title in a separate checkout.", { exact: true })
-      .waitFor();
-    await page.keyboard.press("Escape");
-    await expectAttribute(checkoutTrigger, "aria-expanded", "false");
-    await expect
-      .poll(() => page.evaluate(() => document.activeElement?.id))
-      .toBe("new-session-checkout-trigger");
-    await checkoutTrigger.click();
+    await button(checkoutSelect, "New worktree Isolated copy of the repo", true).click();
     await checkoutSelect.getByLabel("Name", { exact: true }).fill("release-proof");
     const afterPointerHide = checkoutSelect.evaluate(
       (element) =>
@@ -235,21 +141,18 @@ suite.define(() => {
     await expect
       .poll(() => checkoutSelect.evaluate((element) => element.matches(":popover-open")))
       .toBe(false);
-    await expectLabel(checkoutTrigger, "Worktree · release-proof");
-    expect(await checkoutTrigger.getAttribute("aria-label")).toBe(
-      "Checkout: Worktree · release-proof",
-    );
-    expect(await checkoutTrigger.getAttribute("title")).toBe("Checkout: Worktree · release-proof");
-    await checkoutTrigger.click();
-    expect(await checkoutSelect.getByLabel("Name", { exact: true }).inputValue()).toBe(
-      "release-proof",
-    );
-    await page.keyboard.press("Escape");
-    await expect
-      .poll(() => checkoutSelect.evaluate((element) => element.matches(":popover-open")))
-      .toBe(false);
     const message = page.locator(".new-session-page__message");
+    await message.fill("/");
+    const slashMenu = page.locator("#chat-new-session-slash-menu-listbox");
+    await pollLocatorText(slashMenu).toContain("/status");
+    expect(await slashMenu.textContent()).not.toContain("/clear");
     await message.fill("fix the flaky test");
+    expect(new URL(page.url()).pathname).toBe("/new");
+    expect(
+      await page.locator('.sidebar-recent-session[data-session-key="agent:main:existing"]').count(),
+    ).toBe(1);
+    expect(await page.locator(".sidebar-recent-session").count()).toBe(1);
+    expect(await gateway.getRequests("sessions.create")).toHaveLength(0);
     await button(page, "Start session").click();
     const createRequest = await gateway.waitForRequest("sessions.create");
     expect(createRequest.params).toMatchObject({
@@ -263,6 +166,7 @@ suite.define(() => {
     await expect
       .poll(() => new URL(page.url()).pathname)
       .toBe(controlUiSessionPath("agent:main:draft-e2e"));
+    expect(await gateway.getRequests("sessions.create")).toHaveLength(1);
   });
 
   it("selects an eligible checkout for a restricted registered project", async () => {

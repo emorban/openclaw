@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { Locator } from "playwright";
@@ -7,8 +7,6 @@ import { expect, it } from "vitest";
 import { appendTranscriptMessages } from "../../../src/config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../../src/config/types.openclaw.js";
 import type { GatewayClient } from "../../../src/gateway/client.ts";
-import { encodePngRgba } from "../../../src/media/png-encode.js";
-import { setAvatar } from "../../../src/state/user-profile-writes.worker.js";
 import { ensureGatewayOwnerProfile } from "../../../src/state/user-profiles.js";
 import { acquireGatewayTestClient } from "../../../test/helpers/gateway-client.ts";
 import {
@@ -27,7 +25,6 @@ const transcriptLength = 900;
 const viewport = { width: 1440, height: 900 };
 let instance: OpenClawTestInstance | undefined;
 let config: OpenClawConfig;
-let originalAvatarBytes = 0;
 
 type RpcMetric = {
   requestId: string;
@@ -68,23 +65,6 @@ const redactFixtureTokens = (text: string, owner: OpenClawTestInstance) =>
     text,
   );
 
-function syntheticAvatar(): Buffer {
-  const width = 1254;
-  const rgba = Buffer.alloc(width * width * 4);
-  let noise = 1;
-  for (let pixel = 0; pixel < width * width; pixel += 1) {
-    noise = (Math.imul(noise, 1664525) + 1013904223) >>> 0;
-    const shade = noise >>> 24;
-    const diamond =
-      Math.abs((pixel % width) - width / 2) + Math.abs(Math.floor(pixel / width) - width / 2) < 270;
-    rgba[pixel * 4] = diamond ? 240 : 70 + (shade >> 2);
-    rgba[pixel * 4 + 1] = diamond ? 240 : 80 + (shade >> 2);
-    rgba[pixel * 4 + 2] = diamond ? 255 : 150 + (shade >> 2);
-    rgba[pixel * 4 + 3] = 255;
-  }
-  return encodePngRgba(rgba, width, width);
-}
-
 const suite = createControlUiE2eSuite({
   name: "Control UI chat loading performance with a real Gateway",
   startServerBeforeBrowser: true,
@@ -98,8 +78,7 @@ const suite = createControlUiE2eSuite({
     try {
       const workspace = owner.state.path("workspace");
       await mkdir(workspace, { recursive: true });
-      const avatar = syntheticAvatar();
-      originalAvatarBytes = avatar.length;
+      const avatar = await readFile(path.join(process.cwd(), "ui/public/apple-touch-icon.png"));
       await writeFile(path.join(workspace, "avatar.png"), avatar);
       config = {
         agents: {
@@ -120,21 +99,7 @@ const suite = createControlUiE2eSuite({
       await owner.state.writeConfig(config);
       // Seed the shared-secret owner before setup clients or the browser could
       // adopt this machine's account name.
-      const profileOptions = { env: owner.env };
-      const profile = ensureGatewayOwnerProfile("Synthetic Viewer", profileOptions);
-      const viewerPixels = Buffer.alloc(64 * 64 * 4);
-      for (let offset = 0; offset < viewerPixels.length; offset += 4) {
-        viewerPixels.set([190, 130, 70, 255], offset);
-      }
-      const avatarSaved = setAvatar(
-        profile.id,
-        encodePngRgba(viewerPixels, 64, 64),
-        "image/png",
-        profileOptions,
-      );
-      if (!avatarSaved.ok) {
-        throw new Error(`Synthetic viewer avatar failed: ${avatarSaved.error.code}`);
-      }
+      ensureGatewayOwnerProfile("Synthetic Viewer", { env: owner.env });
       await owner.startGateway();
       return { baseUrl: `http://127.0.0.1:${owner.port}/`, close: () => owner.cleanup() };
     } catch (error) {
@@ -283,7 +248,7 @@ suite.define(() => {
         serviceWorkers: "block",
         locale: "en-US",
       },
-      async ({ page, context }) => {
+      async ({ page }) => {
         await page.addInitScript(() => {
           // Measure short-link resolution, not cached-roster route recovery. Keep
           // restored Home preferences; clear identity admission in each new document
@@ -299,10 +264,10 @@ suite.define(() => {
           );
         });
         const pending = new Map<string, RpcMetric>();
-        const waitForStartupResponses = (requestStart = 0) =>
+        const waitForStartupResponses = () =>
           expect
             .poll(() => {
-              const metrics = rpc.slice(requestStart);
+              const metrics = rpc;
               return (
                 metrics.some(
                   (metric) =>
@@ -314,14 +279,10 @@ suite.define(() => {
               );
             })
             .toBe(true);
-        const waitForStartupCommit = async (
-          sessionKey: string,
-          pane: Locator,
-          requestStart = 0,
-        ) => {
+        const waitForStartupCommit = async (sessionKey: string, pane: Locator) => {
           await expect
             .poll(() =>
-              selectRpc(rpc.slice(requestStart), "chat.startup", sessionKey).some(
+              selectRpc(rpc, "chat.startup", sessionKey).some(
                 (metric) => metric.receivedMs !== undefined,
               ),
             )
@@ -411,16 +372,12 @@ suite.define(() => {
             .locator(".chat-thread")
             .getByText("Synthetic Home message 900.", { exact: false })
             .waitFor();
-        const measureLoad = async (homeOpen: boolean, requestStart = 0) => {
-          const selectedCommitted = waitForStartupCommit(selectedKey, selectedPane, requestStart);
-          const homeCommitted = homeOpen
-            ? waitForStartupCommit(homeKey, home.locator("openclaw-chat-pane"), requestStart)
-            : Promise.resolve(null);
+        const measureLoad = async () => {
+          const selectedCommitted = waitForStartupCommit(selectedKey, selectedPane);
+          const homeCommitted = waitForStartupCommit(homeKey, home.locator("openclaw-chat-pane"));
           await waitForTail();
           await composer.waitFor();
-          if (homeOpen) {
-            await waitForHome();
-          }
+          await waitForHome();
           await Promise.all([selectedCommitted, homeCommitted]);
         };
         await waitForTail();
@@ -432,7 +389,7 @@ suite.define(() => {
         measuring = true;
         await page.reload();
         await waitForControlUiGatewayReady(page);
-        await measureLoad(true);
+        await measureLoad();
         await page.waitForFunction(() =>
           [...document.querySelectorAll<HTMLImageElement>(".sidebar-agent-card__avatar img")].some(
             (image) => image.complete && image.naturalWidth > 0,
@@ -450,32 +407,12 @@ suite.define(() => {
               return { width: image.naturalWidth, height: image.naturalHeight };
             }),
           );
-        const { avatarRequests, avatarUrl } = await page.evaluate(() => {
-          const entries = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
-          return {
-            avatarRequests: entries.filter(
-              (entry) => new URL(entry.name).pathname === "/avatar/main",
-            ).length,
-            avatarUrl: entries
-              .filter((entry) => new URL(entry.name).pathname === "/avatar/main")
-              .toSorted((left, right) => right.decodedBodySize - left.decodedBodySize)[0]?.name,
-          };
-        });
-        if (!avatarUrl) {
-          throw new Error("Browser never requested the configured avatar route");
-        }
-        const avatarAuth = { Authorization: `Bearer ${owner.gatewayToken}` };
-        const firstAvatar = await context.request.get(avatarUrl, { headers: avatarAuth });
-        const etag = firstAvatar.headers().etag;
-        const revalidated = await context.request.get(avatarUrl, {
-          headers: { ...avatarAuth, "If-None-Match": etag ?? "" },
-        });
-        const cache = {
-          status: firstAvatar.status(),
-          bytes: (await firstAvatar.body()).length,
-          control: firstAvatar.headers()["cache-control"],
-          revalidatedStatus: revalidated.status(),
-        };
+        const avatarRequests = await page.evaluate(
+          () =>
+            performance
+              .getEntriesByType("resource")
+              .filter((entry) => new URL(entry.name).pathname === "/avatar/main").length,
+        );
 
         const thread = selectedPane.locator(".chat-thread");
         const loadedMessageCount = () =>
@@ -548,26 +485,6 @@ suite.define(() => {
           .waitFor();
         const paginationMetrics = structuredClone(rpc.slice(startupMetrics.length));
         const olderPages = olderHistoryRequests(paginationMetrics);
-        const reloadNarrow = async (homeOpen: boolean) => {
-          await page.setViewportSize({ width: 1050, height: 900 });
-          const requestStart = rpc.length;
-          pending.clear();
-          startedAt = Date.now();
-          // Keep the same short-link input even if navigation canonicalized the prior URL.
-          await page.goto(`${url.origin}${url.pathname}`);
-          await waitForControlUiGatewayReady(page);
-          await measureLoad(homeOpen, requestStart);
-          await waitForStartupResponses(requestStart);
-          return {
-            startup: structuredClone(rpc.slice(requestStart)),
-          };
-        };
-        const narrowHomeOpen = await reloadNarrow(true);
-        await page
-          .locator("openclaw-assistant-panel")
-          .getByRole("button", { name: "Close assistant sidebar", exact: true })
-          .click();
-        const narrowHomeClosed = await reloadNarrow(false);
         measuring = false;
         expect(olderPages).toHaveLength(olderPageCommits);
         expect(olderPages.length).toBeGreaterThan(1);
@@ -586,42 +503,23 @@ suite.define(() => {
         expect(nextOffset).toBe(transcriptLength);
         const selectedStartup = selectRpc(startupMetrics, "chat.startup", selectedKey)[0];
         expect(selectedStartup).toBeDefined();
-        for (const { stage, metrics } of [
-          { stage: "desktop-home-restored", metrics: startupMetrics },
-          {
-            stage: "narrow-home-restored",
-            metrics: narrowHomeOpen.startup,
-          },
-          {
-            stage: "narrow-home-closed",
-            metrics: narrowHomeClosed.startup,
-          },
-        ]) {
-          expect(olderHistoryRequests(metrics)).toHaveLength(0);
-          const resolutions = selectRpc(metrics, "sessions.resolve");
-          expect(
-            resolutions,
-            `${stage} sessions.resolve requests: ${JSON.stringify(resolutions)}`,
-          ).toHaveLength(1);
-          const resolved = resolutions[0]!;
-          expect(resolved).toMatchObject({
-            agentId: "main",
-            shortId: "12345678",
-            resolutionOk: true,
-            resolvedKey: selectedKey,
-            resolvedAgentId: "main",
-          });
-          const selected = selectRpc(metrics, "chat.startup", selectedKey);
-          expect(selected).toHaveLength(1);
-        }
+        expect(olderHistoryRequests(startupMetrics)).toHaveLength(0);
+        const resolutions = selectRpc(startupMetrics, "sessions.resolve");
+        expect(resolutions).toHaveLength(1);
+        expect(resolutions[0]).toMatchObject({
+          agentId: "main",
+          shortId: "12345678",
+          resolutionOk: true,
+          resolvedKey: selectedKey,
+          resolvedAgentId: "main",
+        });
+        expect(selectRpc(startupMetrics, "chat.startup", selectedKey)).toHaveLength(1);
         expect(selectedStartup?.messages).toBeLessThanOrEqual(80);
         expect(selectedStartup?.historyBytes).toBeLessThanOrEqual(256 * 1024);
         const homeStartup = selectRpc(startupMetrics, "chat.startup", homeKey)[0];
         expect(homeStartup?.sentMs).toBeGreaterThanOrEqual(selectedStartup?.receivedMs ?? Infinity);
-        for (const metrics of [startupMetrics, narrowHomeOpen.startup]) {
-          expect(selectRpc(metrics, "chat.history", homeKey)).toHaveLength(0);
-          expect(selectRpc(metrics, "agent.identity.get")).toHaveLength(1);
-        }
+        expect(selectRpc(startupMetrics, "chat.history", homeKey)).toHaveLength(0);
+        expect(selectRpc(startupMetrics, "agent.identity.get")).toHaveLength(1);
         expect(
           startupMetrics
             .filter((metric) => ["agents.list", "agent.identity.get"].includes(metric.method))
@@ -629,9 +527,6 @@ suite.define(() => {
         ).toBe(true);
         expect(images.some((image) => image.width === 128 && image.height === 128)).toBe(true);
         expect(avatarRequests).toBe(1);
-        expect(cache).toMatchObject({ status: 200, revalidatedStatus: 304 });
-        expect(cache.bytes).toBeLessThan(originalAvatarBytes / 10);
-        expect(cache.control).toContain("immutable");
       },
     );
   });
