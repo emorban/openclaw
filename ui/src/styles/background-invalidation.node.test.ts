@@ -1,3 +1,4 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, it } from "vitest";
 import { readStyles, styleDocument, styleFixture } from "./style-fixture.test-support.ts";
 
@@ -31,8 +32,13 @@ fixture.describe("personal background style scope", () => {
         const recalculated: number[] = [];
         cdp.on("Tracing.dataCollected", ({ value }) => {
           for (const event of value) {
-            if (event.name === "UpdateLayoutTree" && event.args?.elementCount) {
-              recalculated.push(event.args.elementCount);
+            const args = event.args;
+            if (
+              event.name === "UpdateLayoutTree" &&
+              isRecord(args) &&
+              typeof args.elementCount === "number"
+            ) {
+              recalculated.push(args.elementCount);
             }
           }
         });
