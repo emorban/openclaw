@@ -1,3 +1,4 @@
+import { raceWithTimeout } from "../../packages/retry/src/index.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { runInDetachedAsyncContext } from "../shared/detached-async-context.js";
 import { racePromiseWithAbortSignal } from "./abort-signal.js";
@@ -14,6 +15,7 @@ import {
   createSqliteLifecycleAggregateError,
   throwSqliteLifecycleErrors,
 } from "./sqlite-lifecycle-errors.js";
+import { SQLITE_WORKER_ADMISSION_TIMEOUT_MS } from "./sqlite-worker-broker-admission.js";
 import {
   receiveSqliteWorkerReply,
   type SqliteWorkerReplyOwner,
@@ -28,7 +30,7 @@ import type {
 import { SqliteWorkerError, type SqliteWorkerReply } from "./sqlite-worker-contract.js";
 import type { SqliteWorkerInputAdmission } from "./sqlite-worker-input-admission.js";
 import { SqliteWorkerSlotCustody } from "./sqlite-worker-request-custody.js";
-import { createCpuTrackedWorker } from "./worker-cpu.js";
+import { createCpuTrackedWorker, receiveWorkerMemoryPort } from "./worker-cpu.js";
 
 function cleanupFailures(results: PromiseSettledResult<unknown>[]): unknown[] {
   return results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
@@ -139,7 +141,7 @@ export function createSqliteWorkerLifecycle({
       if (idle.length === 0) {
         // Join the first completing carrier's FIFO even if its next job has started.
         // Requiring an idle window could starve opens behind a steady command stream.
-        selected = await racePromiseWithAbortSignal(
+        selected = await raceWithTimeout(
           Promise.race(
             available.map((slot) =>
               slot.current!.result.then(
@@ -148,8 +150,16 @@ export function createSqliteWorkerLifecycle({
               ),
             ),
           ),
-          options.signal,
-          (signal) => signal.reason,
+          SQLITE_WORKER_ADMISSION_TIMEOUT_MS,
+          () => {
+            throw new SqliteWorkerError("SQLite worker queue capacity reached", "overloaded");
+          },
+          {
+            signal: options.signal,
+            onAbort: (signal) => {
+              throw signal.reason;
+            },
+          },
         );
         options.signal?.throwIfAborted();
         options.assertCurrent?.();
@@ -211,7 +221,11 @@ export function createSqliteWorkerLifecycle({
     };
     const replyOwner = createReplyOwner(slot);
     slots.add(slot);
-    worker.on("message", (reply: SqliteWorkerReply) => slot.receiveReply(reply));
+    worker.on("message", (reply: SqliteWorkerReply) => {
+      if (!receiveWorkerMemoryPort(worker, reply)) {
+        slot.receiveReply(reply);
+      }
+    });
     worker.on("error", (error) => fail(slot, error));
     worker.on("messageerror", (error) => fail(slot, error));
     worker.once("exit", (code) => {

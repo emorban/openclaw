@@ -1,5 +1,6 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { GATEWAY_STARTUP_ADMISSION_WAIT_MS } from "../../../packages/gateway-protocol/src/startup-unavailable.js";
 import type { ControlUiSessionListSnapshot } from "../../../src/plugin-sdk/control-ui.js";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import type { GatewayBrowserClient } from "../api/gateway.ts";
@@ -18,6 +19,7 @@ import {
   sessionsResult,
 } from "../lib/sessions/session-capability.test-support.ts";
 import { createTestGatewayClient } from "../test-helpers/gateway-client.ts";
+import { gatewayHelloForMethods } from "../test-helpers/gateway-methods.ts";
 import { createControlUiPluginHost } from "./control-ui-host.ts";
 import { type ControlUiPluginOwner, ControlUiPluginRuntime } from "./control-ui-runtime.ts";
 import { scopeControlUiHost } from "./control-ui-scope.ts";
@@ -78,8 +80,14 @@ const sessionSnapshot = (
 };
 
 function createRosterHost(request: GatewayBrowserClient["request"], assistantDock?: AssistantDock) {
-  const client = { request } as GatewayBrowserClient;
-  const { gateway } = createGatewayHarness(client);
+  const client = createTestGatewayClient((method, ...args) =>
+    method === "plugins.controlUi.list"
+      ? { plugins: [], diagnostics: [] }
+      : request(method, ...args),
+  );
+  const { gateway } = createGatewayHarness(client, undefined, {
+    initial: { hello: gatewayHelloForMethods(["plugins.controlUi.list"]) },
+  });
   const agents = createAgentCapability(gateway);
   const sessions = createTestSessionCapability(gateway);
   const context = {
@@ -151,7 +159,11 @@ describe("native UI roster refresh", () => {
     const fixture = createRosterHost(client.request.bind(client));
     const params = { agentId: "main", displayName: "Board agent", surface: "plugin-dock" } as const;
     await expect(fixture.host.sessions.create(params)).resolves.toBe(key);
-    expect(request).toHaveBeenCalledWith("sessions.create", params);
+    expect(request).toHaveBeenCalledWith("sessions.create", params, {
+      timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
+      signal: fixture.host.signal,
+      retainSentResultOnAbort: true,
+    });
     expect(request).toHaveBeenCalledWith(
       "sessions.list",
       expect.objectContaining({ excludeDock: true }),

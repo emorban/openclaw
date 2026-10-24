@@ -37,6 +37,8 @@ export function createRuntimeProcessEntrypoints(currentModuleUrl: string) {
     gitPackCleanup: runtimeProcessEntrypoint("agents/worktrees/git-pack-cleanup.worker"),
     fsSafeCopy: runtimeProcessEntrypoint("infra/fs-safe-copy.worker"),
     sharedStateStore: runtimeProcessEntrypoint("state/openclaw-state.worker"),
+    clientCredentials: runtimeProcessEntrypoint("infra/client-credential.worker"),
+    ttsPreferences: runtimeProcessEntrypoint("tts/tts-settings-write.worker"),
     authProfileInlineUsage: runtimeProcessEntrypoint("agents/auth-profiles/inline-usage.worker"),
     pluginModelCatalogRead: runtimeProcessEntrypoint("agents/plugin-model-catalog-read.worker"),
     pluginModelCatalogCredentials: runtimeProcessEntrypoint("agents/plugin-model-catalog.worker"),
@@ -69,13 +71,6 @@ export function createRuntimeProcessEntrypoints(currentModuleUrl: string) {
       "config/sessions/session-message-rewrite.worker",
     ),
     sessionDiskBudget: runtimeProcessEntrypoint("config/sessions/disk-budget.worker"),
-    heartbeatOutcomeStore: runtimeProcessEntrypoint("infra/heartbeat-outcome-store.worker"),
-    acpParentStreamStore: runtimeProcessEntrypoint(
-      "agents/subagents/spawn/acp-parent-stream-store.worker",
-    ),
-    messageToolRunOutcomeStore: runtimeProcessEntrypoint(
-      "infra/message-tool-run-outcome-store.worker",
-    ),
     contextEngineTurnOutbox: runtimeProcessEntrypoint(
       "agents/harness/context-engine-turn-outbox.worker",
     ),
@@ -99,6 +94,7 @@ export function createRuntimeProcessEntrypoints(currentModuleUrl: string) {
     updateRepair: runtimeProcessEntrypoint("infra/update-repair.worker"),
     immutableBuild: runtimeProcessEntrypoint("infra/update-immutable-build.worker"),
     updateMigratedFinalize: runtimeProcessEntrypoint("infra/update-migrated-finalize.worker"),
+    updateAutomaticCleanup: runtimeProcessEntrypoint("infra/update-automatic-cleanup.worker"),
     updateCandidateState: runtimeProcessEntrypoint("infra/update-candidate-state.worker"),
     doctorLint: runtimeProcessEntrypoint("commands/doctor-lint.worker"),
     doctor: runtimeProcessEntrypoint("commands/doctor.worker"),

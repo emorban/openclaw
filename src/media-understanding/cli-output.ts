@@ -2,46 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import { extractGeminiResponse } from "../../packages/media-understanding-common/src/output-extract.js";
-import { hasErrnoCode } from "../infra/errors.js";
-
-function extractSherpaOnnxText(raw: string): string | undefined {
-  const tryParse = (value: string): string | undefined => {
-    const trimmed = value.trim();
-    const head = trimmed[0];
-    if (head !== "{" && head !== '"') {
-      return undefined;
-    }
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (typeof parsed === "string") {
-        return tryParse(parsed);
-      }
-      if (parsed && typeof parsed === "object" && "text" in parsed) {
-        const text = parsed.text;
-        if (typeof text === "string") {
-          return text.trim();
-        }
-      }
-    } catch {
-      // Structured text is optional; CLI stdout can also contain non-JSON progress.
-    }
-    return undefined;
-  };
-
-  const direct = tryParse(raw);
-  if (direct !== undefined) {
-    return direct;
-  }
-
-  const lines = normalizeStringEntries(raw.split("\n"));
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const parsed = tryParse(lines[i] ?? "");
-    if (parsed !== undefined) {
-      return parsed;
-    }
-  }
-  return undefined;
-}
+import { ignoreMissingPath } from "../infra/errno.js";
 
 function findArgValue(args: string[], keys: string[]): string | undefined {
   for (const [index, arg] of args.entries()) {
@@ -104,17 +65,6 @@ function resolveParakeetOutputPath(args: string[], mediaPath: string): string | 
   return path.join(outputDir, `${path.parse(mediaPath).name}.txt`);
 }
 
-async function readCliTranscriptFile(filePath: string): Promise<string> {
-  try {
-    return (await fs.readFile(filePath, "utf8")).trim();
-  } catch (error) {
-    if (hasErrnoCode(error, "ENOENT")) {
-      return "";
-    }
-    throw error;
-  }
-}
-
 export async function resolveCliOutput(params: {
   command: string;
   args: string[];
@@ -133,7 +83,7 @@ export async function resolveCliOutput(params: {
   if (fileOutput) {
     // A known file-output contract is authoritative: falling back would expose
     // progress/status stdout as user speech when transcription is empty or missing.
-    return await readCliTranscriptFile(fileOutput);
+    return (await fs.readFile(fileOutput, "utf8").catch(ignoreMissingPath))?.trim() ?? "";
   }
 
   if (commandId === "gemini") {
@@ -144,9 +94,41 @@ export async function resolveCliOutput(params: {
   }
 
   if (commandId === "sherpa-onnx-offline") {
-    const response = extractSherpaOnnxText(params.stdout);
-    if (response !== undefined) {
-      return response;
+    const raw = params.stdout;
+    const tryParse = (value: string): string | undefined => {
+      const trimmed = value.trim();
+      const head = trimmed[0];
+      if (head !== "{" && head !== '"') {
+        return undefined;
+      }
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (typeof parsed === "string") {
+          return tryParse(parsed);
+        }
+        if (parsed && typeof parsed === "object" && "text" in parsed) {
+          const text = parsed.text;
+          if (typeof text === "string") {
+            return text.trim();
+          }
+        }
+      } catch {
+        // Structured text is optional; CLI stdout can also contain non-JSON progress.
+      }
+      return undefined;
+    };
+
+    const direct = tryParse(raw);
+    if (direct !== undefined) {
+      return direct;
+    }
+
+    const lines = normalizeStringEntries(raw.split("\n"));
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const parsed = tryParse(lines[i] ?? "");
+      if (parsed !== undefined) {
+        return parsed;
+      }
     }
   }
 

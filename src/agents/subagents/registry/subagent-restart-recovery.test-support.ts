@@ -77,6 +77,7 @@ export function useSubagentRestartRecoveryFixture(
       status: "pending",
     })) as GatewayRecoveryRuntime["waitForAgent"],
     sendRecoveryNotice: vi.fn(),
+    resumeChatInput: vi.fn(),
   };
   const activateGatewayRuntime = async () => {
     const gatewayContext = {
@@ -84,7 +85,7 @@ export function useSubagentRestartRecoveryFixture(
       resolveGatewayContext: () => gatewayContext as never,
     };
     bindGatewayContextResolver(gatewayRuntime, gatewayContext.resolveGatewayContext);
-    await activateSubagentRegistry(gatewayContext.resolveGatewayContext);
+    await activateSubagentRegistry(gatewayContext.resolveGatewayContext).settled;
   };
 
   const envSnapshot = captureEnv(["OPENCLAW_STATE_DIR"]);

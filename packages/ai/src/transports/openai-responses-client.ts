@@ -69,7 +69,10 @@ import {
   withResponsesRequestAcceptance,
 } from "./openai-responses-request-lifecycle.js";
 import { projectResponsesSteeringInput } from "./openai-responses-steering.js";
-import { hasOnlyResponsesFunctionTools } from "./openai-responses-stream-errors.js";
+import {
+  DegenerateToolCallArgumentsError,
+  hasOnlyResponsesFunctionTools,
+} from "./openai-responses-stream-errors.js";
 import { processResponsesStream } from "./openai-responses-stream-internal.js";
 import { observeResponsesStream } from "./openai-responses-stream-observer-internal.js";
 import { createRecoverableResponsesWebSocketStream } from "./openai-responses-websocket-recovery.js";
@@ -123,15 +126,11 @@ export function createOpenAIResponsesClient(
   });
 }
 
-type ResponsesPricingOptions = Pick<
-  NonNullable<Parameters<typeof processResponsesStream>[4]>,
-  "serviceTier" | "applyServiceTierPricing"
->;
 type ResponsesStreamParams = Parameters<typeof createResponsesStreamWithRecovery>[0] & {
   requestOptions: ReturnType<typeof buildOpenAISdkRequestOptions>;
 };
 
-type ResponsesTransportExecutorOptions = {
+function createResponsesTransportExecutor(config: {
   outputApi?: AssistantMessage["api"];
   firstEventTimeoutMs?: number;
   streamRequest?: boolean;
@@ -141,10 +140,11 @@ type ResponsesTransportExecutorOptions = {
   pricingOptions?: (
     options: OpenAIResponsesOptions | undefined,
     model: Model,
-  ) => ResponsesPricingOptions;
-};
-
-function createResponsesTransportExecutor(config: ResponsesTransportExecutorOptions): StreamFn {
+  ) => Pick<
+    NonNullable<Parameters<typeof processResponsesStream>[4]>,
+    "serviceTier" | "applyServiceTierPricing"
+  >;
+}): StreamFn {
   return (model, context, options) => {
     const responsesOptions = options as OpenAIResponsesOptions | undefined;
     const independent = independentResponsesRequest.has(options);
@@ -539,6 +539,7 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
                   transport === "websocket" ? websocketBaseline : continuationBaseline,
                 ),
               ...config.pricingOptions?.(responsesOptions, model),
+              promptCacheTtl: params.prompt_cache_options?.ttl,
               resolveServiceTier: (responseTier, originalTier) =>
                 responseTier ??
                 (requestedTier === "priority" || requestedTier === "default"
@@ -614,6 +615,9 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
         );
         finalizeTransportStream({ stream, output, signal: options?.signal });
       } catch (error) {
+        if (error instanceof DegenerateToolCallArgumentsError) {
+          firstEventAbort?.abort(error);
+        }
         if (requestLifecycle) {
           await requestLifecycle.settle().catch(() => undefined);
         }

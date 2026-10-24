@@ -14,7 +14,11 @@ import type {
 } from "../infra/approval-gateway-runtime.types.js";
 import { createApprovalNativeRouteCoordinator } from "../infra/approval-native-route-coordinator.js";
 import type { ChannelApprovalKind } from "../infra/approval-types.js";
-import { GatewayDispatchUnavailableError } from "../infra/restart-recovery-errors.js";
+import {
+  GatewayDispatchUnavailableError,
+  GatewayOperatorRecoveryAuthorizationError,
+  GatewayOperatorRecoveryOwnershipError,
+} from "../infra/restart-recovery-errors.js";
 import { warnPluginSdkDeprecation } from "../plugins/sdk-deprecation.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 // HTTP agent ingress can finish before the lazy agent.wait handler loads its recorder.
@@ -44,6 +48,7 @@ import type { AgentRunRequest } from "./server-methods/agent-request-types.js";
 import type { GatewayRequestContext } from "./server-methods/types.js";
 import { createSyntheticPluginRuntimeClient } from "./server-plugin-runtime-client.js";
 import { registerGatewayRecoveryRuntime } from "./server-recovery-runtime-context.js";
+import { readSessionSendDeliveryAdmission } from "./session-send-delivery.js";
 import {
   cancelSubagentCompletionToolHandoff,
   registerSubagentCompletionToolHandoff,
@@ -57,6 +62,7 @@ const loadOutboundMessageRuntime = createLazyRuntimeModule(
   () => import("../infra/outbound/message.js"),
 );
 const loadOperatorRecovery = createLazyRuntimeModule(() => import("./operator-run-recovery.js"));
+const loadChatInputRecovery = createLazyRuntimeModule(() => import("./chat-input-recovery.js"));
 
 const RECOVERY_NOTICE_COMPLETION_RETENTION = {
   idPrefix: "main-session-restart-recovery:",
@@ -193,6 +199,27 @@ export function createGatewayInstanceRuntime(
         ...requestOptions,
       }),
     startRecoveryTyping: (params) => recoveryTyping.start(params),
+    resumeChatInput: async (target, requestOptions) => {
+      assertDispatchAvailable("chat.send");
+      const context = options.getContext();
+      await (
+        await loadChatInputRecovery()
+      ).resumeChatInput(
+        context,
+        target,
+        {
+          ...requestOptions,
+          assertCurrent: () => {
+            assertDispatchAvailable("chat.send");
+            if (options.getContext() !== context) {
+              throw new Error("Gateway chat recovery context changed.");
+            }
+            requestOptions.assertCurrent();
+          },
+        },
+        options.getMethodRegistry(),
+      );
+    },
     dispatchAgent: async <T>(
       payload: AgentRunRequest,
       timeoutMs?: number,
@@ -281,13 +308,17 @@ export function createGatewayInstanceRuntime(
           restored?.requesterOrigin ?? dispatchOptions.agentToolCaller?.requesterOrigin;
         assertRecoveryCurrent();
         if (requesterTarget && !requesterOrigin) {
-          throw new Error("Restart recovery requester source is unavailable; send a new request.");
+          throw new GatewayOperatorRecoveryOwnershipError(
+            "Restart recovery requester source is unavailable; send a new request.",
+          );
         }
         if (
           requesterOrigin?.operatorProfileId &&
           requesterOrigin.operatorProfileId !== operatorAuthority?.profileId
         ) {
-          throw new Error("Restart recovery requester has no matching operator authority.");
+          throw new GatewayOperatorRecoveryAuthorizationError(
+            "Restart recovery requester has no matching operator authority.",
+          );
         }
         delegatedToolPolicyHandoffId = dispatchOptions.delegatedToolPolicyHandoff
           ? registerSubagentCompletionToolHandoff(dispatchOptions.delegatedToolPolicyHandoff)
@@ -341,10 +372,50 @@ export function createGatewayInstanceRuntime(
               },
             })
           : recoveryAgentTurns;
+        const savedPeer =
+          payload.agentId && payload.expectedExistingSessionId && payload.idempotencyKey
+            ? readSessionSendDeliveryAdmission({
+                agentId: payload.agentId,
+                sessionKey: payload.sessionKey,
+                sessionId: payload.expectedExistingSessionId,
+                runId: payload.idempotencyKey,
+              })
+            : undefined;
+        const recoveryInput = target
+          ? {
+              agentId: target.agentId,
+              sessionKey: target.sessionKey,
+              sessionId: target.sessionId,
+              runId: target.recoveryRunId,
+              assertCurrent: assertRecoveryCurrent,
+            }
+          : savedPeer?.acceptedMessage
+            ? {
+                ...savedPeer.delivery.target,
+                runId: savedPeer.delivery.runId,
+                assertCurrent: assertRecoveryCurrent,
+              }
+            : undefined;
         return await agentTurns.dispatch<T>(payload, {
+          recoveryInput,
           controllerInput: dispatchOptions.controllerInput,
           replyExpectation: dispatchOptions.replyExpectation,
           assertAdmissionCurrent: assertRecoveryCurrent,
+          assertCancellationCurrent: () => {
+            assertDispatchAvailable("agent");
+            assertRecoveryTarget();
+            dispatchOptions.signal?.throwIfAborted();
+            if (options.getContext() !== context) {
+              throw new Error("Gateway recovery context changed.");
+            }
+            dispatchOptions.assertAdmissionCurrent?.();
+            if (restored?.operator) {
+              restored.operator.assertPolicyCurrent();
+            } else {
+              operatorAuthority?.assertCurrent();
+            }
+          },
+          executionSource: dispatchOptions.executionSource,
           prepareDispatchCurrent: dispatchOptions.prepareDispatchCurrent,
           expectFinal: dispatchOptions.expectFinal,
           onAccepted: dispatchOptions.onAccepted,

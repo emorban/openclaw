@@ -27,7 +27,6 @@ import { createRuntimeConfigCapability } from "../lib/config/runtime-config-capa
 import { loadCurrentDeviceAuthToken } from "../lib/nodes/index.ts";
 import { createSessionCapability } from "../lib/sessions/index.ts";
 import { parseAgentSessionKey } from "../lib/sessions/session-key.ts";
-import { loadChatObserverDisplayPreference } from "../pages/chat/chat-observer-display.ts";
 import { sendSessionObserverVisibility } from "../pages/chat/chat-observer.ts";
 import {
   isDefaultChatLanding,
@@ -169,7 +168,6 @@ export function bootstrapApplication(): ApplicationRuntime {
     settings,
     startup.password ?? "",
     hasPendingGateway ? "" : (startup.pendingBootstrapToken ?? ""),
-    undefined,
     {
       persistDefaultConnectionSettings: documentMode === null,
       ownsWarmBoot,
@@ -289,6 +287,7 @@ export function bootstrapApplication(): ApplicationRuntime {
     }
   }
   let firstPreferencesConnection = true;
+  // Seed profile preferences before later connected observers start their reads.
   const stopBootstrapPreferences = gateway.subscribe((snapshot) => {
     if (snapshot.phase !== "connected" || !snapshot.client || !firstPreferencesConnection) {
       return;
@@ -437,6 +436,7 @@ export function bootstrapApplication(): ApplicationRuntime {
   );
   const initialConnectionRevision = gateway.connectionRevision;
   let firstConfigConnection = true;
+  // Start shared reads and connection recovery independently of mounted views.
   const stopPostConnect = gateway.subscribe((snapshot) => {
     if (snapshot.phase === "connected") {
       browserBootstrapAttempted = true;
@@ -470,9 +470,9 @@ export function bootstrapApplication(): ApplicationRuntime {
       lastPostConnectClient = client;
       const ifNeeded = firstConfigConnection;
       firstConfigConnection = false;
-      void config.refresh({ ifNeeded });
+      void config.refresh({ ifNeeded, signal: startupLifecycle.signal });
       void connectionBootstrap.run("session-observer", () =>
-        sendSessionObserverVisibility(client, loadChatObserverDisplayPreference() !== "off"),
+        sendSessionObserverVisibility(gateway.snapshot),
       );
     }
     // Recovery scope resolves after hello, so dedupe its later publication independently.
@@ -621,7 +621,7 @@ export function bootstrapApplication(): ApplicationRuntime {
     },
     start: () => {
       if (!startupLifecycle.signal.aborted) {
-        void config.refresh({ ifNeeded: true });
+        void config.refresh({ ifNeeded: true, signal: startupLifecycle.signal });
       }
       const stopRouter = () => router.stop();
       if (startsApplicationRouter) {

@@ -10,12 +10,14 @@ import {
   uiSessionRowMatchesSelectedChat,
 } from "../../lib/sessions/session-key.ts";
 import { normalizeApplicationContext } from "../../test-helpers/application-context-fixtures.ts";
+import { installModelPickerLayout } from "../../test-helpers/model-picker-layout.ts";
 import { mountSolid } from "../../test-helpers/mount-solid.ts";
 import { mountSolid as mountSolidComponent } from "../../test-helpers/solid-render.tsx";
 import { flush, waitForSolid } from "../../test-helpers/solid-settle.ts";
-import { createComposerContainer } from "./chat-composer.test-support.ts";
-import { resetChatViewState } from "./chat-view-state.ts";
+import { composerContextWrapper, createComposerContainer } from "./chat-composer.test-support.ts";
+import { resetChatViewState } from "./chat-view-state.test-support.ts";
 import { ChatView, type ChatProps } from "./chat-view.tsx";
+import { createComposerQuestions } from "./components/chat-composer-questions.ts";
 import { registerMessageActionElements } from "./components/chat-message-action-elements.ts";
 import {
   prepareChatMessageRender,
@@ -34,10 +36,14 @@ export async function renderChatModelControls(
   props: ChatModelControlsProps,
   container: HTMLDivElement,
 ) {
+  installModelPickerLayout();
   const renderProps: ChatModelControlsProps = {
     ...props,
     modelPickerOpen: props.modelPickerOpen ?? true,
   };
+  if (renderProps.modelPickerOpen) {
+    await import("./components/chat-model-picker-panel.tsx");
+  }
   const update = modelControlsUpdates.get(container);
   if (update) {
     update(renderProps);
@@ -50,8 +56,10 @@ export async function renderChatModelControls(
     modelControlsUpdates.set(container, (next) => view.update(next));
   }
   if (renderProps.modelPickerOpen) {
-    await waitForSolid(() =>
-      expect(container.querySelector(".chat-controls__model-menu")).not.toBeNull(),
+    // The first open compiles the lazy panel under the full CI shard's load.
+    await waitForSolid(
+      () => expect(container.querySelector(".chat-controls__model-menu")).not.toBeNull(),
+      { timeout: 5_000 },
     );
   }
   return container;
@@ -158,6 +166,14 @@ export function stubAnimationFrames() {
     for (const callback of callbacks.splice(0)) {
       callback(0);
     }
+  };
+}
+
+export function stubSettledAnimationFrames() {
+  const frame = stubAnimationFrames();
+  return () => {
+    frame();
+    flush();
   };
 }
 
@@ -272,8 +288,10 @@ export function renderChatPropsInto(
     }
     const [current, setCurrent] = createSignal({ props, application });
     const view = mountSolid(
-      () =>
-        createComponent(ChatView, {
+      () => {
+        const questions = createComposerQuestions(props.paneId, () => current().props);
+        return createComponent(ChatView, {
+          questions,
           get props() {
             return current().props;
           },
@@ -281,8 +299,9 @@ export function renderChatPropsInto(
             const value = current().application;
             return value && normalizeApplicationContext(value);
           },
-        }),
-      { container },
+        });
+      },
+      { container, wrapper: composerContextWrapper(container) },
     );
     mountedViews.set(container, {
       update: (nextProps, nextApplication) =>
