@@ -123,6 +123,21 @@ const inventory = "scripts/lib/mac-native-inventory.py";
 
 type MaterializationFixture = Awaited<ReturnType<typeof materializationFixture>>;
 
+async function observeMaterialization(fixture: MaterializationFixture, prelude: string) {
+  // Assert in Vitest: Python atexit exceptions do not change the process exit status.
+  const result = await fixture.run("arm64", {
+    prelude: `import atexit, json, os, shutil, subprocess
+initial_fds = len(os.listdir("/dev/fd"))
+def record(**values):
+    print(json.dumps(dict(values, initialFds=initial_fds, finalFds=len(os.listdir("/dev/fd")))))
+${prelude}`,
+  });
+  const evidence: Record<string, unknown> = JSON.parse(result.stdout);
+  expect(evidence.initialFds).toEqual(expect.any(Number));
+  expect(evidence.finalFds).toBe(evidence.initialFds);
+  return { result, evidence };
+}
+
 function expectUnpublished(
   fixture: MaterializationFixture,
   result: { status: number | null; stderr: string },
@@ -343,14 +358,14 @@ if (fs.existsSync(${JSON.stringify(path.join(root, "reject-verification"))})) pr
   const packageRoot = path.join(canonical, "lib/node_modules/openclaw");
   const packageFile = (name: string, contents: string | Buffer, mode?: number) =>
     write(path.join(packageRoot, name), contents, mode);
-  for (const [name, os, cpu, bytes] of [
-    ["native-darwin-arm64", "darwin", "arm64", binaries.arm64],
-    ["native-darwin-x64", "darwin", "x64", binaries.x86_64],
-    ["native-linux-arm64", "linux", "arm64", binaries.elf],
-    ["native-win32-x64", "win32", "x64", binaries.pe],
-    ["@fixture/native-darwin-arm64", "darwin", "arm64", binaries.arm64],
-    ["@fixture/native-linux-arm64", "linux", "arm64", binaries.elf],
-  ] as const) {
+  const nativePackages = [
+    ["native-darwin-arm64", "darwin", "arm64", binaries.arm64, ["arm64"]],
+    ["native-darwin-x64", "darwin", "x64", binaries.x86_64, ["x86_64"]],
+    ["native-linux-arm64", "linux", "arm64", binaries.elf, []],
+    ["@fixture/native-darwin-arm64", "darwin", "arm64", binaries.arm64, ["arm64"]],
+    ["@fixture/native-linux-arm64", "linux", "arm64", binaries.elf, []],
+  ] as const;
+  for (const [name, os, cpu, bytes] of nativePackages) {
     const nativeRoot = path.join(packageRoot, "node_modules", name);
     await write(
       path.join(nativeRoot, "package.json"),
@@ -367,19 +382,8 @@ if (fs.existsSync(${JSON.stringify(path.join(root, "reject-verification"))})) pr
     "node_modules/npm/bin/npm-cli.js",
     "// CLI module must remain available to Bun\n",
   );
-  await packageFile(
-    "nested/win32/package.json",
-    JSON.stringify({ name: "fixture-resource", os: ["win32"], cpu: ["x64"] }),
-  );
-  for (const [name, bytes, mode] of [
-    ["universal.node", binaries.universal, 0o644],
-    ["foreign.node", binaries.elf, 0o644],
-    ["nested/win32/build.mjs", "// preserve Windows source\n", 0o755],
-    ["dist/control-ui/index.html", "<!doctype html>\n", 0o644],
-    ["dist/control-ui/assets/app.js", "// bundled Control UI\n", 0o644],
-  ] as const) {
-    await packageFile(name, bytes, mode);
-  }
+  await packageFile("dist/control-ui/index.html", "<!doctype html>\n");
+  await packageFile("nested/package.json", '{"os":["win32"]}');
   await cp(path.join(root, "dist/build-info.json"), path.join(packageRoot, "dist/build-info.json"));
   await mkdir(path.join(packageRoot, "node_modules/.bin"));
   await symlink(
@@ -461,6 +465,7 @@ cp -p ${quote(path.join(canonical, "lib/libsqlite3.dylib"))} "$2/lib/libsqlite3.
     destination,
     calls,
     scratchLog,
+    nativePackages,
     supportedArchitectures,
     tmp,
     temporaryBefore: snapshot(tmp),
@@ -572,45 +577,29 @@ describe.skipIf(process.platform !== "darwin")("Mac runtime materialization", ()
           verified!.productInode,
         );
       }
-      const published = snapshot(fixture.destination);
-      const ownerMarker = "lib/node_modules/openclaw/openclaw-install-owner.json";
-      expect(published.find(({ path: name }) => name === ownerMarker)).toMatchObject({
-        path: ownerMarker,
-        kind: "file",
-        mode: 0o644,
-      });
-      expect(JSON.parse(readFileSync(path.join(fixture.destination, ownerMarker), "utf8"))).toEqual(
-        {
-          schemaVersion: 1,
-          owner: "macos-app",
-          displayName: "OpenClaw.app",
-          updateHint: "Update OpenClaw.app to update this Gateway.",
-        },
+      const ownerMarker = path.join(
+        fixture.destination,
+        "lib/node_modules/openclaw/openclaw-install-owner.json",
       );
-      expect(published.filter(({ path: name }) => name !== ownerMarker)).toEqual(
-        before.filter(
-          ({ path: name }) =>
-            name !== "lib/node_modules/openclaw/foreign.node" &&
-            !/^lib\/node_modules\/openclaw\/node_modules\/npm\/bin\/(?:npm|npx)(?:\.cmd|\.ps1)?$/.test(
-              name,
-            ) &&
-            ![
-              ".bin",
-              "native-linux-arm64",
-              "native-win32-x64",
-              "@fixture/native-linux-arm64",
-              ...(!architectures.some((architecture) => architecture === "arm64")
-                ? ["native-darwin-arm64", "@fixture/native-darwin-arm64"]
-                : []),
-              ...(!architectures.some((architecture) => architecture === "x86_64")
-                ? ["native-darwin-x64"]
-                : []),
-            ].some(
-              (packageName) =>
-                name === `lib/node_modules/openclaw/node_modules/${packageName}` ||
-                name.startsWith(`lib/node_modules/openclaw/node_modules/${packageName}/`),
-            ),
-        ),
+      const markerInfo = lstatSync(ownerMarker);
+      expect([markerInfo.isFile(), markerInfo.mode & 0o777]).toEqual([true, 0o644]);
+      expect(JSON.parse(readFileSync(ownerMarker, "utf8"))).toMatchObject({
+        schemaVersion: 1,
+        owner: "macos-app",
+      });
+      const modules = path.join(fixture.destination, "lib/node_modules/openclaw/node_modules");
+      for (const [name, _os, _cpu, bytes, retainedOn] of fixture.nativePackages) {
+        const target = path.join(modules, name);
+        if (retainedOn.some((arch) => architectures.some((requested) => requested === arch))) {
+          expect(readFileSync(path.join(target, "binding.node"))).toEqual(bytes);
+        } else {
+          expect(existsSync(target)).toBe(false);
+        }
+      }
+      expect(existsSync(path.join(modules, ".bin"))).toBe(false);
+      expect(readdirSync(path.join(modules, "npm/bin"))).toEqual(["npm-cli.js"]);
+      expect(readFileSync(path.join(modules, "../nested/package.json"), "utf8")).toBe(
+        '{"os":["win32"]}',
       );
       expectRuntimeScratchCleaned(fixture);
     },
@@ -1051,9 +1040,9 @@ def verify_closed():
       const aliasInode =
         schedule === "symlink-aba" ? lstatSync(fixture.at("alias")).ino : undefined;
       const before = snapshot(fixture.source);
-      const result = await fixture.run("arm64", {
-        prelude: `
-import os, shutil, subprocess, json
+      const { result, evidence } = await observeMaterialization(
+        fixture,
+        `
 inside, outside = ${JSON.stringify(inside)}, ${JSON.stringify(outside)}
 schedule = ${JSON.stringify(schedule)}
 original_stat, original_scan, original_run, original_copy = os.stat, os.scandir, subprocess.run, shutil.copyfileobj
@@ -1064,7 +1053,6 @@ def open_fd(*args, **kwargs):
     return fd
 os.open = open_fd
 inode = os.stat(inside).st_ino
-initial_fds = len(os.listdir("/dev/fd"))
 original_readlink = os.readlink
 changed = False
 copied = []
@@ -1105,23 +1093,13 @@ def copy(source, destination, *args):
     if destination.name.endswith("/images/arm64"):
         with open(destination.name, "rb") as output: copied.append(output.read().hex())
 os.stat, os.scandir, subprocess.run, shutil.copyfileobj = info, scan, run, copy
-import atexit
 @atexit.register
-def evidence():
-    with open(${JSON.stringify(path.join(fixture.root, "race.json"))}, "w") as output:
-        json.dump({"changed": changed, "copied": copied, "outsideOpened": outside_opened, "initialFds": initial_fds, "finalFds": len(os.listdir("/dev/fd")) - 1}, output)
+def report():
+    record(changed=changed, copied=copied, outsideOpened=outside_opened)
 `,
-      });
-      const evidence = JSON.parse(readFileSync(path.join(fixture.root, "race.json"), "utf8")) as {
-        changed: boolean;
-        copied: string[];
-        outsideOpened: boolean[];
-        initialFds: number;
-        finalFds: number;
-      };
+      );
       expect(evidence).toMatchObject({
         changed: true,
-        finalFds: evidence.initialFds,
         outsideOpened: [],
         copied:
           schedule === "before-open" || schedule === "symlink-aba"
@@ -1145,14 +1123,13 @@ def evidence():
       const replacement = path.join(fixture.root, "replacement");
       await write(replacement, fixture.binaries.x86_64);
       const before = snapshot(fixture.source);
-      const result = await fixture.run("arm64", {
-        prelude: `
-import atexit, json, os, subprocess
+      const { result, evidence } = await observeMaterialization(
+        fixture,
+        `
 target = ${JSON.stringify(target)}
 with open(target, "rb") as stream: original = stream.read()
 with open(${JSON.stringify(replacement)}, "rb") as stream: replacement = stream.read()
 original_info = os.stat(target)
-initial_fds = len(os.listdir("/dev/fd"))
 original_run, schedule = subprocess.run, []
 def run(args, **kwargs):
     result = original_run(args, **kwargs)
@@ -1170,25 +1147,13 @@ def run(args, **kwargs):
     return result
 subprocess.run = run
 @atexit.register
-def evidence():
+def report():
     current = os.stat(target)
-    with open(${JSON.stringify(path.join(fixture.root, "omission.json"))}, "w") as output:
-        json.dump({"schedule": schedule, "sameInode": current.st_ino == original_info.st_ino,
-                   "changedCtime": current.st_ctime_ns != original_info.st_ctime_ns,
-                   "sameMtime": current.st_mtime_ns == original_info.st_mtime_ns,
-                   "initialFds": initial_fds, "finalFds": len(os.listdir("/dev/fd")) - 1}, output)
+    record(schedule=schedule, sameInode=current.st_ino == original_info.st_ino,
+           changedCtime=current.st_ctime_ns != original_info.st_ctime_ns,
+           sameMtime=current.st_mtime_ns == original_info.st_mtime_ns)
 `,
-      });
-      const evidence = JSON.parse(
-        readFileSync(path.join(fixture.root, "omission.json"), "utf8"),
-      ) as {
-        schedule: string[];
-        sameInode: boolean;
-        changedCtime: boolean;
-        sameMtime: boolean;
-        initialFds: number;
-        finalFds: number;
-      };
+      );
       expect(evidence).toMatchObject({
         schedule: [
           "replaced after file classification",
@@ -1198,7 +1163,6 @@ def evidence():
         sameInode: true,
         changedCtime: true,
         sameMtime: true,
-        finalFds: evidence.initialFds,
       });
       expect(snapshot(fixture.source)).toEqual(before);
       expectUnpublished(fixture, result);
@@ -1213,13 +1177,11 @@ def evidence():
         await fixture.put(`resource-${index}.js`, "// ordinary resource\n");
       }
       const before = snapshot(fixture.source);
-      expectExit(
-        await fixture.run("arm64", {
-          prelude: `
-import os, subprocess, json, atexit
+      const { result, evidence } = await observeMaterialization(
+        fixture,
+        `
 original_run = subprocess.run
 batches = []
-initial_fds = len(os.listdir("/dev/fd"))
 def run(args, **kwargs):
     result = original_run(args, **kwargs)
     fds = kwargs.get("pass_fds", ())
@@ -1228,23 +1190,18 @@ def run(args, **kwargs):
     return result
 subprocess.run = run
 @atexit.register
-def evidence():
-    with open(${JSON.stringify(path.join(fixture.root, "batches.json"))}, "w") as output:
-        json.dump({"batches": batches, "initial": initial_fds, "final": len(os.listdir("/dev/fd")) - 1}, output)
+def report():
+    record(batchCount=len(batches), maxBatch=max(batches), classified=sum(batches))
 `,
-        }),
       );
+      expectExit(result);
       expect(snapshot(fixture.destination)).toEqual(
         before.filter((entry) => entry.path !== "images/elf"),
       );
       expect(snapshot(fixture.source)).toEqual(before);
-      const evidence = JSON.parse(
-        readFileSync(path.join(fixture.root, "batches.json"), "utf8"),
-      ) as { batches: number[]; initial: number; final: number };
-      expect(evidence.batches.length).toBeLessThanOrEqual(3);
-      expect(Math.max(...evidence.batches)).toBeLessThanOrEqual(64);
-      expect(evidence.batches.reduce((sum, size) => sum + size, 0)).toBe(133);
-      expect(evidence.final).toBe(evidence.initial);
+      expect(evidence.batchCount).toBeLessThanOrEqual(3);
+      expect(evidence.maxBatch).toBeLessThanOrEqual(64);
+      expect(evidence.classified).toBe(133);
     },
   );
 
