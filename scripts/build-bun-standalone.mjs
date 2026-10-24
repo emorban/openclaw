@@ -43,6 +43,7 @@ import {
 } from "./lib/bun-standalone-sidecar.mjs";
 import { copyStandaloneRuntime, STANDALONE_RUNTIME_ROOTS } from "./lib/bun-standalone-snapshot.mjs";
 import { stageStandaloneSqlite } from "./lib/bun-standalone-sqlite.mjs";
+import { prepareStandaloneWasm } from "./lib/bun-standalone-wasm.mjs";
 import {
   discoverStandaloneWorkers,
   prepareStandaloneWorkers,
@@ -565,6 +566,14 @@ const resourcePlan = planStandaloneRuntime(
   declaredPluginAssets,
   metadata.directories,
 );
+const wasm =
+  mode === "aot"
+    ? prepareStandaloneWasm({
+        resources: resourcePlan.files,
+        outputRoot: path.join(outputRoot, "modules"),
+        parse,
+      })
+    : undefined;
 fs.writeFileSync(
   path.join(outputRoot, "native-resources.json"),
   JSON.stringify(nativeResources.files, null, 2),
@@ -576,10 +585,12 @@ for (const filename of compiledEntries) {
     nativeTables += 1;
     fs.writeFileSync(
       filename,
-      contents.replaceAll(
-        nativeResources.bootstrapReplacement.search,
-        nativeResources.bootstrapReplacement.replacement,
-      ),
+      // Every embedded worker imports this bootstrap before its library loaders.
+      (wasm?.registrationPath ? `import ${JSON.stringify(wasm.registrationPath)};\n` : "") +
+        contents.replaceAll(
+          nativeResources.bootstrapReplacement.search,
+          nativeResources.bootstrapReplacement.replacement,
+        ),
     );
   }
 }
@@ -707,6 +718,7 @@ const manifest = await createStandaloneManifest({
   openclaw: openclawIdentity,
   plugins,
   embedded: {
+    ...(wasm ? { webAssembly: wasm.assets } : {}),
     workers: workerEntries.length,
     plugins: new Set(
       Object.keys(embeddedPaths)
