@@ -19,6 +19,7 @@ import {
 } from "./openclaw-state-db-read-connection.js";
 import { postgresStateReadSnapshot } from "./openclaw-state-postgres-snapshot-context.js";
 import { stateReadRegistry } from "./openclaw-state-read-operation-registry.js";
+import { prepareStateStream } from "./openclaw-state-read-stream.js";
 import type {
   OpenClawStateReadReply,
   OpenClawStateReadRequest,
@@ -41,7 +42,16 @@ serveOwnedWorkerTasks(
         input.command.type === "agentDatabaseRegistry.read"
           ? await import("./openclaw-agent-db-registry.read.js")
           : undefined;
+      // Finish the selected owner's import before fresh admission, not during stream execution.
+      const readStream =
+        input.command.type === "subagents.restore" ||
+        input.command.type === "meetingTranscripts.export"
+          ? await prepareStateStream(input, input.command, channel, () => {
+              sourceAdmitted = true;
+            })
+          : undefined;
       const dedicatedRead =
+        readStream !== undefined ||
         input.command.type === "admit" ||
         input.command.type === "plugins.metadata.read" ||
         input.command.type === "gatewayOwnerLease.read" ||
@@ -165,15 +175,14 @@ serveOwnedWorkerTasks(
                 : { status: "unavailable" },
           };
         }
+        if (command.type === "subagents.restore" || command.type === "meetingTranscripts.export") {
+          if (!readStream) {
+            throw new Error("State read stream is unavailable");
+          }
+          return await control.runNativeSection(readStream);
+        }
         if (!handlers) {
           throw new Error("State read command handlers are unavailable");
-        }
-        if (command.type === "subagents.restore" || command.type === "meetingTranscripts.export") {
-          return await control.runNativeSection(() =>
-            handlers.readStateStream(input, command, channel, () => {
-              sourceAdmitted = true;
-            }),
-          );
         }
         if (command.type === "subagents.sessionList") {
           const result = readOpenClawStateReadOnlyLocation(

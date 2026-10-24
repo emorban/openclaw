@@ -98,7 +98,6 @@ import { readMcpOAuthStateCommand } from "./openclaw-state-read-mcp-oauth.js";
 import type { RegisteredStateReadCommand } from "./openclaw-state-read-operation-registry.js";
 import { readStateRegistryCommand } from "./openclaw-state-read-registry.js";
 import { readSessionRowsSharedFacts } from "./openclaw-state-read-session-rows.worker.js";
-import { readStateStream } from "./openclaw-state-read-stream.js";
 import type {
   OpenClawStateReadRequest,
   OpenClawStateReadResult,
@@ -110,7 +109,7 @@ import { readUserPreferences, selectUserPreferenceValues } from "./user-preferen
 import { readUserProfileCommand } from "./user-profile-read.worker.js";
 import { selectResolvedUserProfileMetadataById } from "./user-profiles-internal.js";
 
-export { prepareAcpSessionMetadataRead, loadSubagentSessionListRunsFromSqlite, readStateStream };
+export { prepareAcpSessionMetadataRead, loadSubagentSessionListRunsFromSqlite };
 
 /** Non-metadata query owners load only when the shared worker receives one of their commands. */
 export function readOpenClawStateDatabaseCommand(
