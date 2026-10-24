@@ -464,6 +464,7 @@ async function completeEmbeddedRun(
   const { outcome: terminalOutcome } = input.terminalState;
   const terminalAborted = isEmbeddedRunTerminalAbort(terminalOutcome);
   const terminalTimedOut = isEmbeddedRunTerminalTimeout(terminalOutcome);
+  const terminalFailed = classifyAgentRunTerminalOutcome(terminalOutcome) === "failure";
   const terminalFailure =
     projectAgentRunAttemptTerminal(input.attempt.terminal).promptError ??
     terminalOutcome.error ??
@@ -475,8 +476,7 @@ async function completeEmbeddedRun(
   // Warning suppression is presentation only: an unrecovered terminal failure
   // must retain error metadata and must not enter successful auth/trace bookkeeping.
   const error =
-    input.incompleteTurnText !== undefined ||
-    classifyAgentRunTerminalOutcome(terminalOutcome) === "failure"
+    input.incompleteTurnText !== undefined || terminalFailed
       ? {
           kind: "incomplete_turn" as const,
           message: storageFailureText ?? formatErrorMessage(terminalFailure),
@@ -486,8 +486,6 @@ async function completeEmbeddedRun(
       : undefined;
   const incompleteTurnText = input.incompleteTurnText ?? error?.message ?? null;
   const replayInvalid = input.resolveReplayInvalid(incompleteTurnText);
-  const yieldHasContinuation =
-    input.attempt.yieldDetected && hasYieldContinuationEvidence(input.attempt);
   const livenessState =
     !error && input.attempt.yieldDetected
       ? "paused"
@@ -500,7 +498,9 @@ async function completeEmbeddedRun(
         });
   // The runtime owns interruption causes; a recovery answer does not replace them.
   const stopReason =
-    terminalAborted || terminalTimedOut || (error && terminalOutcome.stopReason === "length")
+    terminalAborted ||
+    terminalTimedOut ||
+    (terminalFailed && terminalOutcome.stopReason === "length")
       ? terminalOutcome.stopReason
       : error
         ? "error"
@@ -608,7 +608,7 @@ async function completeEmbeddedRun(
                   ),
                 ]
               : input.payloadsForTerminalPath
-            : input.attempt.yieldDetected && !yieldHasContinuation
+            : input.attempt.yieldDetected && !hasYieldContinuationEvidence(input.attempt)
               ? [setReplyPayloadMetadata({ text: YIELD_DIAGNOSTIC_TEXT }, { hostNotice: true })]
               : input.payloadsForTerminalPath;
   const sourceFinal = input.attempt.messagingToolSourceReplyPayloads?.findLast(

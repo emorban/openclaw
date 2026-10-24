@@ -366,11 +366,13 @@ export async function prepareTerminalWithSettledTurnFinalization(input: {
     failureSignal: prepared.failureSignal,
     terminalToolFailure: prepared.terminalToolFailure,
   };
-  if (finalizerAnswered && finalizationOutcome === "answered" && !recoveredOutputLimit) {
+  if (finalizerAnswered && finalizationOutcome === "answered") {
     // Recovery owns the selected terminal only after delivery observation and
     // authority checks; failed or cancelled summaries retain the original facts.
     assertFinalizationActive();
-    runParams.onAttemptTerminalReplaced?.();
+    if (!recoveredOutputLimit) {
+      runParams.onAttemptTerminalReplaced?.();
+    }
   }
   return {
     ...completion,
