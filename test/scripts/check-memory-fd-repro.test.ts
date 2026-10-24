@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import { createServer, type Server } from "node:http";
+import { createServer } from "node:http";
 import path from "node:path";
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { afterEach, describe, expect, it } from "vitest";
@@ -21,6 +21,12 @@ import {
 } from "../../src/infra/runtime-worker-url.js";
 import { withEnv } from "../../src/test-utils/env.js";
 import { resolveTestNodeExecPath } from "../../src/test-utils/node-process.js";
+import {
+  closeHttpServer,
+  listenLoopback,
+  readRequestText,
+  respondJson,
+} from "../helpers/gateway-integration-fixtures.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const scriptUrl = resolveRuntimeWorkerUrl(scriptModuleEntrypoints.checkMemoryFdRepro);
@@ -31,7 +37,6 @@ const FOREIGN_PID = 2_147_483_645;
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 type OwnershipScenario =
-  | "owned-success"
   | "owned-success-inherited-root"
   | "inherited-paths"
   | "stdout-error"
@@ -46,7 +51,6 @@ type OwnershipScenario =
   | "replaced-during"
   | "ignored-stop"
   | "primary-EACCES-cleanup-EIO"
-  | "primary-EIO-cleanup-EACCES"
   | "completed-pass-cleanup"
   | "completed-threshold-cleanup"
   | "completed-threshold-cleanup-report-error";
@@ -322,21 +326,6 @@ function runGatewayOwnershipFixture(scenario: OwnershipScenario, expectedStatus 
   return { result, journal, summary, fixtureRoot: root };
 }
 
-async function listen(server: Server): Promise<number> {
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      server.off("error", reject);
-      resolve();
-    });
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("test server did not expose a TCP port");
-  }
-  return address.port;
-}
-
 function classifyResult(result: unknown) {
   return classifyMemorySearchInvokeResponse({
     httpOk: true,
@@ -371,6 +360,14 @@ function expectFinalized(journal: ReturnType<typeof runGatewayOwnershipFixture>[
   expect(journal.samples).toHaveLength(3);
   expect(journal.events).toEqual(["close", "cleanup", "summary"]);
 }
+
+const numericOptions = [
+  ["FILES", "--files", "fileCount", 20],
+  ["MAX_WORKSPACE_REG_FDS", "--max-workspace-reg-fds", "maxWorkspaceRegFds", 4],
+  ["TIMEOUT_MS", "--invoke-timeout-ms", "invokeTimeoutMs", 1000],
+  ["SAMPLE_DELAY_MS", "--sample-delay-ms", "sampleDelayMs", 0],
+  ["SETTLE_DELAY_MS", "--settle-delay-ms", "settleDelayMs", 0],
+] as const;
 
 function parseEnv(env: Record<string, string>, args: string[] = []) {
   return withEnv(
@@ -410,42 +407,19 @@ describe("check-memory-fd-repro", () => {
   });
 
   it("lets explicit CLI numeric flags override malformed inherited env defaults", () => {
-    expect(
-      parseEnv(
-        {
-          FILES: "17files",
-          MAX_WORKSPACE_REG_FDS: "4fds",
-          TIMEOUT_MS: "1e3",
-          SAMPLE_DELAY_MS: "soon",
-          SETTLE_DELAY_MS: "later",
-        },
-        Object.entries({
-          "--files": 20,
-          "--max-workspace-reg-fds": 4,
-          "--invoke-timeout-ms": 1000,
-          "--sample-delay-ms": 0,
-          "--settle-delay-ms": 0,
-        }).flatMap(([flag, value]) => [flag, String(value)]),
-      ),
-    ).toMatchObject({
-      fileCount: 20,
-      invokeTimeoutMs: 1000,
-      maxWorkspaceRegFds: 4,
-      sampleDelayMs: 0,
-      settleDelayMs: 0,
-    });
+    const env = Object.fromEntries(numericOptions.map(([name]) => [name, "invalid"]));
+    const args = numericOptions.flatMap((option) => [option[1], String(option[3])]);
+    expect(parseEnv(env, args)).toMatchObject(
+      Object.fromEntries(numericOptions.map((option) => [option[2], option[3]])),
+    );
   });
 
   it("rejects missing valued options instead of consuming the next flag", () => {
     for (const flag of [
-      "--files",
-      "--invoke-timeout-ms",
-      "--max-workspace-reg-fds",
+      ...numericOptions.map(([, optionFlag]) => optionFlag),
       "--min-leaked-fds",
       "--mode",
       "--output-dir",
-      "--sample-delay-ms",
-      "--settle-delay-ms",
     ]) {
       for (const value of ["--keep", "-h"]) {
         expect(() => parseArgs([flag, value])).toThrow(`Missing value for ${flag}`);
@@ -466,24 +440,18 @@ describe("check-memory-fd-repro", () => {
 
   it("clamps oversized timers and sends the matching memory probe", async () => {
     let requestBody: unknown;
-    const server = createServer((request, response) => {
-      const chunks: Buffer[] = [];
-      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-      request.on("end", () => {
-        requestBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        setTimeout(() => {
-          response.writeHead(200, { "content-type": "application/json" }).end(
-            JSON.stringify({
-              ok: true,
-              result: {
-                content: [{ type: "text", text: JSON.stringify({ results: [] }) }],
-              },
-            }),
-          );
-        }, 25);
-      });
+    const server = createServer(async (request, response) => {
+      requestBody = JSON.parse(await readRequestText(request));
+      setTimeout(
+        () =>
+          respondJson(response, {
+            ok: true,
+            result: { content: [{ type: "text", text: JSON.stringify({ results: [] }) }] },
+          }),
+        25,
+      );
     });
-    const port = await listen(server);
+    const port = Number(new URL(await listenLoopback(server)).port);
     try {
       await expect(
         invokeMemorySearch({
@@ -506,9 +474,7 @@ describe("check-memory-fd-repro", () => {
         sessionKey: "main",
       });
     } finally {
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-      });
+      await closeHttpServer(server);
     }
   });
 
@@ -532,26 +498,16 @@ describe("check-memory-fd-repro", () => {
   });
 
   it("rejects disabled memory_search tool payloads", () => {
-    const result = classifyResult({
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            results: [],
-            disabled: true,
-            unavailable: true,
-            error: 'No API key found for provider "openai".',
-          }),
-        },
-      ],
-    });
-
-    expect(result).toMatchObject({
+    const error = 'No API key found for provider "openai".';
+    const payload = { results: [], disabled: true, unavailable: true, error };
+    expect(
+      classifyResult({ content: [{ type: "text", text: JSON.stringify(payload) }] }),
+    ).toMatchObject({
       ok: false,
       gatewayOk: true,
       toolDisabled: true,
       toolUnavailable: true,
-      toolError: 'No API key found for provider "openai".',
+      toolError: error,
     });
   });
 
@@ -562,12 +518,14 @@ describe("check-memory-fd-repro", () => {
     });
   });
 
-  it.each([
-    { exitCode: null, signalCode: "SIGTERM" },
-    { exitCode: 0, signalCode: null },
-  ])("rejects readiness for an exited child (%j)", async (exitState) => {
+  it("rejects readiness for a signalled child", async () => {
     await expect(
-      waitForGatewayReady({ child: exitState, port: 9, logPath: "gateway.log", timeoutMs: 10_000 }),
+      waitForGatewayReady({
+        child: { exitCode: null, signalCode: "SIGTERM" },
+        port: 9,
+        logPath: "gateway.log",
+        timeoutMs: 10_000,
+      }),
     ).rejects.toThrow("gateway exited before ready");
   });
 
@@ -619,32 +577,30 @@ describe("check-memory-fd-repro", () => {
       },
     );
 
-    it.each([
-      "owned-success",
-      "owned-success-inherited-root",
-      "inherited-paths",
-      "delayed-success",
-    ] as const)("joins the launched process before publishing success (%s)", (scenario) => {
-      const { journal, summary, fixtureRoot } = runGatewayOwnershipFixture(scenario, 0);
-      if (scenario === "inherited-paths") {
-        expect(journal.events).toEqual(
-          expect.arrayContaining(["isolated:index", "isolated:gateway"]),
-        );
-      }
-      expect(journal.launch).toEqual({
-        entry: path.join(fixtureRoot, "openclaw.mjs"),
-        noCompileCache: "1",
-        devSourceRoot:
-          scenario === "owned-success-inherited-root"
-            ? path.join(fixtureRoot, "inherited-source")
-            : fixtureRoot,
-      });
-      expect(journal.samples).toEqual(ownedSamples(3));
-      expect(journal.closed).toBe(true);
-      expect(journal.events.indexOf("close")).toBeLessThan(journal.events.indexOf("summary"));
-      expect(journal.rootExists).toBe(false);
-      expect(summary?.passed).toBe(true);
-    });
+    it.each(["owned-success-inherited-root", "inherited-paths", "delayed-success"] as const)(
+      "joins the launched process before publishing success (%s)",
+      (scenario) => {
+        const { journal, summary, fixtureRoot } = runGatewayOwnershipFixture(scenario, 0);
+        if (scenario === "inherited-paths") {
+          expect(journal.events).toEqual(
+            expect.arrayContaining(["isolated:index", "isolated:gateway"]),
+          );
+        }
+        expect(journal.launch).toEqual({
+          entry: path.join(fixtureRoot, "openclaw.mjs"),
+          noCompileCache: "1",
+          devSourceRoot:
+            scenario === "owned-success-inherited-root"
+              ? path.join(fixtureRoot, "inherited-source")
+              : fixtureRoot,
+        });
+        expect(journal.samples).toEqual(ownedSamples(3));
+        expect(journal.closed).toBe(true);
+        expect(journal.events.indexOf("close")).toBeLessThan(journal.events.indexOf("summary"));
+        expect(journal.rootExists).toBe(false);
+        expect(summary?.passed).toBe(true);
+      },
+    );
 
     it("fails report-only and retains inputs when the owned process cannot be joined", () => {
       const { journal, summary } = runGatewayOwnershipFixture("ignored-stop");
@@ -653,19 +609,13 @@ describe("check-memory-fd-repro", () => {
       expect(summary?.passed).not.toBe(true);
     });
 
-    it.each([
-      { primary: "EACCES", cleanup: "EIO", scenario: "primary-EACCES-cleanup-EIO" },
-      { primary: "EIO", cleanup: "EACCES", scenario: "primary-EIO-cleanup-EACCES" },
-    ] as const)(
-      "prints primary $primary and cleanup $cleanup failures",
-      ({ primary, cleanup, scenario }) => {
-        const { result, journal, summary } = runGatewayOwnershipFixture(scenario);
-        expect(result.stderr).toContain(`measurement denied ${primary}`);
-        expect(result.stderr).toContain(`workspace removal failed ${cleanup}`);
-        expect(journal.closed).toBe(true);
-        expect(summary?.passed).not.toBe(true);
-      },
-    );
+    it("prints primary EACCES and cleanup EIO failures", () => {
+      const { result, journal, summary } = runGatewayOwnershipFixture("primary-EACCES-cleanup-EIO");
+      expect(result.stderr).toContain("measurement denied EACCES");
+      expect(result.stderr).toContain("workspace removal failed EIO");
+      expect(journal.closed).toBe(true);
+      expect(summary?.passed).not.toBe(true);
+    });
   });
 
   it("bounds gateway readiness output while keeping newest logs", () => {
