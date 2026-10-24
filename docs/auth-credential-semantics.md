@@ -172,9 +172,9 @@ directory, environment, or source still replaces it.
 Detached connection, cron, heartbeat, and hook callbacks retain that Gateway's
 read-only worker scope without inheriting startup or request authority. Shutdown
 refuses late callbacks before they can create another reader.
-Auth-file observation owns its readers until the observation registry closes,
-so a directory discovered by a temporary request continues publishing changes
-after that request ends.
+Auth-file observation reuses the current Gateway's reader binding, including
+directories discovered later by temporary requests. Publications stop when those
+Gateway readers close; the next Gateway generation rebinds retained observers.
 Usage bookkeeping invalidates later cache reuse while admitted reads can finish
 their snapshots. Credential, selection, ownership, and lifecycle changes still
 invalidate in-flight preparation.

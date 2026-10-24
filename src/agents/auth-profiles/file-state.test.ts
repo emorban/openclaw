@@ -8,10 +8,6 @@ import { Worker } from "node:worker_threads";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { applyAgentDatabaseReaderRequest } from "../../infra/agent-database-readers.js";
-import {
-  createSqliteReadOnlyWorkerScope,
-  readOnlyWorkerScope,
-} from "../../infra/sqlite-readonly-worker-context.js";
 import { runOpenClawAgentPathWriteAdmission } from "../../state/openclaw-agent-write-admission.js";
 import { closeOpenClawStateDatabaseAsync } from "../../state/openclaw-state-db-cache.js";
 import {
@@ -211,27 +207,6 @@ function closeFiles(paths: string[], retainedPaths?: string[]) {
     deleted: false,
   });
 }
-
-it("keeps file notifications alive after the discovering caller's readers close", async () => {
-  const { directory, databasePath } = fixture({ timers: true, fallback: true, existing: true });
-  const caller = createSqliteReadOnlyWorkerScope();
-  caller.run(() => readAuthProfileDatabaseIdentity(databasePath));
-  await caller.close();
-  const changes: boolean[] = [];
-  let publicationReaders: ReturnType<typeof readOnlyWorkerScope.getStore>;
-  listen(directory, (change) => {
-    publicationReaders = readOnlyWorkerScope.getStore();
-    changes.push(change.identityChanged);
-  });
-
-  replaceFile(databasePath);
-  await refreshAuthProfileFileState();
-  expect(changes).toEqual([true]);
-  expect(publicationReaders?.active).toBe(true);
-
-  await closeOpenClawStateDatabaseAsync();
-  expect(publicationReaders?.active).toBe(false);
-});
 
 it("rejects a swapped database before a privileged write even before observation runs", async () => {
   const { databasePath } = fixture({ existing: true });
