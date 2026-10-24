@@ -1,6 +1,5 @@
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "vite";
-import { renderSocialPreviewSvg, socialPreviewFontFiles } from "./control-ui-social-preview.ts";
 
 /** The same scene supplies the still fallback and the versioned motion asset. */
 export function controlUiSocialCardPlugin(): Plugin {
@@ -8,6 +7,9 @@ export function controlUiSocialCardPlugin(): Plugin {
     name: "control-ui-social-card",
     apply: "build",
     async buildStart() {
+      // Serve/test config imports do not own filesystem-backed artwork.
+      const { renderSocialPreviewSvg, socialPreviewFontFiles } =
+        await import("./control-ui-social-preview.ts");
       const { Resvg } = await import("@resvg/resvg-js");
       const image = new Resvg(renderSocialPreviewSvg(), {
         font: {
