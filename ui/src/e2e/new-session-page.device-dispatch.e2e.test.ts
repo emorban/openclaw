@@ -1,4 +1,3 @@
-import path from "node:path";
 import { gatewayOriginScope } from "@openclaw/gateway-client/browser";
 import type { Page } from "playwright";
 import { expect, it } from "vitest";
@@ -10,7 +9,6 @@ import {
   pollEnabled,
   pollDisabled,
   WORKSPACE,
-  captureDeviceRuntimeUiProof,
   controlUiSessionPath,
   createNewSessionPageE2eSuite,
   createdSessionListResult,
@@ -241,9 +239,6 @@ suite.define(() => {
         {
           locale: "en-US",
           serviceWorkers: "block",
-          ...(process.env.OPENCLAW_CAPTURE_UI_PROOF === "1"
-            ? { recordVideo: { dir: path.join(suite.artifactDir, "device-runtime-gating") } }
-            : {}),
         },
         async ({ page }) => {
           const environment = pairedRunner();
@@ -290,15 +285,6 @@ suite.define(() => {
           await page.clock.runFor(CLOUD_PROFILE_RETRY_DELAYS_MS[0] - 1);
           expect(await gateway.getRequests("environments.list")).toHaveLength(
             requestsBeforeRefresh + 1,
-          );
-          await captureDeviceRuntimeUiProof(
-            suite,
-            page,
-            `failed-topology-${value.replace(":", "-")}.png`,
-            {
-              surface: page.locator(".oc-popover.new-session-page__where-popover"),
-              content: [selectedDevice, automaticDevice],
-            },
           );
           expect(await start.isDisabled()).toBe(true);
           expect(await selectedDevice.isDisabled()).toBe(true);
@@ -483,18 +469,12 @@ suite.define(() => {
       await where.click();
       await page.locator('[data-value="device:paired-runner"]').click();
       await pollAttribute(where, "data-device-id").toBe("paired-runner");
-      await captureDeviceRuntimeUiProof(suite, page, "01-main-agent-paired-node-selected.png");
       const agentPicker = page.locator(".new-session-page__select--agent openclaw-agent-select");
       await agentPicker.locator(".agent-select__trigger").click();
       await agentPicker.getByRole("menuitemradio", { name: "research", exact: true }).click();
       await pollText(agentPicker.locator(".agent-select__label")).toBe("research");
       await pollAttribute(where, "data-device-id").toBeNull();
       await pollText(where.locator(".new-session-page__trigger-label")).toBe("Local");
-      await captureDeviceRuntimeUiProof(
-        suite,
-        page,
-        "02-research-agent-local-destination-restored.png",
-      );
       const message = "run this agent locally";
       await page.locator(".new-session-page__message").fill(message);
       await page.getByRole("button", { name: "Start session" }).click();

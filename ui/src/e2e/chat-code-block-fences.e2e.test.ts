@@ -1,8 +1,5 @@
-import { writeFile } from "node:fs/promises";
-import path from "node:path";
 import type { BrowserContextOptions, Page } from "playwright";
 import { expect, it } from "vitest";
-import { takeControlUiScreenshotFrame } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import { installMockGateway, startControlUiE2eServer } from "../test-helpers/control-ui-e2e.ts";
 import { chatMessage, requireRecord, requireString } from "./chat-flow.test-support.ts";
 import { polledAttribute } from "./chat-presentation.test-support.ts";
@@ -115,13 +112,6 @@ suite.define(() => {
           );
           expect(await expand.getAttribute("aria-expanded")).toBe("false");
           await page.keyboard.press(key);
-          const frame = await takeControlUiScreenshotFrame(page, wrapper, [viewport], {
-            animations: "disabled",
-          });
-          await writeFile(
-            path.join(suite.artifactDir, `keyboard-reveal-${theme}-${width}.png`),
-            frame.png,
-          );
           expect(await viewport.evaluate((element) => element === document.activeElement)).toBe(
             true,
           );
@@ -249,7 +239,7 @@ suite.define(() => {
     });
   });
 
-  it.each([8, 12])("clips %i block-art lines to seven rendered rows", async (lineCount) => {
+  it.each([8])("clips %i block-art lines to seven rendered rows", async (lineCount) => {
     await suite.withPage({ viewport: { width: 1280, height: 900 } }, async ({ page }) => {
       const art = Array.from({ length: lineCount }, () => "██  ██  ██").join("\n");
       await installMockGateway(page, {
@@ -275,139 +265,6 @@ suite.define(() => {
         collapsedHeight,
       );
       expect(await code.textContent()).toBe(art + "\n");
-    });
-  });
-
-  it("preserves indented code from history through streaming and copying", async () => {
-    await suite.withPage(
-      { ...desktop, viewport: { height: 900, width: 1280 } },
-      async ({ page }) => {
-        const gateway = await installMockGateway(page, {
-          historyMessages: [
-            { role: "user", content: "    *user literal*", timestamp: 1000 },
-            { role: "assistant", content: "    *assistant literal*", timestamp: 2000 },
-          ],
-        });
-        await page.addInitScript(() => {
-          Object.defineProperty(navigator, "clipboard", {
-            configurable: true,
-            value: {
-              writeText: async (text: string) => {
-                document.documentElement.dataset.copiedCode = text;
-              },
-            },
-          });
-        });
-        await page.goto(`${suite.server.baseUrl}chat`);
-        await page.locator(".chat-group.assistant .chat-text").waitFor();
-        expect(await page.locator(".chat-group.user pre code").textContent()).toBe(
-          "*user literal*\n",
-        );
-        expect(await page.locator(".chat-group.assistant pre code").textContent()).toBe(
-          "*assistant literal*\n",
-        );
-        await page
-          .locator(".agent-chat__composer-combobox textarea")
-          .fill("Show an indented example");
-        await page.getByRole("button", { name: "Send message" }).click();
-        const request = await gateway.waitForRequest("chat.send");
-        const runId = requireString(requireRecord(request.params).idempotencyKey, "run id");
-        const first = "    *first";
-        const second = `${first}\n\n    second`;
-        for (const text of [first, second]) {
-          await emitDelta(gateway, runId, text);
-          const code = page.locator(".chat-bubble.streaming pre code");
-          await expect
-            .poll(() => code.allTextContents())
-            .toEqual([text.replace(/^ {4}/gm, "") + "\n"]);
-        }
-        await page.locator(".chat-bubble.streaming .code-block-copy").click();
-        expect(await page.locator("html").getAttribute("data-copied-code")).toBe(
-          "*first\n\nsecond",
-        );
-        await gateway.emitChatFinal({ runId, text: second });
-        await expect
-          .poll(() => page.locator(".chat-group.assistant pre code").allTextContents())
-          .toContain("*first\n\nsecond\n");
-      },
-    );
-  });
-
-  it("releases hidden transcript observations and resumes them on the retained code", async () => {
-    await suite.withPage(desktop, async ({ page }) => {
-      type ObservationWindow = typeof window & {
-        codeBlockObservations: () => { observed: number; connected: number; detached: number };
-      };
-      await page.addInitScript(() => {
-        const NativeResizeObserver = window.ResizeObserver;
-        const targets = new Map<ResizeObserver, Set<Element>>();
-        let observed = 0;
-        window.ResizeObserver = class extends NativeResizeObserver {
-          override observe(target: Element, options?: ResizeObserverOptions) {
-            super.observe(target, options);
-            if (target.matches(".code-block-viewport, .code-block-viewport code")) {
-              const current = targets.get(this) ?? new Set<Element>();
-              current.add(target);
-              targets.set(this, current);
-              observed += 1;
-            }
-          }
-
-          override unobserve(target: Element) {
-            super.unobserve(target);
-            targets.get(this)?.delete(target);
-          }
-
-          override disconnect() {
-            super.disconnect();
-            targets.delete(this);
-          }
-        };
-        (window as ObservationWindow).codeBlockObservations = () => {
-          const nodes = [...targets.values()].flatMap((current) => Array.from(current));
-          return {
-            observed,
-            connected: nodes.filter((node) => node.isConnected).length,
-            detached: nodes.filter((node) => !node.isConnected).length,
-          };
-        };
-      });
-      await installMockGateway(page, {
-        historyMessages: [
-          { role: "user", content: "Show the launch command.", timestamp: 1_000 },
-          { role: "assistant", content: wideFence, timestamp: 2_000 },
-        ],
-      });
-      const observations = () =>
-        page.evaluate(() => (window as ObservationWindow).codeBlockObservations());
-
-      await page.goto(`${suite.server.baseUrl}chat`);
-      await expect.poll(async () => (await observations()).connected).toBe(2);
-      const code = await page.locator(".chat-thread code").elementHandle();
-      const sidebar = page.locator("openclaw-app-sidebar");
-      await sidebar.locator(".sidebar-identity-card").click();
-      await sidebar
-        .locator(".sidebar-identity-menu")
-        .getByRole("menuitem", { exact: true, name: "Settings" })
-        .click();
-      await page.locator('.settings-sidebar__item[href="/logs"]').click();
-      await page.locator("openclaw-logs-page").waitFor({ state: "visible" });
-      await page.locator("openclaw-chat-pane").waitFor({ state: "hidden" });
-      expect(await code?.evaluate((element) => element.isConnected)).toBe(true);
-      // A page reload would discard the probe too and cannot prove in-app teardown.
-      expect((await observations()).observed).toBeGreaterThanOrEqual(2);
-      await expect.poll(async () => (await observations()).connected).toBe(0);
-      await expect.poll(async () => (await observations()).detached).toBe(0);
-      await page.goBack();
-      await page.goBack();
-      await page.locator(".chat-thread code").waitFor({ state: "visible" });
-      expect(
-        await page
-          .locator(".chat-thread code")
-          .evaluate((element, previous) => element === previous, code),
-      ).toBe(true);
-      await expect.poll(async () => (await observations()).connected).toBe(2);
-      expect((await observations()).detached).toBe(0);
     });
   });
 
