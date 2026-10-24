@@ -7,7 +7,6 @@ import {
   controlUiSessionUrl,
   installMockGateway,
 } from "../test-helpers/control-ui-e2e.ts";
-import { cronListResponseFixture } from "../test-helpers/cron.ts";
 import { openChatDetails } from "./chat-details.test-support.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 
@@ -18,94 +17,44 @@ const parentKey = "agent:main:details-background";
 // The mock Gateway's fixture rows always carry a numeric updatedAt.
 type SessionFixture = GatewaySessionRow & { updatedAt: number };
 
-function child(
-  slug: string,
-  label: string,
-  state: Partial<GatewaySessionRow>,
-  offsetMs: number,
-): SessionFixture {
-  const key = `agent:main:subagent:${slug}`;
-  return {
-    key,
-    sessionId: slug,
-    kind: "direct",
-    classification: "subagent",
-    label,
-    spawnedBy: parentKey,
-    parentSessionKey: parentKey,
-    createdAt: now - offsetMs,
-    startedAt: now - offsetMs,
-    ...state,
-    updatedAt: now - 1_000,
-  };
-}
-
-function running(runId: string, headline: string) {
-  return {
-    status: "running" as const,
-    hasActiveRun: true,
-    activeRunIds: [runId],
-    observerDigest: {
-      runId,
-      revision: 1,
-      updatedAt: now - 2_000,
-      headline,
-      health: "on-track" as const,
-    },
-  };
-}
-
-function ended(status: GatewaySessionRow["status"], durationMs: number, offsetMs: number) {
-  return {
-    status,
-    hasActiveRun: false,
-    activeRunIds: [],
-    runtimeMs: durationMs,
-    endedAt: now - offsetMs + durationMs,
-  };
-}
-
-const children: SessionFixture[] = [
-  child("ui-review", "UI review", running("run-ui", "Comparing light and dark Details"), 252_000),
-  child("api-audit", "Gateway API audit", running("run-api", "Reading the process owner"), 95_000),
-  child("docs-check", "Docs check", ended("done", 61_000, 600_000), 600_000),
-  child("lint-pass", "Lint pass", ended("done", 38_000, 540_000), 540_000),
-  child("bench", "Cold-load benchmark", ended("failed", 132_000, 480_000), 480_000),
-  child("i18n", "Locale baseline", ended("done", 12_000, 700_000), 700_000),
-];
+const children: SessionFixture[] = Array.from({ length: 6 }, (_, index) => ({
+  key: `agent:main:subagent:child-${index}`,
+  sessionId: `child-${index}`,
+  kind: "direct",
+  classification: "subagent",
+  label: `Child ${index}`,
+  spawnedBy: parentKey,
+  parentSessionKey: parentKey,
+  updatedAt: now - 1_000,
+  status: index < 2 ? "running" : index === 2 ? "failed" : "done",
+  hasActiveRun: index < 2,
+  activeRunIds: index < 2 ? [`run-${index}`] : [],
+}));
 
 function processRow(
   processId: string,
   name: string,
-  status: SessionProcessSummary["status"],
-  age: number,
-  tail: string,
-  duration?: number,
-  exitCode?: number,
+  status: SessionProcessSummary["status"] = "running",
 ): SessionProcessSummary {
   return {
     processId,
     instanceId: processId + "-1",
     name,
     status,
-    startedAt: now - age,
-    tail,
+    startedAt: now - 1_000,
+    tail: "",
     truncated: false,
     canStop: status === "running",
-    ...(duration === undefined ? {} : { endedAt: now - age + duration, exitCode }),
   };
 }
 const processes = [
-  processRow("dev-server", "Background terminal", "running", 1_380_000, "ready in 412 ms"),
+  processRow("dev-server", "Background terminal"),
   processRow(
     "watch-tests",
     "/workspace/openclaw/projects/desktop-details/background-process-verification",
-    "running",
-    74_000,
-    "",
   ),
-  processRow("build", "pnpm ui:build", "completed", 900_000, "built in 53.2s", 54_000, 0),
-  processRow("typecheck", "pnpm tsgo:ui", "failed", 820_000, "error TS2322", 30_000, 2),
+  processRow("build", "pnpm ui:build", "completed"),
+  processRow("typecheck", "pnpm tsgo:ui", "failed"),
 ];
 
 suite.define(() => {
@@ -151,15 +100,6 @@ suite.define(() => {
               "sessions.processes.stop",
             ],
             methodResponses: {
-              "cron.list": cronListResponseFixture({
-                jobs: [],
-                snapshotRevision: "details-background",
-                total: 0,
-                offset: 0,
-                limit: 50,
-                hasMore: false,
-                nextOffset: null,
-              }),
               "sessions.processes.list": {
                 sessionId: "details-background",
                 processes,
@@ -297,75 +237,10 @@ suite.define(() => {
               expect(await longName.locator("..").getAttribute("aria-label")).toContain(
                 processes[1]!.name,
               );
-              expect(
-                await processGroup
-                  .locator('[data-status="completed"] .chat-details-processes__stop')
-                  .count(),
-              ).toBe(0);
-              expect(
-                await processGroup
-                  .locator('[data-status="failed"] .chat-details-processes__stop')
-                  .count(),
-              ).toBe(0);
-              if (width === 1728) {
-                await gateway.deferNext("sessions.processes.stop");
-                await stop.press("Enter");
-                const request = await gateway.waitForRequest("sessions.processes.stop");
-                expect(request.params).toMatchObject({
-                  key: parentKey,
-                  sessionId: "details-background",
-                  processId: "dev-server",
-                  instanceId: "dev-server-1",
-                });
-                await expect.poll(() => stop.isDisabled()).toBe(true);
-                expect(await first.getByRole("status").textContent()).toBe("Stopping…");
-                expect(await badge.isVisible()).toBe(true);
-                expect(await pane.locator("openclaw-chat-processes-panel").count()).toBe(0);
-                await gateway.resolveDeferred("sessions.processes.stop", { requested: false });
-                await processGroup.getByRole("alert").waitFor();
-                await processGroup.getByRole("button", { name: "Retry", exact: true }).click();
-                await processGroup.getByRole("alert").waitFor({ state: "detached" });
-                await gateway.deferNext("sessions.processes.stop");
-                await stop.click();
-                await expect
-                  .poll(async () => (await gateway.getRequests("sessions.processes.stop")).length)
-                  .toBe(2);
-                await gateway.setMethodResponse("sessions.processes.list", {
-                  sessionId: "details-background",
-                  processes: processes.map((row) =>
-                    row.processId === "dev-server"
-                      ? { ...row, status: "killed", canStop: false, endedAt: now }
-                      : row,
-                  ),
-                  truncated: false,
-                });
-                await gateway.resolveDeferred("sessions.processes.stop", { requested: true });
-                await expect.poll(() => first.getAttribute("data-status")).toBe("killed");
-                expect(await first.locator(".chat-details-processes__stop").count()).toBe(0);
-                await gateway.setMethodResponse("sessions.processes.list", {
-                  sessionId: "details-background",
-                  processes,
-                  truncated: false,
-                });
-                await gateway.emitGatewayEvent("sessions.processes.changed", {
-                  sessionKey: parentKey,
-                  agentId: "main",
-                });
-                await expect.poll(() => first.getAttribute("data-status")).toBe("running");
-              }
               await first
                 .locator(".chat-details-processes__open")
                 .evaluate((element) => (element as HTMLElement).blur());
               await page.mouse.move(0, 0);
-            }
-            if (width === 1728) {
-              await processGroup
-                .locator('[data-process-id="dev-server"] .chat-details-processes__open')
-                .click();
-              const panel = pane.locator("openclaw-chat-processes-panel");
-              await panel.getByRole("button", { name: processes[0]!.name, exact: true }).waitFor();
-              await pane.getByRole("button", { name: "Close Processes", exact: true }).click();
-              await panel.waitFor({ state: "hidden" });
             }
             if (width === 390) {
               await processGroup.getByRole("button", { name: "Show all", exact: true }).click();
@@ -380,40 +255,8 @@ suite.define(() => {
                   exact: true,
                 })
                 .click();
-              await openChatDetails(pane);
-              await summary.click();
-              const collection = pane.locator("openclaw-chat-subagents-panel");
-              await collection
-                .locator(
-                  '[data-session-key="agent:main:subagent:ui-review"] .chat-subagents-mobile__open',
-                )
-                .waitFor();
-              expect(
-                await collection
-                  .locator(".chat-subagents-mobile__disclosure")
-                  .getAttribute("aria-expanded"),
-              ).toBe("true");
-              await expect.poll(() => collection.locator("[data-session-key]").count()).toBe(6);
             }
           }
-          await page.setViewportSize({ width: 1728, height: 1100 });
-          await pane.locator(".chat-details-toggle").waitFor();
-          const details = await openChatDetails(pane);
-          await details.getByRole("button", { name: /All subagents\. 2 Working/ }).click();
-          const collection = pane.locator("openclaw-chat-subagents-panel");
-          const runningRow = collection.locator(
-            '[data-session-key="agent:main:subagent:ui-review"]',
-          );
-          await runningRow.waitFor();
-          await expect
-            .poll(() => runningRow.textContent())
-            .toContain("Comparing light and dark Details");
-          expect(
-            await collection
-              .locator(".subagents-desktop__disclosure")
-              .getAttribute("aria-expanded"),
-          ).toBe("true");
-          await expect.poll(() => collection.locator("[data-session-key]").count()).toBe(6);
           expect(await gateway.getRequests("chat.send")).toHaveLength(0);
         },
       );

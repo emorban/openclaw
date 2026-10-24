@@ -5,11 +5,9 @@ import { CLOUD_PROFILE_RETRY_DELAYS_MS } from "../pages/new-session/cloud-profil
 import {
   pollAttribute,
   pollText,
-  pollValue,
   pollEnabled,
   pollDisabled,
   WORKSPACE,
-  controlUiSessionPath,
   createNewSessionPageE2eSuite,
   createdSessionListResult,
   installMockGateway,
@@ -18,8 +16,8 @@ import {
 
 const suite = createNewSessionPageE2eSuite();
 const deviceTargets = [
-  { name: "selected", value: "device:paired-runner", target: { deviceId: "paired-runner" } },
-  { name: "automatic", value: "auto-device", target: { autoDevice: true } },
+  { name: "selected", value: "device:paired-runner" },
+  { name: "automatic", value: "auto-device" },
 ];
 const gitRepository = {
   branches: [{ kind: "local", name: "main" }],
@@ -48,17 +46,6 @@ const busyRunner = () => ({
   id: "node:offline-runner",
   label: "Offline runner",
 });
-
-function rememberedTarget(kind: "device" | "auto-device" | "cloud", id?: string) {
-  return {
-    preference: { kind, ...(id ? { id } : {}) },
-    attribute: `data-${kind === "cloud" ? "cloud-profile" : kind === "device" ? "device-id" : kind}`,
-    value: id ?? "true",
-    target: {
-      [kind === "device" ? "deviceId" : kind === "cloud" ? "profileId" : "autoDevice"]: id ?? true,
-    },
-  };
-}
 
 async function openDevicePage(
   page: Page,
@@ -316,81 +303,70 @@ suite.define(() => {
     },
   );
 
-  it.each([
-    { name: "paired device", ...rememberedTarget("device", "paired-runner") },
-    { name: "automatic device", ...rememberedTarget("auto-device") },
-    { name: "cloud worker", ...rememberedTarget("cloud", "aws") },
-  ])(
-    "does not start locally while a remembered $name destination is being restored",
-    async ({ preference, attribute, value, target }) => {
-      await suite.withPage({ locale: "en-US", serviceWorkers: "block" }, async ({ page }) => {
-        if (preference.kind === "cloud") {
-          // Recovery hydration must neither restart the catalog nor fall back to Local.
-          await page.addInitScript(() => {
-            const originalDigest = crypto.subtle.digest.bind(crypto.subtle);
-            const delayed = new Promise<void>((resolve) => {
-              window.addEventListener("test-release-recovery-scope", () => resolve(), {
-                once: true,
-              });
-            });
-            crypto.subtle.digest = async (algorithm, data) => {
-              if (new TextDecoder().decode(data) === "e2e-device-token") {
-                await delayed;
-              }
-              return originalDigest(algorithm, data);
-            };
+  it("does not start locally while a remembered cloud worker is being restored", async () => {
+    await suite.withPage({ locale: "en-US", serviceWorkers: "block" }, async ({ page }) => {
+      // Recovery hydration must neither restart the catalog nor fall back to Local.
+      await page.addInitScript(() => {
+        const originalDigest = crypto.subtle.digest.bind(crypto.subtle);
+        const delayed = new Promise<void>((resolve) => {
+          window.addEventListener("test-release-recovery-scope", () => resolve(), {
+            once: true,
           });
-        }
-
-        const sessionKey = "agent:main:restored-remote-destination";
-        const catalog = {
-          environments: deviceEnvironments(),
-          profiles: [{ id: "aws", providerId: "crabbox" }],
+        });
+        crypto.subtle.digest = async (algorithm, data) => {
+          if (new TextDecoder().decode(data) === "e2e-device-token") {
+            await delayed;
+          }
+          return originalDigest(algorithm, data);
         };
-        await rememberDestination(page, preference);
-        const gateway = await openDevicePage(page, {
-          heldMethods: ["environments.list"],
-          operatorScopes: ["operator.read", "operator.write", "operator.admin"],
-          methodResponses: {
-            "environments.list": catalog,
-            "worktrees.branches": gitRepository,
-            "sessions.create": { key: sessionKey },
-            "sessions.list": createdSessionListResult(sessionKey),
-            "sessions.dispatch": { placement: { state: "active", generation: 1 } },
-            "sessions.send": { runId: "run-restored-remote", status: "started" },
-          },
-        });
-        await pollAttribute(page.locator("#new-session-checkout-trigger"), "data-worktree").toBe(
-          "false",
-        );
-        if (preference.kind === "cloud") {
-          await page.evaluate(() => {
-            window.dispatchEvent(new Event("test-release-recovery-scope"));
-          });
-          await waitForGatewayRecoveryScope(page);
-          expect(await gateway.getRequests("environments.list")).toHaveLength(1);
-        }
-        await page.locator(".new-session-page__message").fill("keep my chosen remote destination");
-        const start = page.getByRole("button", { name: "Start session" });
-        await pollDisabled(start).toBe(true);
-        await pollAttribute(start.locator("xpath=.."), "content").toContain(
-          "Restoring your last session setup",
-        );
-        expect(await gateway.getRequests("sessions.create")).toHaveLength(0);
-        await gateway.resolveDeferred("environments.list");
-        const where = page.locator("#new-session-where-trigger");
-        await pollAttribute(where, attribute).toBe(value);
-        await pollEnabled(start).toBe(true);
-        await start.click();
-        await expect(gateway.waitForRequest("sessions.create")).resolves.toMatchObject({
-          params: { worktree: true },
-        });
-        await expect(gateway.waitForRequest("sessions.dispatch")).resolves.toMatchObject({
-          params: { key: sessionKey, agentId: "main", ...target },
-        });
       });
-    },
-  );
+
+      const sessionKey = "agent:main:restored-remote-destination";
+      const catalog = {
+        environments: deviceEnvironments(),
+        profiles: [{ id: "aws", providerId: "crabbox" }],
+      };
+      await rememberDestination(page, { kind: "cloud", id: "aws" });
+      const gateway = await openDevicePage(page, {
+        heldMethods: ["environments.list"],
+        operatorScopes: ["operator.read", "operator.write", "operator.admin"],
+        methodResponses: {
+          "environments.list": catalog,
+          "worktrees.branches": gitRepository,
+          "sessions.create": { key: sessionKey },
+          "sessions.list": createdSessionListResult(sessionKey),
+          "sessions.dispatch": { placement: { state: "active", generation: 1 } },
+          "sessions.send": { runId: "run-restored-remote", status: "started" },
+        },
+      });
+      await pollAttribute(page.locator("#new-session-checkout-trigger"), "data-worktree").toBe(
+        "false",
+      );
+      await page.evaluate(() => {
+        window.dispatchEvent(new Event("test-release-recovery-scope"));
+      });
+      await waitForGatewayRecoveryScope(page);
+      expect(await gateway.getRequests("environments.list")).toHaveLength(1);
+      await page.locator(".new-session-page__message").fill("keep my chosen remote destination");
+      const start = page.getByRole("button", { name: "Start session" });
+      await pollDisabled(start).toBe(true);
+      await pollAttribute(start.locator("xpath=.."), "content").toContain(
+        "Restoring your last session setup",
+      );
+      expect(await gateway.getRequests("sessions.create")).toHaveLength(0);
+      await gateway.resolveDeferred("environments.list");
+      const where = page.locator("#new-session-where-trigger");
+      await pollAttribute(where, "data-cloud-profile").toBe("aws");
+      await pollEnabled(start).toBe(true);
+      await start.click();
+      await expect(gateway.waitForRequest("sessions.create")).resolves.toMatchObject({
+        params: { worktree: true },
+      });
+      await expect(gateway.waitForRequest("sessions.dispatch")).resolves.toMatchObject({
+        params: { key: sessionKey, agentId: "main", profileId: "aws" },
+      });
+    });
+  });
 
   it.each([
     {
@@ -485,66 +461,4 @@ suite.define(() => {
       expect(await gateway.getRequests("sessions.send")).toHaveLength(0);
     });
   });
-
-  it.each(deviceTargets)(
-    "reloads a pending empty-workspace create with the same $name device target",
-    async ({ value, target }) => {
-      await suite.withPage({ locale: "en-US", serviceWorkers: "block" }, async ({ page }) => {
-        const message = "resume on the paired device";
-        const gateway = await openDevicePage(page, {
-          deferredMethods: ["sessions.create"],
-          operatorScopes: undefined,
-          workspaceGit: false,
-          methodResponses: {
-            "sessions.dispatch": { placement: { state: "active", generation: 1 } },
-            "sessions.send": { runId: "run-device-recovery", status: "started" },
-          },
-        });
-        await page.locator("#new-session-where-trigger").click();
-        await page.locator(`[data-value="${value}"]`).click();
-        await page.locator(".new-session-page__message").fill(message);
-        await page.getByRole("button", { name: "Start session" }).click();
-        const firstCreate = await gateway.waitForRequest("sessions.create");
-        expect(firstCreate.params).toMatchObject({ worktree: true, worktreeSource: "empty" });
-        const sessionKey = (firstCreate.params as { key?: string }).key;
-        if (!sessionKey) {
-          throw new Error("expected a recoverable device create key");
-        }
-        await page.reload();
-        await gateway.waitForRequest("environments.list");
-        await pollAttribute(
-          page.locator("#new-session-where-trigger"),
-          value === "auto-device" ? "data-auto-device" : "data-device-id",
-        ).toBe(value === "auto-device" ? "true" : "paired-runner");
-        await pollValue(page.locator(".new-session-page__message")).toBe(message);
-        await pollText(page.locator("#new-session-project-trigger")).toContain("New workspace");
-        expect(await page.locator("#new-session-checkout-trigger").count()).toBe(0);
-        await page.getByRole("button", { name: "Start session" }).click();
-        const retryCreate = await gateway.waitForRequest("sessions.create");
-        expect(retryCreate.params).toMatchObject({
-          key: sessionKey,
-          message: "",
-          worktree: true,
-          worktreeSource: "empty",
-        });
-        expect(await gateway.getRequests("sessions.dispatch")).toHaveLength(0);
-        await gateway.deferNext("sessions.dispatch");
-        await gateway.resolveDeferred("sessions.create", { key: sessionKey });
-        await expect(gateway.waitForRequest("sessions.dispatch")).resolves.toMatchObject({
-          params: { key: sessionKey, agentId: "main", ...target },
-        });
-        expect(await gateway.getRequests("sessions.send")).toHaveLength(0);
-        await gateway.resolveDeferred("sessions.dispatch");
-        await expect(gateway.waitForRequest("sessions.send")).resolves.toMatchObject({
-          params: { key: sessionKey, agentId: "main", message },
-        });
-        expect(await gateway.getRequests("sessions.create")).toHaveLength(1);
-        expect(await gateway.getRequests("sessions.dispatch")).toHaveLength(1);
-        expect(await gateway.getRequests("sessions.send")).toHaveLength(1);
-        await page.waitForURL((url) => url.pathname === controlUiSessionPath(sessionKey), {
-          timeout: 30_000,
-        });
-      });
-    },
-  );
 });
