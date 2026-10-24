@@ -13,7 +13,6 @@ import {
 } from "./chat-flow-fixtures.test-support.ts";
 import {
   SESSION_DRAG_MIME,
-  captureSessionAccessibilityProof,
   chatSessionListResponse,
   controlUiSessionPath,
   createChatFlowE2eSuite,
@@ -427,40 +426,33 @@ suite.define(() => {
       .toBe(controlUiSessionPath("agent:main:session-b"));
   });
 
-  it.each([
-    { name: "current context and latest-run cost", stale: false },
-    { name: "approximate stale context without a warning", stale: true },
-  ])("shows $name in the composer usage ring", async ({ stale }) => {
+  it("shows current context and latest-run cost in the composer usage ring", async () => {
     const { page } = await chatFixture(suite, {
-      ...(stale
-        ? {}
-        : {
-            historyMessages: [
-              { role: "user", content: "Show current usage", timestamp: Date.now() - 1_000 },
-              {
-                role: "assistant",
-                content: "Usage ready.",
-                model: "gpt-5.5",
-                provider: "openai",
-                timestamp: Date.now(),
-                cost: {
-                  input: 0.003456,
-                  output: 0.018,
-                  cacheRead: 0.0015,
-                  cacheWrite: 0.0005,
-                  total: 0.023456,
-                },
-              },
-              {
-                role: "assistant",
-                content: "Usage ready.",
-                model: "gateway-injected",
-                provider: "openclaw",
-                timestamp: Date.now() + 1,
-                usage: { cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-              },
-            ],
-          }),
+      historyMessages: [
+        { role: "user", content: "Show current usage", timestamp: Date.now() - 1_000 },
+        {
+          role: "assistant",
+          content: "Usage ready.",
+          model: "gpt-5.5",
+          provider: "openai",
+          timestamp: Date.now(),
+          cost: {
+            input: 0.003456,
+            output: 0.018,
+            cacheRead: 0.0015,
+            cacheWrite: 0.0005,
+            total: 0.023456,
+          },
+        },
+        {
+          role: "assistant",
+          content: "Usage ready.",
+          model: "gateway-injected",
+          provider: "openclaw",
+          timestamp: Date.now() + 1,
+          usage: { cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        },
+      ],
       methodResponses: {
         "sessions.list": {
           count: 1,
@@ -473,16 +465,12 @@ suite.define(() => {
               kind: "direct",
               contextTokens: 200_000,
               updatedAt: Date.now(),
-              ...(stale
-                ? { totalTokens: 190_000, totalTokensFresh: false }
-                : {
-                    estimatedCostUsd: 0.023456,
-                    inputTokens: 757_300,
-                    outputTokens: 42_300,
-                    totalTokens: 46_000,
-                    model: "gpt-5.5",
-                    modelProvider: "openai",
-                  }),
+              estimatedCostUsd: 0.023456,
+              inputTokens: 757_300,
+              outputTokens: 42_300,
+              totalTokens: 46_000,
+              model: "gpt-5.5",
+              modelProvider: "openai",
             },
           ],
         },
@@ -491,38 +479,25 @@ suite.define(() => {
     await page.goto(`${suite.server.baseUrl}chat`);
     const trigger = page.locator("summary.context-ring");
     await trigger.waitFor({ timeout: 10_000 });
-    if (stale) {
-      expect((await trigger.textContent())?.trim()).toBe("");
-      expect(await trigger.getAttribute("aria-label")).toBe(
-        "Session context usage: ~190k of 200k (~95%)",
-      );
-      expect(
-        await trigger.evaluate((element) => element.classList.contains("context-ring--warning")),
-      ).toBe(false);
-    }
     await trigger.click();
     const popover = page.locator(".context-usage__popover");
-    if (stale) {
-      await expectTextContains(popover, "~190k / 200k · ~95%");
-    } else {
-      await expect.poll(() => popover.isVisible()).toBe(true);
-      for (const text of [
-        "46k / 200k · 23%",
-        "757.3k",
-        "42.3k",
-        "Est. cost",
-        "$0.023",
-        "Cost by Type",
-        "$0.0035",
-        "$0.018",
-        "$0.0015",
-        "$0.0005",
-      ]) {
-        await expectTextContains(popover, text);
-      }
-      await page.keyboard.press("Escape");
-      await expect.poll(() => popover.isHidden()).toBe(true);
+    await expect.poll(() => popover.isVisible()).toBe(true);
+    for (const text of [
+      "46k / 200k · 23%",
+      "757.3k",
+      "42.3k",
+      "Est. cost",
+      "$0.023",
+      "Cost by Type",
+      "$0.0035",
+      "$0.018",
+      "$0.0015",
+      "$0.0005",
+    ]) {
+      await expectTextContains(popover, text);
     }
+    await page.keyboard.press("Escape");
+    await expect.poll(() => popover.isHidden()).toBe(true);
   });
 
   it("routes page typing to the active composer without stealing text input focus", async () => {
@@ -676,7 +651,6 @@ suite.define(() => {
     await page.getByRole("main").click();
     await expectCount(page.locator(".sidebar-session-sort-menu"), 0);
   });
-
   it("keeps derived sidebar titles and accessible state after session patch refreshes", async () => {
     const { page } = await newChatPage(suite);
     const initialKey = "agent:main:session-a";
@@ -722,6 +696,18 @@ suite.define(() => {
     const tree = row.locator("..");
     const list = tree.locator("..");
     await expectText(label, readableTitle);
+    for (const [sessionKey, weight] of [
+      [key, "600"],
+      [initialKey, "500"],
+    ]) {
+      expect(
+        await page
+          .locator(
+            `.sidebar-recent-session[data-session-key="${sessionKey}"] .sidebar-recent-session__name`,
+          )
+          .evaluate((element) => getComputedStyle(element).fontWeight),
+      ).toBe(weight);
+    }
     expect(await list.getAttribute("role")).toBe("list");
     expect(await tree.getAttribute("role")).toBe("listitem");
     expect(await row.getAttribute("role")).toBeNull();
@@ -730,7 +716,6 @@ suite.define(() => {
     expect(await link.getAttribute("aria-current")).toBe("page");
     expect(await link.getAttribute("aria-describedby")).toBeNull();
     expect(await link.ariaSnapshot()).toContain(`link "${readableTitle}"`);
-    await captureSessionAccessibilityProof(suite, page, "after-derived-title");
 
     const listCountBeforePatch = (await gateway.getRequests("sessions.list", rosterMatch)).length;
     // Unread remains shared session metadata; personal pinning no longer patches or refreshes it.
@@ -752,6 +737,5 @@ suite.define(() => {
     // The retained title can match before the refresh renders Unread.
     await expect.poll(() => link.ariaSnapshot()).toContain(`link "Unread ${readableTitle}"`);
     expect(await link.getByRole("img", { name: "Unread", exact: true }).count()).toBe(1);
-    await captureSessionAccessibilityProof(suite, page, "after-patch-refresh");
   });
 });

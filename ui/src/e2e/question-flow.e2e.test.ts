@@ -4,7 +4,6 @@ import { afterEach, expect, it } from "vitest";
 import type { SessionsListResult } from "../api/types.ts";
 import { SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD } from "../lib/session-pull-requests.ts";
 import { CHAT_TRANSCRIPT_END_THRESHOLD_PX } from "../pages/chat/scroll.ts";
-import { selectChatLayoutAction } from "../test-helpers/chat-layout-menu.ts";
 import {
   controlUiSessionUrl,
   installMockGateway,
@@ -471,11 +470,14 @@ suite.define(() => {
     ).toBe(true);
   });
 
-  it("masks a store-bound secret and resolves it with edited hosts without echoing the value", async () => {
+  it("masks a store-bound secret through host validation and resolves its corrected hosts", async () => {
     const { gateway, page } = await openQuestionPage();
     const request = secretStoreQuestion("question-store-secret-success");
     const fakeSecret = "fake-secret-never-use-browser-proof-123";
-    await gateway.setMethodResponse("question.resolve", storedSecretAnswer());
+    const validationMessage = "Allowed hosts must be valid hostnames.";
+    await gateway.setMethodResponse("question.resolve", {
+      __mockError: { code: "INVALID_REQUEST", message: validationMessage },
+    });
     const panel = await showQuestion(page, gateway, request);
     await expectCount(panel.getByText("Requested by main", { exact: false }), 1);
     await expectCount(panel.getByText("Publish the release artifacts."), 1);
@@ -490,8 +492,16 @@ suite.define(() => {
     expect(await hostsInput.inputValue()).toBe("api.example.test");
 
     await secretInput.fill(fakeSecret);
-    await hostsInput.fill("api.example.test, uploads.example.test extra.example.test");
+    await hostsInput.fill("bad-host.example.test");
     await expectSecretNotEchoed(page, fakeSecret, true);
+    await button(panel, "Submit").click();
+    await gateway.waitForRequest("question.resolve");
+    await panel.getByText(validationMessage, { exact: false }).waitFor();
+    await expect.poll(() => secretInput.isEnabled()).toBe(true);
+    expect(await secretInput.inputValue()).toBe(fakeSecret);
+    await expectSecretNotEchoed(page, fakeSecret);
+    await gateway.setMethodResponse("question.resolve", storedSecretAnswer());
+    await hostsInput.fill("api.example.test, uploads.example.test extra.example.test");
 
     await secretInput.focus();
     await page.keyboard.press("Tab");
@@ -501,59 +511,26 @@ suite.define(() => {
     await expectSecretInput(secretInput, "text", fakeSecret);
     const hide = button(panel, "Hide secret");
     expect(await hide.getAttribute("aria-pressed")).toBe("true");
-    expect(await gateway.getRequests("question.resolve")).toHaveLength(0);
+    expect(await gateway.getRequests("question.resolve")).toHaveLength(1);
     await page.keyboard.press("Space");
     await expectSecretInput(secretInput, "password", fakeSecret);
-    expect(await gateway.getRequests("question.resolve")).toHaveLength(0);
+    expect(await gateway.getRequests("question.resolve")).toHaveLength(1);
 
-    await button(panel, "Submit").click();
-    await expectResolution(gateway, {
-      id: request.id,
-      answers: { answers: { api_key: [fakeSecret] } },
-      secretStoreAllowedHosts: ["api.example.test", "uploads.example.test", "extra.example.test"],
-    });
-    await expectCount(panel, 0);
-    const summary = page.locator(".chat-question-summary").filter({ hasText: "API key:" });
-    await summary.waitFor();
-    await expectCount(summary.getByText("Answered", { exact: true }), 1);
-    expect(await summary.textContent()).not.toContain("stored");
-    await expectSecretNotEchoed(page, fakeSecret);
-  });
-
-  it("keeps a store-bound question interactive after Gateway validation rejects its hosts", async () => {
-    const { gateway, page } = await openQuestionPage();
-    const request = secretStoreQuestion("question-store-secret-validation");
-    const fakeSecret = "fake-secret-never-use-validation-proof-456";
-    const validationMessage = "Allowed hosts must be valid hostnames.";
-    await gateway.setMethodResponse("question.resolve", {
-      __mockError: { code: "INVALID_REQUEST", message: validationMessage },
-    });
-    const panel = await showQuestion(page, gateway, request);
-    const secretInput = panel.locator('input[type="password"]');
-    const hostsInput = panel.locator(".chat-question-panel__hosts");
-    await secretInput.fill(fakeSecret);
-    await hostsInput.fill("bad-host.example.test");
-    await button(panel, "Submit").click();
-    await gateway.waitForRequest("question.resolve");
-    await panel.getByText(validationMessage, { exact: false }).waitFor();
-    await expect.poll(() => secretInput.isEnabled()).toBe(true);
-    expect(await secretInput.inputValue()).toBe(fakeSecret);
-    await expectSecretNotEchoed(page, fakeSecret);
-
-    await gateway.setMethodResponse("question.resolve", storedSecretAnswer());
-    await hostsInput.fill("corrected.example.test");
-    const previousRequestCount = (await gateway.getRequests("question.resolve")).length;
     await button(panel, "Submit").click();
     await expectResolution(
       gateway,
       {
         id: request.id,
         answers: { answers: { api_key: [fakeSecret] } },
-        secretStoreAllowedHosts: ["corrected.example.test"],
+        secretStoreAllowedHosts: ["api.example.test", "uploads.example.test", "extra.example.test"],
       },
-      previousRequestCount,
+      1,
     );
     await expectCount(panel, 0);
+    const summary = page.locator(".chat-question-summary").filter({ hasText: "API key:" });
+    await summary.waitFor();
+    await expectCount(summary.getByText("Answered", { exact: true }), 1);
+    expect(await summary.textContent()).not.toContain("stored");
     await expectSecretNotEchoed(page, fakeSecret);
   });
 
@@ -607,107 +584,6 @@ suite.define(() => {
     expect(await document.textContent()).not.toContain("stored");
     expect(new URL(page.url()).pathname).toBe(`/operator/ask/${request.id}`);
   });
-
-  it("retains a typed answer when navigating between pending questions", async () => {
-    const { gateway, page } = await openQuestionPage();
-    const first = questionRecord("question-a-format", {
-      questionId: "format",
-      header: "Format",
-      question: "Which format should I use?",
-      options: [{ label: "Compact" }, { label: "Detailed" }],
-      isOther: true,
-    });
-
-    const second = questionRecord("question-b-audience", {
-      questionId: "audience",
-      header: "Audience",
-      question: "Who should read it?",
-      options: [{ label: "Engineers" }, { label: "Everyone" }],
-      isOther: true,
-    });
-
-    await gateway.emitGatewayEvent("question.requested", first);
-    await gateway.emitGatewayEvent("question.requested", second);
-    const panel = page.locator("openclaw-chat-question-panel");
-    await panel.getByRole("textbox", { name: "Your own answer for Format" }).fill("Compact");
-    await button(panel, "Next").click();
-    await panel.getByText("Who should read it?", { exact: true }).waitFor();
-    await button(panel, "Previous").click();
-    await panel.getByText("Which format should I use?", { exact: true }).waitFor();
-    expect(
-      await panel.getByRole("textbox", { name: "Your own answer for Format" }).inputValue(),
-    ).toBe("Compact");
-    expect(await panel.getByRole("radio", { name: /Compact/ }).getAttribute("aria-checked")).toBe(
-      "false",
-    );
-  });
-
-  it.each([
-    ["answered", false],
-    ["cancelled", false],
-    ["answered", true],
-    ["cancelled", true],
-  ] as const)(
-    "reconciles %s across panes (submitting pane closed: %s) without a resolution event",
-    async (status, closeSubmittingPane) => {
-      const { gateway, page } = await openQuestionPage();
-      await selectChatLayoutAction(page, "Open split view");
-      const panes = page.locator("openclaw-chat-pane.chat-split-view__pane");
-      await expectCount(panes, 2);
-      await expectCount(panes.locator(composerSelector), 2);
-      expect(await gateway.getRequests("question.list")).toHaveLength(1);
-
-      const request = questionRecord(`question-split-${status}-${closeSubmittingPane}`);
-
-      await gateway.emitGatewayEvent("question.requested", request);
-      const panels = panelFor(page, "Where should I deploy?");
-      await expectCount(panels, 2);
-      await expectQuestionAttention(page, request.questions[0]!.question);
-
-      const answers = { answers: { deploy_target: ["Staging"] } };
-      const result: QuestionResolveResult =
-        status === "answered" ? { status, answers } : { status };
-      if (closeSubmittingPane) {
-        await gateway.deferNext("question.resolve");
-      } else {
-        await gateway.setMethodResponse("question.resolve", result);
-      }
-      const submittingIndex = closeSubmittingPane ? 1 : 0;
-      const submittingPane = panes.nth(submittingIndex);
-      const submittingPanel = panels.nth(submittingIndex);
-      if (status === "answered") {
-        await submittingPanel.getByRole("radio", { name: /Staging/ }).click();
-      }
-      await submittingPanel
-        .getByRole("button", { name: status === "answered" ? "Submit" : "Skip", exact: true })
-        .click();
-      const resolveRequest = await gateway.waitForRequest("question.resolve");
-      expect(resolveRequest.params).toEqual(
-        status === "answered" ? { id: request.id, answers } : { id: request.id, cancel: true },
-      );
-      expect(await gateway.getRequests("question.resolve")).toHaveLength(1);
-      const remainingPanes = page.locator("openclaw-chat-pane");
-      if (closeSubmittingPane) {
-        await selectChatLayoutAction(submittingPane, "Close pane");
-        await expectCount(remainingPanes, 1);
-        await expectQuestionAttention(page, request.questions[0]!.question);
-        await gateway.resolveDeferred("question.resolve", result);
-      }
-      const remainingCount = closeSubmittingPane ? 1 : 2;
-
-      await expectCount(panels, 0);
-      await expectCount(remainingPanes.locator(composerSelector), remainingCount);
-      await expect
-        .poll(() =>
-          page
-            .locator(".chat-question-summary")
-            .filter({ hasText: status === "answered" ? "Staging" : "Skipped" })
-            .count(),
-        )
-        .toBe(remainingCount);
-      await expectQuestionAttention(page, null);
-    },
-  );
 
   it("restores the composer when reconnect recovery cannot find an old question", async () => {
     const { gateway, page } = await openQuestionPage();

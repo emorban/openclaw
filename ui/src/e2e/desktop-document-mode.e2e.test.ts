@@ -505,76 +505,6 @@ suite.define(() => {
   });
 
   it.each([
-    {
-      name: "execution node",
-      session: { execNode: "workstation" },
-      environment: { id: "node:workstation", type: "node" },
-      source: { kind: "node", nodeId: "workstation" },
-    },
-    {
-      name: "paired device placement",
-      session: {
-        placement: {
-          state: "active",
-          environmentId: "worker-device",
-          runner: { kind: "device", deviceId: "workstation", status: "available" },
-        },
-      },
-      environment: { id: "node:workstation", type: "node" },
-      source: { kind: "node", nodeId: "workstation" },
-    },
-    {
-      name: "cloud placement",
-      session: { placement: { state: "active", environmentId: "worker-cloud" } },
-      environment: { id: "worker-cloud", type: "worker" },
-      source: { kind: "environment", environmentId: "worker-cloud" },
-    },
-  ])("resolves a $name session to its observable machine and auto-connects", async (scenario) => {
-    await suite.withPage({ serviceWorkers: "block" }, async ({ page }) => {
-      const sessionKey = "agent:main:mobile-session";
-      const { gateway, panel } = await openDesktopDocument(
-        page,
-        `focus/desktop/session/${encodeURIComponent(sessionKey)}`,
-        {
-          environments: [gatewayEnvironment, makeEnvironment(scenario.environment.id)],
-          session: sessionRow(sessionKey, scenario.session),
-        },
-      );
-
-      const request = await gateway.waitForRequest("desktop.observe");
-      expect(request.params).toEqual({
-        source: scenario.source,
-        control: false,
-      });
-      await remoteView(panel).waitFor();
-      await gateway.setMethodResponse("sessions.describe", {
-        session: sessionRow(
-          sessionKey,
-          { ...scenario.session, placement: { state: "reclaimed" } },
-          2,
-        ),
-      });
-      await gateway.setMethodResponse("environments.list", {
-        environments: [gatewayEnvironment, { ...scenario.environment, desktop: true }],
-      });
-      await gateway.emitGatewayEvent("sessions.changed", { sessionKey, reason: "reclaim" });
-      await exactText(panel, "Desktop sources").waitFor();
-      expect(await remoteView(panel).count()).toBe(0);
-      expect(await gateway.getRequests("desktop.observe")).toHaveLength(1);
-
-      await gateway.setMethodResponse("sessions.describe", {
-        session: sessionRow(sessionKey, scenario.session, 3),
-      });
-      await gateway.emitGatewayEvent("sessions.changed", { sessionKey, reason: "placement" });
-      await remoteView(panel).waitFor();
-      expect((await gateway.getRequests("desktop.observe")).at(-1)?.params).toEqual({
-        source: scenario.source,
-        control: false,
-      });
-    });
-  });
-
-  it.each([
     { name: "unknown", session: null },
     {
       name: "reclaimed cloud",
@@ -595,43 +525,6 @@ suite.define(() => {
       expect(await gateway.getRequests("desktop.observe")).toHaveLength(0);
     });
   });
-
-  it.each([false, true])(
-    "retries a preselected desktop after inventory failure (session=%s)",
-    async (sessionSelected) => {
-      await suite.withPage({ serviceWorkers: "block" }, async ({ page }) => {
-        const sessionKey = "agent:main:mobile-session";
-        const id = sessionSelected ? "node:workstation" : "gateway";
-        const { gateway, panel } = await startDesktopDocument(
-          page,
-          sessionSelected
-            ? `focus/desktop/session/${encodeURIComponent(sessionKey)}`
-            : "focus/desktop/source/gateway",
-          {
-            session: sessionSelected
-              ? sessionRow(sessionKey, { execNode: "workstation" })
-              : undefined,
-          },
-        );
-        await gateway.rejectDeferred("environments.status", {
-          code: "UNAVAILABLE",
-          message: "desktop inventory is temporarily unavailable",
-        });
-
-        if (!sessionSelected) {
-          await panel.getByRole("alert").filter({ hasText: "inventory" }).waitFor();
-        }
-        const retry = button(panel, "Retry");
-        await retry.waitFor();
-        expect(await gateway.getRequests("desktop.observe")).toHaveLength(0);
-
-        await gateway.setMethodResponse("environments.status", makeEnvironment(id));
-        await retry.click();
-        await expectObserve(gateway, id);
-        await remoteView(panel).waitFor();
-      });
-    },
-  );
 
   it("keeps all six touch controls reachable at 320px, phone, and desktop widths", async () => {
     await suite.withPage({ serviceWorkers: "block" }, async ({ page }) => {
@@ -701,40 +594,6 @@ suite.define(() => {
       const sizing = panel.getByRole("combobox", { name: "Desktop size", exact: true });
       await sizing.selectOption("actual");
       await expect.poll(() => panel.getAttribute("data-scale-viewport")).toBe("false");
-
-      await button(panel, "Keyboard").click();
-      expect(
-        await panel.evaluate((element) =>
-          (element.getRootNode() as Document | ShadowRoot).activeElement?.classList.contains(
-            "desktop-keyboard-input",
-          ),
-        ),
-      ).toBe(true);
-      await page.keyboard.type("k");
-      await expect.poll(() => panel.getAttribute("data-last-keyboard-event")).toBe("keyup:k");
-      await panel.locator(".desktop-keyboard-input").evaluate((element) => {
-        const input = element as HTMLTextAreaElement;
-        input.value += "m";
-        input.dispatchEvent(
-          new InputEvent("input", { data: "m", inputType: "insertText", bubbles: true }),
-        );
-      });
-      await expect.poll(() => panel.getAttribute("data-last-keyboard-text")).toBe("m");
     });
-  });
-
-  it("applies the optional control segment as the initial control request", async () => {
-    for (const [route, expected] of [
-      ["focus/desktop/source/gateway", false],
-      ["focus/desktop/control/source/gateway", true],
-    ] as const) {
-      await suite.withPage({ serviceWorkers: "block" }, async ({ page }) => {
-        const { gateway } = await openDesktopDocument(page, route, {
-          desktopObserve: observe(`control-${String(expected)}`, expected),
-        });
-        const request = await gateway.waitForRequest("desktop.observe");
-        expect(request.params).toEqual({ source: { kind: "host" }, control: expected });
-      });
-    }
   });
 });

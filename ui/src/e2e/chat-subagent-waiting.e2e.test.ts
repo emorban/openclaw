@@ -1,10 +1,6 @@
-import { writeFile } from "node:fs/promises";
-import path from "node:path";
 import { expect, it } from "vitest";
 import type { GatewaySessionRow } from "../api/types.ts";
 import { selectChatLayoutAction } from "../test-helpers/chat-layout-menu.ts";
-import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
-import { takeControlUiScreenshotFrame } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import {
   controlUiBundledSettingsStorageKey,
   controlUiSessionUrl,
@@ -17,10 +13,6 @@ const suite = createControlUiE2eSuite({ name: "Chat waiting on subagents" });
 
 suite.define(() => {
   it("streams inline narration without opening children and uses the available title width", async () => {
-    const artifactParent = process.env.OPENCLAW_UI_E2E_ARTIFACT_DIR?.trim();
-    const artifactDir = artifactParent
-      ? createControlUiE2eArtifactDir("subagent-inline-preview", artifactParent)
-      : undefined;
     await suite.withPage(
       { locale: "en-US", serviceWorkers: "block", viewport: { width: 1000, height: 900 } },
       async ({ page }) => {
@@ -89,16 +81,6 @@ suite.define(() => {
         const activity = pane.locator(".chat-subagent-activity").first();
         const rows = activity.locator(".chat-subagent-activity__row");
         await expect.poll(() => rows.count()).toBe(4);
-        const capture = async (name: string) => {
-          if (!artifactDir) {
-            return;
-          }
-          const frame = await takeControlUiScreenshotFrame(page, pane, [activity], {
-            animations: "disabled",
-          });
-          await writeFile(path.join(artifactDir, name), frame.png);
-        };
-        await capture("initial-wide.png");
         const untruncatedTitles = () =>
           rows
             .locator(".chat-subagent-activity__name")
@@ -129,7 +111,6 @@ suite.define(() => {
           .getByText("Checking CocoaPods and Gradle compatibility.", { exact: true })
           .waitFor();
         expect(await untruncatedTitles()).toBe(true);
-        await capture("live-wide.png");
         await page.setViewportSize({ width: 390, height: 900 });
         await page.locator(".shell--mobile-nav").waitFor();
         const oneLine = () =>
@@ -149,7 +130,6 @@ suite.define(() => {
             }),
           );
         await expect.poll(oneLine).toBe(true);
-        await capture("live-narrow.png");
         for (const child of children) {
           expect(await gateway.getRequests("chat.history", { sessionKey: child.key })).toHaveLength(
             0,
@@ -160,10 +140,6 @@ suite.define(() => {
   });
 
   it("keeps child activity without a duplicate composer line and restores the parent's working indicator", async () => {
-    const artifactParent = process.env.OPENCLAW_UI_E2E_ARTIFACT_DIR?.trim();
-    const artifactDir = artifactParent
-      ? createControlUiE2eArtifactDir("chat-subagent-waiting", artifactParent)
-      : undefined;
     await suite.withPage(
       { locale: "en-US", serviceWorkers: "block", viewport: { width: 1280, height: 900 } },
       async ({ page }) => {
@@ -293,14 +269,6 @@ suite.define(() => {
           .getByText("I am delegating the backend implementation.", { exact: true })
           .waitFor();
         const activePane = page.locator(".chat-pane-cache__pane--active");
-        const screenshot = async (name: string, targets: ReturnType<typeof page.locator>[]) => {
-          if (artifactDir) {
-            const frame = await takeControlUiScreenshotFrame(page, activePane, targets, {
-              animations: "disabled",
-            });
-            await writeFile(path.join(artifactDir, name), frame.png);
-          }
-        };
         const indicator = activePane.locator(".chat-working-indicator");
         await indicator.waitFor();
         expect(await indicator.textContent()).not.toContain("Waiting on subagents");
@@ -429,7 +397,6 @@ suite.define(() => {
           (await indicator.locator(".chat-working-indicator__tokens").textContent())?.trim();
         await reportUsage(runId, 4_100);
         await expect.poll(workingTokens).toBe("4.1k output tokens");
-        await screenshot("working-light-1280.png", [activityRow, indicator]);
         const activityBounds = await activityRow.boundingBox();
         const statusBounds = await indicator.boundingBox();
         expect(activityBounds).not.toBeNull();
@@ -483,34 +450,29 @@ suite.define(() => {
           yielded: true,
         });
         await gateway.waitForRequest("chat.history", { after: historyReads });
-        // Both before and after captures follow the same committed transcript boundary.
         await page
           .locator(".chat-thread p")
           .getByText("Backend work is now delegated.", { exact: true })
           .waitFor();
-        const captureWaiting = async (mode: "light" | "dark", width: number) => {
+        const checkWaitingLayout = async (mode: "light" | "dark", width: number) => {
           await page.setViewportSize({ width, height: 900 });
           await page.evaluate((themeMode) => {
             document.documentElement.dataset.themeMode = themeMode;
             document.documentElement.style.colorScheme = themeMode;
           }, mode);
-          if (artifactDir) {
-            await screenshot(`waiting-${mode}-${width}.png`, [
-              activityRow,
-              turnTimer,
-              activePane.locator(".agent-chat__composer-combobox"),
-            ]);
-            const rightInset = await turnTimer.evaluate((element) => {
-              const column = element.closest(".chat-group-messages");
-              if (!column) {
-                throw new Error("Missing assistant message column");
-              }
-              return Math.abs(
-                column.getBoundingClientRect().right - element.getBoundingClientRect().right,
-              );
-            });
-            expect(rightInset).toBeLessThanOrEqual(1);
-          }
+          await expect
+            .poll(() =>
+              turnTimer.evaluate((element) => {
+                const column = element.closest(".chat-group-messages");
+                if (!column) {
+                  throw new Error("Missing assistant message column");
+                }
+                return Math.abs(
+                  column.getBoundingClientRect().right - element.getBoundingClientRect().right,
+                );
+              }),
+            )
+            .toBeLessThanOrEqual(1);
         };
         const childLink = activityRow.getByRole("button");
         await childLink.waitFor();
@@ -535,9 +497,9 @@ suite.define(() => {
         await observeChild(2, 63_001, "Running backend regression tests");
         await activityRow.getByText("Running backend regression tests", { exact: true }).waitFor();
         expect(await activePane.locator(".chat-notice").count()).toBe(0);
-        await captureWaiting("light", 1280);
-        await captureWaiting("dark", 1280);
-        await captureWaiting("dark", 390);
+        await checkWaitingLayout("light", 1280);
+        await checkWaitingLayout("dark", 1280);
+        await checkWaitingLayout("dark", 390);
         expect(
           await activityRow.evaluate((element) => element.scrollWidth <= element.clientWidth),
         ).toBe(true);
@@ -680,10 +642,6 @@ suite.define(() => {
         });
         await indicator.waitFor();
         expect(await indicator.textContent()).not.toContain("Waiting on");
-        await screenshot("resumed-dark-1280.png", [
-          indicator,
-          activePane.locator(".agent-chat__composer-combobox"),
-        ]);
         // Still one assistant row once it answers, on the same clock, and both
         // runs' tokens count on its line.
         await block.getByText(answerText, { exact: true }).waitFor();
