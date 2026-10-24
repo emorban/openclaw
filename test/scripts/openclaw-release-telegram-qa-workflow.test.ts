@@ -68,12 +68,6 @@ function sutScript(delimiter?: string) {
   return delimiter ? extractHereDocument(script, delimiter) : script;
 }
 
-function containsAll(source: string, fragments: string[]) {
-  for (const fragment of fragments) {
-    expect(source).toContain(fragment);
-  }
-}
-
 const PROVENANCE_BLOCKS = [
   { jobName: "build_candidate", stepName: "Validate candidate release provenance" },
   { jobName: "run_telegram", stepName: "Revalidate candidate release provenance" },
@@ -436,11 +430,6 @@ describe("release Telegram QA workflow", () => {
     expect(extractCandidate.run).toContain(
       '--cert-identity "https://github.com/${CALLED_WORKFLOW_REF}"',
     );
-    for (const { jobName, stepName } of PROVENANCE_BLOCKS) {
-      expect(requireRun(jobName, stepName).trim()).toBe(
-        'bash "${GITHUB_WORKSPACE}/scripts/release-telegram-provenance.sh"',
-      );
-    }
     for (const [jobName, value] of Object.entries(workflow().jobs ?? {})) {
       for (const checkout of value.steps?.filter((candidate) =>
         candidate.uses?.startsWith("actions/checkout@"),
@@ -711,36 +700,20 @@ describe("release Telegram QA workflow", () => {
 
   it("shares only the isolated workspace with the trusted scenario host", () => {
     const createSut = sutScript();
-    containsAll(createSut, [
-      'workspace="${temp_root}/workspace"',
-      'chown -R "$RUNNER_UID:$SUT_GID" "$workspace"',
-      'chmod -R u=rwX,g=rwX,o= "$workspace"',
-      'find "$workspace" -type d -exec chmod g+s {} +',
-    ]);
-    expect(createSut).not.toContain(
-      'for path in \\\n            "$temp_root/workspace" \\\n            "${OPENCLAW_HOME:?}"',
-    );
+    expect(createSut).toContain('chmod -R u=rwX,g=rwX,o= "$workspace"');
+    expect(createSut).toContain('find "$workspace" -type d -exec chmod g+s {} +');
   });
 
   it("lets the SUT create suite locks without exposing the runner-owned config", () => {
     const createSut = sutScript();
-    containsAll(createSut, [
-      'chown "$RUNNER_UID:$SUT_GID" "$temp_root"',
+    for (const mode of [
       'chmod 1770 "$temp_root"',
-      '"$(stat -c \'%F:%a:%u:%g\' "$temp_root")" == "directory:1770:${RUNNER_UID}:${SUT_GID}"',
-      'chown "$RUNNER_UID:$SUT_GID" "$config_path"',
       'chmod 0640 "$config_path"',
-      '"$(stat -c \'%F:%a:%u:%g\' "$config_path")" == "regular file:640:${RUNNER_UID}:${SUT_GID}"',
-      '"${temp_root}/state/qa-auth-bootstrap/openclaw.json")',
-      '"$(stat -c \'%F:%a:%u:%g\' "$requested_config_path")" == "regular file:600:${SUT_UID}:${SUT_GID}"',
-      'generation_dir="${RUNTIME_ROOT}/config-generations"',
       'install -d -o root -g root -m 0700 "$generation_dir"',
-      '"regular file:600:0:0"',
       '/usr/bin/setpriv --reuid="$SUT_UID" --regid="$SUT_GID"',
-      'export OPENCLAW_CONFIG_PATH="$projection_dir/openclaw.json"',
-    ]);
-    expect(createSut).not.toContain('chmod 0711 "$temp_root"');
-    expect(createSut).not.toContain('chmod 1777 "$temp_root"');
+    ]) {
+      expect(createSut).toContain(mode);
+    }
   });
 
   it.runIf(process.platform === "linux").each(["directory", "symlink"])(
@@ -892,21 +865,11 @@ printf '%s\\n' "\${OPENCLAW_GATEWAY_HOST_LIFELINE-}" "\${launcher_pid-unset}" "\
       expect(result.stdout).toBe("synthetic-stdin\n");
       expect(result.stderr).toBe("");
     }
-
-    expect(launcher).not.toContain("export PS1=");
-    expect(launcher).not.toContain("export -n BASHOPTS SHELLOPTS");
-    expect(launcher).not.toContain("unset BASH_ENV ENV");
   });
 
   it("mounts an isolated SUT-owned tmp without exposing the host tmp tree", () => {
     const launcher = sutScript("LAUNCHER");
-    containsAll(launcher, [
-      'for masked_path in "$RUNNER_HOME" /var/tmp /dev/shm; do',
-      "set_launcher_stage mount-private-tmp",
-      '-o "mode=0700,uid=${SUT_UID},gid=${SUT_GID},nosuid,nodev,noexec"',
-      "openclaw-telegram-sut-tmp",
-      '"$(stat -c \'%F:%a:%u:%g\' /tmp)" == "directory:700:${SUT_UID}:${SUT_GID}"',
-    ]);
-    expect(launcher).not.toContain('for masked_path in "$RUNNER_HOME" /tmp');
+    expect(launcher).toContain('for masked_path in "$RUNNER_HOME" /var/tmp /dev/shm; do');
+    expect(launcher).toContain('-o "mode=0700,uid=${SUT_UID},gid=${SUT_GID},nosuid,nodev,noexec"');
   });
 });

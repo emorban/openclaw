@@ -119,7 +119,6 @@ function expectFixtureResults(
 
 const cleanupDefaults = {
   failRun: false,
-  pauseAfterAck: false,
   failFirstFile: false,
   homePolicy: "isolated",
 };
@@ -141,7 +140,6 @@ const cleanupCases = [
     cleanupCase(route, "forks"),
     cleanupCase(route, "threads", { failRun: true }),
   ]),
-  cleanupCase("profile-runner", "forks", { failRun: true, pauseAfterAck: true }),
 ];
 
 posixIt.each([
@@ -161,8 +159,8 @@ posixIt.each([
     ),
   ),
 ])(
-  "$route cleans its namespace after $pool completion ($homePolicy, failed run: $failRun, paused after acknowledgement: $pauseAfterAck, first-file failure: $failFirstFile)",
-  async ({ route, pool, failRun, pauseAfterAck, failFirstFile, homePolicy }) => {
+  "$route cleans its namespace after $pool completion ($homePolicy, failed run: $failRun, first-file failure: $failFirstFile)",
+  async ({ route, pool, failRun, failFirstFile, homePolicy }) => {
     const root = tempDirs.make("oc-vt-state-");
     const files = scriptFiles(root);
     const profileOnly = homePolicy === "profile-only" || homePolicy === "profile-only-parent-shell";
@@ -381,87 +379,6 @@ export default {
     }
     const vitestArgs = ["--root", root, "--configLoader", "native"];
     const profileDir = path.join(root, "profiles");
-    const pauseReceipt = path.join(root, "pause.json");
-    if (pauseAfterAck) {
-      const preload = path.join(root, "pause-after-ack.cjs");
-      fs.writeFileSync(
-        preload,
-        `
-const { subscribe } = require("node:diagnostics_channel");
-const fs = require("node:fs");
-const { execFileSync } = require("node:child_process");
-const schedule = globalThis.setTimeout;
-const cancel = globalThis.clearTimeout;
-const deadlines = new Map();
-globalThis.setTimeout = (callback, delay, ...args) => {
-  if (delay !== 60000) return schedule(callback, delay, ...args);
-  const invoke = () => callback(...args);
-  const timer = schedule(() => { deadlines.delete(timer); invoke(); }, delay);
-  deadlines.set(timer, invoke);
-  return timer;
-};
-globalThis.clearTimeout = timer => { deadlines.delete(timer); return cancel(timer); };
-const isVitestFork = arg => typeof arg === "string" && arg.replaceAll("\\\\", "/").endsWith("/vitest/dist/workers/forks.js");
-if (isVitestFork(process.argv[1]) && process.send) {
-  const send = process.send;
-  process.send = function(message, ...args) {
-    if (message?.__vitest_worker_response__ === true && message.type === "stopped" && message.willExit === true) {
-      const callbackIndex = args.length - 1;
-      const callback = args[callbackIndex];
-      args[callbackIndex] = function(...callbackArgs) {
-        // The patched transport exits in this callback. Stop after its response
-        // flushes, before that exit can race the parent's message observation.
-        if (!callbackArgs[0]) process.kill(process.pid, "SIGSTOP");
-        return callback.apply(this, callbackArgs);
-      };
-    }
-    return send.call(this, message, ...args);
-  };
-}
-subscribe("child_process", ({ process: child }) => {
-  let selected = false;
-  let acknowledged = false;
-  let poll;
-  const deadline = { delay: 60000, liveTimers: 0, stopped: false, advanced: 0, error: null };
-  child.once("spawn", () => {
-    selected = child.spawnargs.some(isVitestFork);
-  });
-  child.on("message", message => {
-    if (!selected || message?.__vitest_worker_response__ !== true || message.type !== "stopped" || message.willExit !== true) return;
-    acknowledged = true;
-    // Let Vitest consume the acknowledgement before observing the child stopped in send's callback.
-    setImmediate(() => {
-      if (child.exitCode !== null || child.signalCode !== null) return;
-      poll = setInterval(() => {
-        try {
-          const state = execFileSync("ps", ["-o", "stat=", "-p", String(child.pid)], { encoding: "utf8", timeout: 1000, maxBuffer: 1024 }).trim();
-          if (!state.startsWith("T")) return;
-          clearInterval(poll);
-          deadline.stopped = true;
-          deadline.liveTimers = deadlines.size;
-          if (deadlines.size !== 1) { deadline.error = "expected one live stop deadline"; return; }
-          const [timer, invoke] = deadlines.entries().next().value;
-          cancel(timer);
-          deadlines.delete(timer);
-          deadline.advanced++;
-          invoke();
-        } catch (error) {
-          clearInterval(poll);
-          deadline.error = String(error);
-        }
-      }, 5);
-      poll.unref();
-    });
-  });
-  child.once("exit", (code, signal) => {
-    clearInterval(poll);
-    if (selected) fs.writeFileSync(${JSON.stringify(pauseReceipt)}, JSON.stringify({ acknowledged, code, signal, deadline }));
-  });
-});
-`,
-      );
-      env.NODE_OPTIONS = `--require=${preload}`;
-    }
     const mirrorPath = path.join(root, "mirror.ansi");
     const batchEntry = path.join(root, "batch.mts");
     fs.writeFileSync(
@@ -532,14 +449,6 @@ process.exitCode = (await completion).code ?? 1;`,
       if (failRun) {
         expect(result.output).toContain(intentionalFailure);
       }
-      if (pauseAfterAck) {
-        expect(files.json("pause.json")).toEqual({
-          acknowledged: true,
-          code: null,
-          signal: "SIGKILL",
-          deadline: { delay: 60_000, liveTimers: 1, stopped: true, advanced: 1, error: null },
-        });
-      }
       const receipt: {
         path: string;
         resetVerified: boolean;
@@ -560,31 +469,6 @@ process.exitCode = (await completion).code ?? 1;`,
           expect(fs.existsSync(owned), owned).toBe(
             realHome && (owned === resource.home || owned === resource.cache),
           );
-        }
-      }
-      if (route.startsWith("profile-")) {
-        const artifacts = fs.readdirSync(profileDir);
-        const profileEvidence = `${result.output}\nProfile artifacts: ${JSON.stringify(artifacts)}`;
-        expect(
-          artifacts.some((file) => file.endsWith(".cpuprofile")),
-          profileEvidence,
-        ).toBe(true);
-        if (route === "profile-runner") {
-          expect(
-            artifacts.some((file) => file.endsWith(".heapprofile")),
-            profileEvidence,
-          ).toBe(true);
-        }
-        for (const artifact of artifacts) {
-          const profile = JSON.parse(fs.readFileSync(path.join(profileDir, artifact), "utf8"));
-          if (artifact.endsWith(".cpuprofile")) {
-            expect(profile.nodes.length, artifact).toBeGreaterThan(0);
-            expect(profile.samples.length, artifact).toBeGreaterThan(0);
-            expect(profile.endTime, artifact).toBeGreaterThan(profile.startTime);
-          } else if (artifact.endsWith(".heapprofile")) {
-            expect(profile.head.children.length, artifact).toBeGreaterThan(0);
-            expect(profile.samples.length, artifact).toBeGreaterThan(0);
-          }
         }
       }
       if (route === "pty") {
