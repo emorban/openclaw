@@ -65,6 +65,29 @@ function countTestLines(root: string, staged: boolean) {
   return total;
 }
 
+function countTestLineDelta(root: string, base: string, staged: boolean) {
+  const entries = execFileSync(
+    "git",
+    ["diff", "--numstat", "-z", ...(staged ? ["--cached"] : []), base, "--", ...PATTERNS],
+    { cwd: root, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 },
+  )
+    .split("\0")
+    .filter(Boolean);
+  let delta = 0;
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]!;
+    const [added, removed] = entry.split("\t", 2);
+    if (added !== "-") {
+      delta += Number(added) - Number(removed);
+    }
+    // NUL-delimited rename records carry the old and new paths separately.
+    if (entry === `${added}\t${removed}\t`) {
+      index += 2;
+    }
+  }
+  return delta;
+}
+
 export function main(root = process.cwd(), argv = process.argv.slice(2)) {
   try {
     const args = parseRatchetArgs(argv);
@@ -87,10 +110,15 @@ export function main(root = process.cwd(), argv = process.argv.slice(2)) {
       );
     }
     const total = countTestLines(root, args.staged);
+    const delta = base ? countTestLineDelta(root, base, args.staged) : null;
     if (total > ceiling) {
+      const details = `Test lines: ${total}; ceiling: ${ceiling}; over by: ${total - ceiling}; net delta: ${delta !== null && delta > 0 ? "+" : ""}${delta ?? "unavailable"}.`;
+      if (!args.prune && delta !== null && delta <= 0) {
+        console.log(`${details} Tree is over the ceiling; this change does not add test lines.`);
+        return 0;
+      }
       console.error(
-        `Test lines: ${total}; ceiling: ${ceiling}; delta: +${total - ceiling}.\n` +
-          "Delete or consolidate an equal number of test lines elsewhere, or justify raising the ceiling in the PR.",
+        `${details}\nOffset the added lines by deleting or consolidating tests elsewhere, or raise the ceiling in ${BASELINE} with justification in the PR.`,
       );
       return 1;
     }
