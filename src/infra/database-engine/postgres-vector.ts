@@ -65,9 +65,12 @@ export function bindPostgresVector(
         /* kysely-allow-raw: The binary column belongs to the admitted projection. */ sql.ref(
           `${request.index.alias}.embedding_bits`,
         );
+      const eligible = binaryPrefilter
+        ? /* kysely-allow-raw: The stored sketch is null exactly when cosine is ineligible. */ sql<boolean>`${bits} IS NOT NULL`
+        : /* kysely-allow-raw: Historical projections compute eligibility from the vector. */ sql<boolean>`${sql.raw(extension)}.vector_norm(${stored}) > 0`;
       const candidates = binaryPrefilter
         ? request.candidates?.({
-            match: /* kysely-allow-raw: The generated sketch is null only for zero vectors. */ sql<boolean>`${bits} IS NOT NULL`,
+            match: eligible,
             distance: /* kysely-allow-raw: Hamming preselection uses the admitted sketch and extension. */ sql<number>`${bits} ${sql.raw(`OPERATOR(${extension}.<~>)`)} ${sql.raw(extension)}.binary_quantize(${vector}::${sql.raw(extension)}.vector)`,
             limit: request.limit * 8,
           })
@@ -75,7 +78,7 @@ export function bindPostgresVector(
       const query = request.query({
         match: candidates
           ? /* kysely-allow-raw: Only scoped, eligible prefilter IDs reach exact cosine reranking. */ sql<boolean>`${sql.ref(`${request.index.alias}.id`)} IN (SELECT id FROM openclaw_vector_candidates)`
-          : /* kysely-allow-raw: Zero vectors have no cosine direction and are ineligible. */ sql<boolean>`${sql.raw(extension)}.vector_norm(${stored}) > 0`,
+          : eligible,
         distance,
       });
       // Materialize IDs only: the cheap scan must not fetch every float32 payload.

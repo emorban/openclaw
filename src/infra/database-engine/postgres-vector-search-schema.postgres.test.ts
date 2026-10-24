@@ -1,5 +1,6 @@
 import path from "node:path";
 import { getEnvironmentData } from "node:worker_threads";
+import { sql } from "kysely";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { AGENT_VECTOR_SEARCH_POSTGRES_SQL } from "../../state/openclaw-agent-vector-search-migration.js";
@@ -59,35 +60,51 @@ const embedding = (dim: number, value: number) => {
 };
 
 describe.skipIf(!connection)("PostgreSQL binary vector schema", () => {
-  it("migrates existing optional projections, preserves historical admission and maintains zero eligibility", () => {
-    withEngineStoreAdmission(() => {
-      using anchor = openNodeSqliteDatabase(
-        path.join(dirs.make("pg-vector-search-"), "anchor.sqlite"),
-      );
-      const opened: PostgresSyncConnection[] = [];
-      const open = (schema: StoreSchema, existingVersion = false) => {
-        const db = openEngineStore({
-          anchor,
-          schema,
-          existingVersion,
-          input: { connection: connection!, schemaPrefix: "binary_vector_test" },
-          openSqlite() {
+  it("migrates existing optional projections, preserves historical admission and maintains zero eligibility", async () => {
+    const pending: Array<Promise<{ rows: { id: string }[] }>> = [];
+    let finish: (() => void) | undefined;
+    let close: (() => void) | undefined;
+    try {
+      withEngineStoreAdmission(() => {
+        const anchor = openNodeSqliteDatabase(
+          path.join(dirs.make("pg-vector-search-"), "anchor.sqlite"),
+        );
+        const opened: PostgresSyncConnection[] = [];
+        close = () => {
+          try {
+            const original = opened[0];
+            if (original) {
+              original.exec(`DROP SCHEMA "${original.schema}" CASCADE`);
+            }
+          } finally {
+            for (const db of opened) {
+              db.close();
+            }
+            anchor.close();
+          }
+        };
+        const open = (schema: StoreSchema, existingVersion = false) => {
+          const db = openEngineStore({
+            anchor,
+            schema,
+            existingVersion,
+            input: { connection: connection!, schemaPrefix: "binary_vector_test" },
+            openSqlite() {
+              throw new Error("Expected PostgreSQL");
+            },
+            prepareAnchor() {},
+            inspectSqlite() {
+              admitSqliteSchema(anchor);
+              return { hasExistingData: false, hasEngineAnchor: Boolean(readEngineAnchor(anchor)) };
+            },
+          });
+          if (!(db instanceof PostgresSyncConnection)) {
             throw new Error("Expected PostgreSQL");
-          },
-          prepareAnchor() {},
-          inspectSqlite() {
-            admitSqliteSchema(anchor);
-            return { hasExistingData: false, hasEngineAnchor: Boolean(readEngineAnchor(anchor)) };
-          },
-        });
-        if (!(db instanceof PostgresSyncConnection)) {
-          throw new Error("Expected PostgreSQL");
-        }
-        opened.push(db);
-        return db;
-      };
-      const original = open(source);
-      try {
+          }
+          opened.push(db);
+          return db;
+        };
+        const original = open(source);
         original.runTransaction(() => {
           for (const dim of dimensions) {
             admitStoreSearch(original, vectorSchema(dim), { extension: `vectors-${dim}` });
@@ -102,14 +119,37 @@ describe.skipIf(!connection)("PostgreSQL binary vector schema", () => {
             }
           }
         });
+        // Override only the migration's catalog input; installed extensions and admission stay real.
+        expect(() =>
+          open({
+            ...destination,
+            postgresMigrations: destination.postgresMigrations!.map((migration) =>
+              Object.assign({}, migration, {
+                sql: migration.sql.replace("regexp_match(extversion,", "regexp_match('0.6.2',"),
+              }),
+            ),
+          }),
+        ).toThrow(
+          "PostgreSQL binary vector search requires pgvector 0.7 or newer. Upgrade the server extension package, then have a database administrator run ALTER EXTENSION vector UPDATE before reopening the store.",
+        );
+        expect(original.prepare("SELECT version FROM openclaw_schema_meta").get()?.version).toBe(
+          32,
+        );
+        expect(
+          original
+            .prepare(
+              "SELECT count(*) AS count FROM information_schema.columns WHERE table_schema = ? AND column_name = 'embedding_bits'",
+            )
+            .get(original.schema)?.count,
+        ).toBe(0);
         publishSqliteDatabaseSchemaChange(anchor);
         // oxlint-disable-next-line typescript/unbound-method -- Forwarded below with the intercepted connection as receiver.
         const prepare = PostgresSyncConnection.prototype.prepare;
         const oldVector = vi
           .spyOn(PostgresSyncConnection.prototype, "prepare")
-          .mockImplementation(function (this: PostgresSyncConnection, sql) {
-            const statement = prepare.call(this, sql);
-            if (sql.includes("pg_catalog.pg_available_extensions")) {
+          .mockImplementation(function (this: PostgresSyncConnection, statementSql) {
+            const statement = prepare.call(this, statementSql);
+            if (statementSql.includes("pg_catalog.pg_available_extensions")) {
               const all = statement.all.bind(statement);
               vi.spyOn(statement, "all").mockImplementation((...values) =>
                 all(...values).map((row) =>
@@ -183,18 +223,50 @@ describe.skipIf(!connection)("PostgreSQL binary vector schema", () => {
           migrated.prepare("SELECT bit_length(embedding_bits) AS dimensions FROM vectors_17").get()
             ?.dimensions,
         ).toBe(17);
-        migrated.runTransaction(() => {
-          migrated.exec("ALTER TABLE vectors_3 ALTER COLUMN embedding_bits DROP EXPRESSION");
-        });
-        publishSqliteDatabaseSchemaChange(anchor);
-        expect(() => open(destination)).toThrow("schema drift");
-      } finally {
-        original.exec(`DROP SCHEMA "${original.schema}" CASCADE`);
-        for (const db of opened) {
-          db.close();
+        for (const dim of dimensions) {
+          const search = admitStoreSearch(migrated, vectorSchema(dim));
+          const query = Array<number>(dim).fill(0);
+          query[0] = -1;
+          const table = sql.table(`vectors_${dim}`);
+          pending.push(
+            search.vector!.nearest<{ id: string }>({
+              index: search.vectors.notes!,
+              vector: query,
+              limit: 3,
+              scopeCount: sql`SELECT count(*) FROM ${table}`,
+              isRow: (value): value is { id: string } =>
+                typeof value === "object" &&
+                value !== null &&
+                "id" in value &&
+                typeof value.id === "string",
+              candidates: ({ match, distance, limit }) =>
+                sql`SELECT v.id FROM ${table} AS v WHERE ${match} ORDER BY ${distance}, v.id LIMIT ${limit}`,
+              query: ({ match, distance }) =>
+                sql`SELECT v.id FROM ${table} AS v WHERE ${match} ORDER BY ${distance}, v.id LIMIT 3`,
+            }),
+          );
         }
+        finish = () => {
+          migrated.runTransaction(() => {
+            migrated.exec("ALTER TABLE vectors_3 ALTER COLUMN embedding_bits DROP EXPRESSION");
+          });
+          publishSqliteDatabaseSchemaChange(anchor);
+          expect(() => open(destination)).toThrow("schema drift");
+        };
+      });
+      for (const result of await Promise.allSettled(pending)) {
+        if (result.status === "rejected") {
+          throw result.reason;
+        }
+        expect(result.value.rows).toEqual([{ id: "negative" }, { id: "positive" }, { id: "zero" }]);
       }
-    });
+      withEngineStoreAdmission(() => finish!());
+    } finally {
+      await Promise.allSettled(pending);
+      if (close) {
+        withEngineStoreAdmission(close);
+      }
+    }
   });
 
   it("migrates stores without optional vectors without creating vector projections", () => {
