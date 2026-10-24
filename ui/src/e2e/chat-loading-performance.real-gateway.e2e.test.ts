@@ -25,7 +25,6 @@ const selectedKey = "agent:main:loading-proof-12345678-0000-4000-8000-0000000000
 const homeKey = "agent:main:main";
 const transcriptLength = 900;
 const viewport = { width: 1440, height: 900 };
-const captureUiProof = process.env.OPENCLAW_CAPTURE_UI_PROOF === "1";
 let instance: OpenClawTestInstance | undefined;
 let config: OpenClawConfig;
 let originalAvatarBytes = 0;
@@ -63,8 +62,6 @@ const selectRpc = (metrics: readonly RpcMetric[], method: string, sessionKey?: s
     (metric) =>
       metric.method === method && (sessionKey === undefined || metric.sessionKey === sessionKey),
   );
-const writeEvidence = (name: string, evidence: unknown) =>
-  writeFile(path.join(suite.artifactDir, `${name}.json`), JSON.stringify(evidence, null, 2));
 const redactFixtureTokens = (text: string, owner: OpenClawTestInstance) =>
   [owner.gatewayToken, owner.hookToken].reduce(
     (redacted, token) => redacted.replaceAll(token, "[redacted fixture token]"),
@@ -275,7 +272,6 @@ suite.define(() => {
     const handoff = await cliJson(["dashboard", "--json"]);
     const url = new URL("/chat/main/12345678", suite.server.baseUrl);
     url.hash = new URL(String(handoff.browserUrl)).hash;
-    const artifactDir = suite.artifactDir;
     const rpc: RpcMetric[] = [];
     const olderHistoryRequests = (metrics: readonly RpcMetric[]) =>
       selectRpc(metrics, "chat.history", selectedKey).filter((metric) => (metric.offset ?? 0) > 0);
@@ -286,14 +282,8 @@ suite.define(() => {
         viewport,
         serviceWorkers: "block",
         locale: "en-US",
-        ...(captureUiProof ? { recordVideo: { dir: artifactDir, size: viewport } } : {}),
       },
       async ({ page, context }) => {
-        const capture = async (name: string) => {
-          if (captureUiProof) {
-            await page.screenshot({ path: path.join(artifactDir, name + ".png") });
-          }
-        };
         await page.addInitScript(() => {
           // Measure short-link resolution, not cached-roster route recovery. Keep
           // restored Home preferences; clear identity admission in each new document
@@ -342,7 +332,6 @@ suite.define(() => {
           await pane.evaluate(async (element) => {
             await (element as LoadingPane).updateComplete;
           });
-          return Date.now() - startedAt;
         };
         page.on("websocket", (socket) => {
           socket.on("framesent", ({ payload }) => {
@@ -428,47 +417,27 @@ suite.define(() => {
             ? waitForStartupCommit(homeKey, home.locator("openclaw-chat-pane"), requestStart)
             : Promise.resolve(null);
           await waitForTail();
-          const selectedVisibleMs = Date.now() - startedAt;
           await composer.waitFor();
-          const composerVisibleMs = Date.now() - startedAt;
           if (homeOpen) {
             await waitForHome();
           }
-          const homeVisibleMs = homeOpen ? Date.now() - startedAt : null;
-          const [selectedAuthoritativeMs, homeAuthoritativeMs] = await Promise.all([
-            selectedCommitted,
-            homeCommitted,
-          ]);
-          return {
-            selectedVisibleMs,
-            composerVisibleMs,
-            homeVisibleMs,
-            selectedAuthoritativeMs,
-            homeAuthoritativeMs,
-          };
+          await Promise.all([selectedCommitted, homeCommitted]);
         };
         await waitForTail();
         await composer.waitFor();
         await page.locator(".sidebar-footer-bar__home").click();
         await waitForHome();
-        await capture("01-restored-home-fixture");
 
         startedAt = Date.now();
         measuring = true;
         await page.reload();
         await waitForControlUiGatewayReady(page);
-        const desktopTiming = await measureLoad(true);
-        const entryScripts = await page
-          .locator("script[src]")
-          .evaluateAll((elements) =>
-            elements.map((element) => new URL((element as HTMLScriptElement).src).pathname),
-          );
+        await measureLoad(true);
         await page.waitForFunction(() =>
           [...document.querySelectorAll<HTMLImageElement>(".sidebar-agent-card__avatar img")].some(
             (image) => image.complete && image.naturalWidth > 0,
           ),
         );
-        await capture("02-selected-and-home-ready");
         // Transcript and roster avatars can render before the dedicated identity reply.
         // Freeze only completed payloads; keep the earlier visibility timings unchanged.
         await waitForStartupResponses();
@@ -481,23 +450,17 @@ suite.define(() => {
               return { width: image.naturalWidth, height: image.naturalHeight };
             }),
           );
-        const { resources, avatarUrl } = await page.evaluate(() => {
+        const { avatarRequests, avatarUrl } = await page.evaluate(() => {
           const entries = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
           return {
-            resources: entries.map((resource) => ({
-              path: new URL(resource.name).pathname,
-              duration: resource.duration,
-              transferSize: resource.transferSize,
-              decodedBodySize: resource.decodedBodySize,
-            })),
+            avatarRequests: entries.filter(
+              (entry) => new URL(entry.name).pathname === "/avatar/main",
+            ).length,
             avatarUrl: entries
               .filter((entry) => new URL(entry.name).pathname === "/avatar/main")
               .toSorted((left, right) => right.decodedBodySize - left.decodedBodySize)[0]?.name,
           };
         });
-        const avatarResource = resources
-          .filter((resource) => resource.path === "/avatar/main")
-          .toSorted((left, right) => right.decodedBodySize - left.decodedBodySize)[0];
         if (!avatarUrl) {
           throw new Error("Browser never requested the configured avatar route");
         }
@@ -532,7 +495,6 @@ suite.define(() => {
             .toEqual({ loadingOlder: false, historyIntentConsumed: false });
         await thread.hover();
         await installHistoryPaginationProbe(selectedPane, transcriptLength, selectedKey);
-        const paginationStartedAt = Date.now();
         let loadedMessages = await loadedMessageCount();
         const initialLoadedMessages = loadedMessages;
         let olderPageCommits = 0;
@@ -559,18 +521,14 @@ suite.define(() => {
           .poll(() => olderHistoryRequests(rpc).some((metric) => metric.receivedMs !== undefined))
           .toBe(true);
         expect(loadedMessages).toBe(transcriptLength);
-        const paginationLoadedMs = Date.now() - paginationStartedAt;
-        await selectedPane.evaluate(async (element) => {
-          await (element as LoadingPane).updateComplete;
-          await new Promise<void>((resolve) => {
-            requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-          });
-        });
-        const paginationRenderedMs = Date.now() - paginationStartedAt;
-        const browserPagination = await page.evaluate(async () => {
+        const pagination = await page.evaluate(async () => {
           await window.historyPaginationProbe.done;
           return window.historyPaginationProbe.result();
         });
+        await writeFile(
+          path.join(suite.artifactDir, "pagination.json"),
+          JSON.stringify(pagination),
+        );
         expect(
           await selectedPane.evaluate((element) =>
             (element as LoadingPane).state.chatMessages.map((message) =>
@@ -588,10 +546,9 @@ suite.define(() => {
             hasText: "Synthetic loading proof message 1.",
           })
           .waitFor();
-        await capture("03-older-history-loaded");
         const paginationMetrics = structuredClone(rpc.slice(startupMetrics.length));
         const olderPages = olderHistoryRequests(paginationMetrics);
-        const captureNarrowReload = async (stage: string, homeOpen: boolean) => {
+        const reloadNarrow = async (homeOpen: boolean) => {
           await page.setViewportSize({ width: 1050, height: 900 });
           const requestStart = rpc.length;
           pending.clear();
@@ -599,44 +556,19 @@ suite.define(() => {
           // Keep the same short-link input even if navigation canonicalized the prior URL.
           await page.goto(`${url.origin}${url.pathname}`);
           await waitForControlUiGatewayReady(page);
-          const timing = await measureLoad(homeOpen, requestStart);
-          await capture(stage);
+          await measureLoad(homeOpen, requestStart);
           await waitForStartupResponses(requestStart);
           return {
-            width: 1050,
-            homeOpen,
-            ...timing,
             startup: structuredClone(rpc.slice(requestStart)),
           };
         };
-        const narrowHomeOpen = await captureNarrowReload("04-narrow-home-restored", true);
+        const narrowHomeOpen = await reloadNarrow(true);
         await page
           .locator("openclaw-assistant-panel")
           .getByRole("button", { name: "Close assistant sidebar", exact: true })
           .click();
-        const narrowHomeClosed = await captureNarrowReload("05-narrow-home-closed", false);
+        const narrowHomeClosed = await reloadNarrow(false);
         measuring = false;
-        await writeEvidence("loading-evidence", {
-          fixture: { synthetic: true, originalAvatarBytes, transcriptLength },
-          entryScripts,
-          ...desktopTiming,
-          startup: startupMetrics,
-          pagination: paginationMetrics,
-          paginationLoadedMs,
-          paginationRenderedMs,
-          browserPagination,
-          initialLoadedMessages,
-          olderPageCommits,
-          olderPageMessageCounts,
-          narrowHomeOpen,
-          narrowHomeClosed,
-          images,
-          avatarResource,
-          cache,
-          resources,
-        });
-
-        // Save measurements before asserting budgets so failures retain their evidence.
         expect(olderPages).toHaveLength(olderPageCommits);
         expect(olderPages.length).toBeGreaterThan(1);
         expect(olderPages.map((metric) => metric.messages)).toEqual(olderPageMessageCounts);
@@ -696,8 +628,7 @@ suite.define(() => {
             .every((metric) => metric.inlineAvatar === false),
         ).toBe(true);
         expect(images.some((image) => image.width === 128 && image.height === 128)).toBe(true);
-        expect(avatarResource).toBeDefined();
-        expect(resources.filter((resource) => resource.path === "/avatar/main")).toHaveLength(1);
+        expect(avatarRequests).toBe(1);
         expect(cache).toMatchObject({ status: 200, revalidatedStatus: 304 });
         expect(cache.bytes).toBeLessThan(originalAvatarBytes / 10);
         expect(cache.control).toContain("immutable");

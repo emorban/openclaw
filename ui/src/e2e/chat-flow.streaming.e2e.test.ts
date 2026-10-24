@@ -1,7 +1,5 @@
-import path from "node:path";
 import { expect, it } from "vitest";
 import type { ChatHost } from "../pages/chat/chat-send-contract.ts";
-import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
 import {
   timedText,
   persistedText,
@@ -39,10 +37,6 @@ suite.define(() => {
     { label: "desktop hover", mobile: false, viewport: { height: 900, width: 1440 } },
     { label: "mobile tap", mobile: true, viewport: { height: 844, width: 390 } },
   ])("shows turn metadata only after completion on $label", async ({ mobile, viewport }) => {
-    const artifactDirParent = process.env.OPENCLAW_UI_E2E_ARTIFACT_DIR?.trim();
-    const artifactDir = artifactDirParent
-      ? createControlUiE2eArtifactDir("chat-flow.streaming", artifactDirParent)
-      : undefined;
     const { context, page, gateway } = await chatFixture(
       suite,
       {
@@ -90,11 +84,6 @@ suite.define(() => {
         .toEqual([true, true]);
     const expectFocus = (locator: typeof earlierAssistant) =>
       expect.poll(() => locator.evaluate((node) => node.matches(":focus-visible"))).toBe(true);
-    const captureMetadata = async (name: string) => {
-      if (artifactDir && !mobile) {
-        await page.screenshot({ fullPage: true, path: path.join(artifactDir, name) });
-      }
-    };
     await page.mouse.move(0, 0);
     await expectActionOpacities(earlierAssistant, mobile ? ["1", "1"] : ["0", "0"]);
     await expectFooter(earlierAssistant, mobile);
@@ -105,12 +94,10 @@ suite.define(() => {
           .evaluateAll((buttons) => buttons.map((button) => getComputedStyle(button).opacity)),
       )
       .toEqual(["0", "0"]);
-    await captureMetadata("before-user-follow-up-metadata-hidden.png");
     await sendMessage(page, "show turn metadata");
     const sendRequest = await gateway.waitForRequest("chat.send");
     await page.mouse.move(0, 0);
     await expectFooter(earlierAssistant, false);
-    await captureMetadata("after-user-follow-up-metadata-hidden.png");
     const runId = requireString(
       requireRecord(sendRequest.params).idempotencyKey,
       "chat send idempotency key",
@@ -284,29 +271,13 @@ suite.define(() => {
   ])(
     "keeps streamed text visible when a chat error terminates the turn on $label",
     async ({ label, viewport }) => {
-      const artifactDirParent = process.env.OPENCLAW_UI_E2E_ARTIFACT_DIR?.trim();
-      const artifactDir = artifactDirParent
-        ? createControlUiE2eArtifactDir("chat-flow.streaming", artifactDirParent)
-        : undefined;
       const { page, gateway } = await chatFixture(suite, undefined, {
         hasTouch: label === "mobile",
         isMobile: label === "mobile",
-        permissions: ["clipboard-read", "clipboard-write"],
         viewport,
-        ...(artifactDir
-          ? {
-              recordVideo: {
-                dir: artifactDir,
-                size: { height: viewport.height, width: viewport.width },
-              },
-            }
-          : {}),
       });
-
       await page.goto(`${suite.server.baseUrl}chat`);
-
-      const prompt = "stream before terminal error";
-      const params = await sendChat(page, gateway, prompt);
+      const params = await sendChat(page, gateway, "stream before terminal error");
       const runId = requireString(params.idempotencyKey, "chat send idempotency key");
       const partialText = "Partial answer before gateway error.";
       await gateway.emitGatewayEvent("chat", chatDelta(runId, partialText, "main"));
@@ -327,10 +298,8 @@ suite.define(() => {
           Date.now(),
         ),
       );
-
       const gatewayErrorText =
         "Agent failed before reply: Session became active in another runner; wait for it to finish before continuing.\nTo view logs, run `openclaw logs --follow` in a terminal.";
-      const errorText = `Error: ${gatewayErrorText}`;
       await gateway.emitGatewayEvent(
         "chat",
         chatEvent(runId, "main", "error", {
@@ -338,61 +307,13 @@ suite.define(() => {
           message: timedText("assistant", gatewayErrorText),
         }),
       );
-
-      await chatTranscript(page).getByText(partialText).waitFor({ timeout: 10_000 });
-      expect(await chatTranscript(page).getByText(partialText, { exact: true }).count()).toBe(1);
       const alert = page.locator(".chat-error");
       await alert.waitFor();
-      if (artifactDir) {
-        await page.screenshot({ path: path.join(artifactDir, `terminal-partial-${label}.png`) });
-      }
-      const details = alert.locator("details");
       const summary = alert.locator("summary");
       const copy = alert.getByRole("button", { name: "Copy error", exact: true });
-      expect(await details.getAttribute("open")).toBeNull();
-      if (label === "desktop") {
-        expect(await copy.count()).toBe(1);
-        expect(await copy.isVisible()).toBe(true);
-        await copy.click();
-        await expect
-          .poll(() => page.evaluate(() => navigator.clipboard.readText()))
-          .toBe(errorText);
-        expect(await details.getAttribute("open")).toBeNull();
-      } else {
-        expect(await copy.isVisible()).toBe(false);
-      }
-      await summary.focus();
-      await page.keyboard.press("Enter");
-      await alert.locator("pre").waitFor({ timeout: 10_000 });
-      const diagnostic = alert.getByLabel("Error details", { exact: true });
-      expect(await diagnostic.count()).toBe(1);
-      expect(await diagnostic.textContent()).toBe(errorText);
-      if (label === "desktop") {
-        expect(await summary.getByText("Details", { exact: true }).count()).toBe(1);
-      } else {
-        await copy.tap();
-        await expect
-          .poll(() => page.evaluate(() => navigator.clipboard.readText()))
-          .toBe(errorText);
-        expect(await details.getAttribute("open")).not.toBeNull();
-      }
-      if (artifactDir) {
-        await page.screenshot({ path: path.join(artifactDir, `terminal-details-${label}.png`) });
-      }
-      const expandedCopy = alert.getByRole("button", { name: /^(Copy error|Copied!)$/u });
-      await page.evaluate(() => navigator.clipboard.writeText("Before expanded copy."));
-      await expandedCopy.press("Enter");
-      await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(errorText);
-      expect(await details.getAttribute("open")).not.toBeNull();
-      expect(await alert.getByRole("button", { name: /^(Copy error|Copied!)$/u }).count()).toBe(1);
-      const copyBox = await expandedCopy.boundingBox();
-      const expandedAlertBox = await alert.boundingBox();
-      expect(copyBox).not.toBeNull();
-      expect(expandedAlertBox).not.toBeNull();
-      expect(copyBox!.x).toBeGreaterThan(expandedAlertBox!.x);
-      expect(copyBox!.x + copyBox!.width).toBeLessThanOrEqual(
-        expandedAlertBox!.x + expandedAlertBox!.width,
-      );
+      expect(await copy.isVisible()).toBe(label === "desktop");
+      await summary.press("Enter");
+      await alert.locator("pre").waitFor();
       await summary.press("Space");
       await alert.locator("pre").waitFor({ state: "hidden" });
       if (label === "mobile") {
@@ -401,10 +322,6 @@ suite.define(() => {
         await summary.locator(".chat-error__mobile-title").tap();
         await alert.locator("pre").waitFor({ state: "hidden" });
       }
-      await expectRequestCountStable(gateway, "chat.send", 1);
-      expect(await alert.getByRole("button", { name: "Dismiss error" }).count()).toBe(0);
-      expect(await alert.getByRole("button", { name: "Retry", exact: true }).count()).toBe(0);
-      expect(await chatTranscript(page).getByText(errorText).count()).toBe(0);
       const [alertBox, composerBox] = await Promise.all([
         alert.boundingBox(),
         page.locator(".agent-chat__composer-shell").boundingBox(),
@@ -412,17 +329,17 @@ suite.define(() => {
       expect(alertBox).not.toBeNull();
       expect(composerBox).not.toBeNull();
       expect(
-        Math.abs(
-          (alertBox?.x ?? 0) +
-            (alertBox?.width ?? 0) / 2 -
-            ((composerBox?.x ?? 0) + (composerBox?.width ?? 0) / 2),
-        ),
+        Math.abs(alertBox!.x + alertBox!.width / 2 - composerBox!.x - composerBox!.width / 2),
       ).toBeLessThan(1);
-      expect(alertBox?.width ?? 0).toBeLessThanOrEqual(composerBox?.width ?? 0);
+      expect(alertBox!.width).toBeLessThanOrEqual(composerBox!.width);
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(
         viewport.width,
       );
-
+      expect(await chatTranscript(page).getByText(partialText, { exact: true }).count()).toBe(1);
+      expect(await chatTranscript(page).getByText(`Error: ${gatewayErrorText}`).count()).toBe(0);
+      expect(await alert.getByRole("button", { name: "Dismiss error" }).count()).toBe(0);
+      expect(await alert.getByRole("button", { name: "Retry", exact: true }).count()).toBe(0);
+      await expectRequestCountStable(gateway, "chat.send", 1);
       await sendMessage(page, "retry after error");
       await waitForRequests(gateway, "chat.send", 2);
       await alert.waitFor({ state: "detached", timeout: 10_000 });

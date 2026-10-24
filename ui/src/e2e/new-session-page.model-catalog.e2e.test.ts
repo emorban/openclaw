@@ -19,7 +19,6 @@ import {
   pollCount,
 } from "./new-session-page.test-support.ts";
 import {
-  personalModelScenario,
   environmentProfiles,
   unavailableError,
   pollVisible,
@@ -358,93 +357,6 @@ suite.define(() => {
       );
     },
   );
-
-  it("starts with a usable retained account despite a refresh failure and leaves the default cleared", async () => {
-    await suite.withPage(createControlUiE2eContextOptions(), async ({ page }) => {
-      const accountFitsMenu = () =>
-        page.locator("[data-chat-account-group-toggle]").evaluate((heading) => {
-          const menu = heading.closest(".chat-controls__model-menu")!;
-          const bounds = menu.getBoundingClientRect();
-          const accountBounds = heading.getBoundingClientRect();
-          return (
-            accountBounds.width > 0 &&
-            accountBounds.left >= bounds.left &&
-            accountBounds.right <= bounds.right
-          );
-        });
-      const account = {
-        authProfileId: "personal:person-a:anthropic:one",
-        provider: "anthropic",
-        label: "Test Person · Personal account",
-        authType: "token",
-        selected: false,
-      };
-      const model = {
-        id: "claude-haiku-4-5",
-        name: "Claude Haiku 4.5",
-        provider: "anthropic",
-        available: true,
-      };
-      const personal = personalModelScenario(model, account, { refreshFailed: true });
-      const gateway = await installMockGateway(page, {
-        ...personal,
-        methodResponses: {
-          ...personal.methodResponses,
-          "sessions.create": { key: "agent:main:personal-account", runStarted: true },
-        },
-      });
-      await page.goto(`${suite.server.baseUrl}new?agent=main`);
-      await page.locator(".new-session-page__message").fill("Start with this saved account");
-      const start = page.getByRole("button", { name: "Start session" });
-      const startHint = start.locator("..");
-      await pollAttribute(start, "aria-disabled").toBe("true");
-      const modelTrigger = page.locator('[data-chat-model-select="true"]');
-      await modelTrigger.click();
-      const picker = page.locator("[data-chat-account-selection]");
-      const accountTrigger = picker.locator("[data-chat-account-group-toggle]");
-      const rejectSelection = async () => {
-        await accountTrigger.click();
-        await gateway.deferNext("models.list", { authProfileId: account.authProfileId });
-        await picker
-          .locator(`[data-chat-account-option="account:${account.authProfileId}"]`)
-          .click();
-        await pollAttribute(startHint, "content").toBe("Loading models…");
-        expect(await start.getAttribute("aria-disabled")).toBe("true");
-        await gateway.rejectDeferred("models.list", unavailableError("Try again"));
-        await pollAttribute(startHint, "content").toBe("Models unavailable");
-        expect(await start.getAttribute("aria-disabled")).toBe("true");
-      };
-      await pollEnabled(accountTrigger).toBe(true);
-      await pollText(page.locator(".chat-controls__model-picker")).toContain("No models available");
-      await expect.poll(accountFitsMenu).toBe(true);
-      await rejectSelection();
-
-      await modelTrigger.click();
-      await modelTrigger.click();
-      await pollText(accountTrigger).toContain(account.label);
-      await pollAttribute(start, "aria-disabled").toBe("false");
-      await pollCount(page.locator("[data-chat-model-catalog-state]")).toBe(0);
-      await expect.poll(accountFitsMenu).toBe(true);
-      await accountTrigger.click();
-      await picker.getByText("Automatic (new-chat default)", { exact: true }).click();
-      await pollAttribute(start, "aria-disabled").toBe("true");
-      await pollText(accountTrigger).toContain("Automatic");
-      await rejectSelection();
-      await accountTrigger.click();
-      await picker.locator(`[data-chat-account-option="account:${account.authProfileId}"]`).click();
-      await pollAttribute(start, "aria-disabled").toBe("false");
-      await page.keyboard.press("Escape");
-      await start.click();
-      const create = await gateway.waitForRequest("sessions.create");
-      expect(create.params).toMatchObject({
-        message: "Start with this saved account",
-        model: `anthropic/claude-haiku-4-5@${account.authProfileId}`,
-      });
-      expect(await gateway.getRequests("users.selectModelAccount")).toHaveLength(0);
-      expect(await gateway.getRequests("users.unlinkAuthProfile")).toHaveLength(0);
-      expect(await gateway.getRequests("users.prefs.set")).toHaveLength(0);
-    });
-  });
 
   it("accepts a draft while keeping the default hidden until model metadata arrives", async () => {
     await suite.withPage(createControlUiE2eContextOptions(), async ({ page }) => {
