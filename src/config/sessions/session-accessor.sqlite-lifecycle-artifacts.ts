@@ -88,35 +88,53 @@ function sqliteTranscriptStateIsReclaimable(params: {
   return updatedAt === undefined || params.nowMs - updatedAt >= params.orphanTranscriptMinAgeMs;
 }
 
-function sqliteTranscriptStateHasMarker(params: {
+function readOrphanTranscriptMarkerSessionIds(params: {
   database: Pick<OpenClawAgentDatabase, "db">;
-  sessionId: string;
+  sessionIds: string[];
+  updatedBefore: number;
   transcriptContentMarker: string;
   diagnostics?: SqliteSessionArtifactPreparationDiagnostics;
-}): boolean {
-  const startedAt = params.diagnostics ? performance.now() : 0;
-  if (params.diagnostics) {
-    params.diagnostics.markerWindows = (params.diagnostics.markerWindows ?? 0) + 1;
+}): Set<string> {
+  const marked = new Set<string>();
+  if (params.sessionIds.length === 0) {
+    return marked;
   }
+  const startedAt = params.diagnostics ? performance.now() : 0;
   try {
     const db = getSessionKysely(params.database.db);
     const rows = iterateSqliteQuerySync(
       params.database.db,
       db
         .selectFrom("transcript_events")
-        .select(transcriptEventJsonSql(params.database.db).as("event_json"))
-        .where("session_id", "=", params.sessionId)
+        .select(["session_id", transcriptEventJsonSql(params.database.db).as("event_json")])
+        .where(
+          "session_id",
+          "in",
+          db
+            .selectFrom("transcript_events")
+            .select("session_id")
+            .where("session_id", "in", params.sessionIds)
+            .groupBy("session_id")
+            .having((eb) => eb(eb.fn.max("created_at"), "<=", params.updatedBefore)),
+        )
+        .orderBy("session_id", "asc")
         .orderBy("seq", "asc"),
     );
     // Consume every row so late SQLite errors still abort cleanup planning.
-    let hasMarker = false;
+    let previousSessionId: string | undefined;
     for (const row of rows) {
       if (params.diagnostics) {
         params.diagnostics.markerRows = (params.diagnostics.markerRows ?? 0) + 1;
+        if (row.session_id !== previousSessionId) {
+          params.diagnostics.markerWindows = (params.diagnostics.markerWindows ?? 0) + 1;
+          previousSessionId = row.session_id;
+        }
       }
-      hasMarker ||= row.event_json.includes(params.transcriptContentMarker);
+      if (!marked.has(row.session_id) && row.event_json.includes(params.transcriptContentMarker)) {
+        marked.add(row.session_id);
+      }
     }
-    return hasMarker;
+    return marked;
   } finally {
     if (params.diagnostics) {
       params.diagnostics.markerScanMs =
@@ -165,31 +183,26 @@ function* planSqliteOrphanLifecycleTranscriptStateDeletes(params: {
     if (params.diagnostics) {
       params.diagnostics.windowRows = (params.diagnostics.windowRows ?? 0) + rows.length;
     }
-    for (const row of rows) {
-      if (
-        !sessionKeyBelongsToAgent(row.session_key, params.agentId) ||
-        params.referencedSessionIds.has(row.session_id) ||
-        params.excludedSessionIds?.has(row.session_id) ||
-        (params.pluginOwnerId &&
-          row.plugin_owner_id &&
-          row.plugin_owner_id !== params.pluginOwnerId)
-      ) {
-        continue;
-      }
-      if (
-        !sqliteTranscriptStateIsReclaimable({
-          database: params.database,
-          sessionId: row.session_id,
-          nowMs: params.nowMs,
-          orphanTranscriptMinAgeMs: params.orphanTranscriptMinAgeMs,
-        }) ||
-        !sqliteTranscriptStateHasMarker({
-          database: params.database,
-          sessionId: row.session_id,
-          transcriptContentMarker: params.transcriptContentMarker,
-          diagnostics: params.diagnostics,
-        })
-      ) {
+    const eligibleIds = rows
+      .filter(
+        (row) =>
+          sessionKeyBelongsToAgent(row.session_key, params.agentId) &&
+          !params.referencedSessionIds.has(row.session_id) &&
+          !params.excludedSessionIds?.has(row.session_id) &&
+          (!params.pluginOwnerId ||
+            !row.plugin_owner_id ||
+            row.plugin_owner_id === params.pluginOwnerId),
+      )
+      .map((row) => row.session_id);
+    const markedIds = readOrphanTranscriptMarkerSessionIds({
+      database: params.database,
+      sessionIds: eligibleIds,
+      updatedBefore: params.nowMs - params.orphanTranscriptMinAgeMs,
+      transcriptContentMarker: params.transcriptContentMarker,
+      diagnostics: params.diagnostics,
+    });
+    for (const sessionId of eligibleIds) {
+      if (!markedIds.has(sessionId)) {
         continue;
       }
       const plan = planSessionStateDeleteIfUnreferenced({
@@ -198,7 +211,7 @@ function* planSqliteOrphanLifecycleTranscriptStateDeletes(params: {
         database: params.database,
         reason: "deleted",
         referencedSessionIds: params.referencedSessionIds,
-        sessionId: row.session_id,
+        sessionId,
       });
       if (plan) {
         deletePlans.push(plan);

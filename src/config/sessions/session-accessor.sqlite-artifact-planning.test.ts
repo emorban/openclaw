@@ -304,7 +304,7 @@ it("leaves a missing lifecycle store absent", async () => {
   expect(fs.existsSync(databasePath)).toBe(false);
 });
 
-it("keeps orphan plans across page boundaries and protects retained references", () => {
+it("pages orphan marker reads while protecting fresh and retained history", () => {
   const ids = Array.from(
     { length: 129 },
     (_, index) => `history-${String(index).padStart(3, "0")}`,
@@ -322,14 +322,45 @@ it("keeps orphan plans across page boundaries and protects retained references",
       transcript.run(id, JSON.stringify(event));
     }
   }, options);
-  const plan = artifactPlanning.planSessionLifecycleArtifactCleanup(database, {
-    ...planInput(),
-    sessionKeySegmentPrefix: "unrelated-",
-    nowMs: Date.now(),
-  });
-  expect(database.db.isTransaction).toBe(false);
-  expect(plan.entries).toEqual([]);
-  expect(plan.deletePlans.map((item) => item.sessionId)).toEqual(
-    ids.filter((id) => id !== ids.at(-2)),
+  const reads = trackSqliteStatementExecutions(
+    requireNativeSqliteDatabase(database.db),
+    ["transcriptSelection"],
+    (sql) =>
+      sql.includes('from "transcript_events"') &&
+      (sql.includes('max("created_at")') || sql.includes(' as "event_json"'))
+        ? "transcriptSelection"
+        : null,
   );
+  const nowMs = Date.now();
+  const plan = () =>
+    artifactPlanning.planSessionLifecycleArtifactCleanup(database, {
+      ...planInput(),
+      sessionKeySegmentPrefix: "unrelated-",
+      orphanTranscriptMinAgeMs: 300_000,
+      nowMs,
+    });
+  try {
+    const first = plan();
+    expect(database.db.isTransaction).toBe(false);
+    expect(first.entries).toEqual([]);
+    expect(first.deletePlans.map((item) => item.sessionId)).toEqual(
+      ids.filter((id) => id !== ids.at(-2)),
+    );
+    expect(reads.counts.transcriptSelection).toBe(2);
+
+    // A later event must invalidate eligibility even when its payload has no marker.
+    runOpenClawAgentWriteTransaction((transaction) => {
+      transaction.db
+        .prepare(
+          "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?, 1, ?, ?)",
+        )
+        .run(ids[0], JSON.stringify({ type: "metadata" }), nowMs);
+    }, options);
+    expect(plan().deletePlans.map((item) => item.sessionId)).toEqual(
+      ids.filter((id) => id !== ids[0] && id !== ids.at(-2)),
+    );
+    expect(reads.counts.transcriptSelection).toBe(4);
+  } finally {
+    reads.restore();
+  }
 });
