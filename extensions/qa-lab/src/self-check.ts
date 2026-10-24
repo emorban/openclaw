@@ -36,7 +36,6 @@ export async function runQaSelfCheckAgainstState(params: {
   transportId?: QaTransportId;
   outputPath?: string;
   repoRoot?: string;
-  notes?: string[];
   waitTimeoutMs?: number;
 }): Promise<QaSelfCheckResult> {
   const startedAt = new Date();
@@ -88,7 +87,7 @@ export async function runQaSelfCheckAgainstState(params: {
       checks,
       scenarios: [scenarioResult],
       timeline,
-      notes: params.notes ?? [
+      notes: [
         "Vertical slice: qa-channel + qa-lab bus + private debugger surface.",
         "Docker orchestration, additional QA runners, and auto-fix loops remain follow-up work.",
       ],

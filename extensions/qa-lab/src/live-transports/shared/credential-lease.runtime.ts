@@ -555,14 +555,8 @@ export async function acquireQaCredentialLease<TPayload>(
 export function startQaCredentialLeaseHeartbeat(
   lease: Pick<QaCredentialLease<unknown>, "heartbeat" | "heartbeatIntervalMs" | "kind" | "source"> &
     Partial<Pick<QaCredentialLease<unknown>, "assertHealthy">>,
-  opts?: {
-    intervalMs?: number;
-    retryDelaysMs?: readonly number[];
-    setTimeoutImpl?: typeof setTimeout;
-    clearTimeoutImpl?: typeof clearTimeout;
-  },
 ) {
-  const intervalMs = opts?.intervalMs ?? lease.heartbeatIntervalMs;
+  const intervalMs = lease.heartbeatIntervalMs;
   if (lease.source !== "convex" || !Number.isFinite(intervalMs) || intervalMs < 1) {
     return {
       getFailure: () => null,
@@ -572,9 +566,6 @@ export function startQaCredentialLeaseHeartbeat(
     };
   }
 
-  const setTimeoutImpl = opts?.setTimeoutImpl ?? setTimeout;
-  const clearTimeoutImpl = opts?.clearTimeoutImpl ?? clearTimeout;
-  const retryDelaysMs = opts?.retryDelaysMs ?? HEARTBEAT_RETRY_DELAYS_MS;
   let failure: Error | null = null;
   let retryAttempt = 0;
   let stopped = false;
@@ -598,7 +589,7 @@ export function startQaCredentialLeaseHeartbeat(
     if (stopped || failure) {
       return;
     }
-    timer = setTimeoutImpl(() => {
+    timer = setTimeout(() => {
       timer = null;
       if (stopped || failure) {
         return;
@@ -608,9 +599,12 @@ export function startQaCredentialLeaseHeartbeat(
           await lease.heartbeat();
           retryAttempt = 0;
         } catch (error) {
-          if (isTransientBrokerTransportError(error) && retryAttempt < retryDelaysMs.length) {
+          if (
+            isTransientBrokerTransportError(error) &&
+            retryAttempt < HEARTBEAT_RETRY_DELAYS_MS.length
+          ) {
             const retryDelayMs = expectDefined(
-              retryDelaysMs[retryAttempt],
+              HEARTBEAT_RETRY_DELAYS_MS[retryAttempt],
               "QA credential heartbeat retry delay",
             );
             retryAttempt += 1;
@@ -644,7 +638,7 @@ export function startQaCredentialLeaseHeartbeat(
     async stop() {
       stopped = true;
       if (timer) {
-        clearTimeoutImpl(timer);
+        clearTimeout(timer);
         timer = null;
       }
       if (inFlight) {

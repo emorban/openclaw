@@ -170,7 +170,6 @@ export async function resolveQaConvexBrokerConnection(options: {
   env: NodeJS.ProcessEnv;
   cwd: string;
   runConvexCliImpl: QaConvexLookup;
-  convexProjectDir?: string;
   signal?: AbortSignal;
 }): Promise<{ siteUrl: string; secret: string; source: "env" | "convex-cli" }> {
   const { env, signal } = options;
@@ -187,7 +186,7 @@ export async function resolveQaConvexBrokerConnection(options: {
       source: "env",
     };
   }
-  const cwd = options.convexProjectDir ?? path.join(options.cwd, "qa", "convex-credential-broker");
+  const cwd = path.join(options.cwd, "qa", "convex-credential-broker");
   const failures: Array<{ launcher: string; code: string }> = [];
   let authenticated = false;
   for (const launcher of LAUNCHERS) {
