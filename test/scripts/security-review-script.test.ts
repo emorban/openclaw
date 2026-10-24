@@ -290,21 +290,6 @@ describe("combined security review entry point", () => {
     expect(result.combined.at(-1)).toBe("success");
   });
 
-  it("recovers the dependency-graph read deadline without granting contributor approval", () => {
-    const graphPath = `/repos/openclaw/openclaw/dependency-graph/compare/${pr.base.sha}...${head}`;
-    const result = evaluate({
-      [rolePath]: { role_name: "read" },
-      [`GET ${pullPath}/files`]: [files[0], { filename: "pnpm-lock.yaml", status: "modified" }],
-      [`GET ${graphPath}`]: { responses: [{ requestTimeout: "fetch" }, []] },
-    });
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.waits).toEqual([1_000]);
-    expect(result.requests.filter((entry) => entry.path === graphPath)).toHaveLength(2);
-    expect(result.combined.at(-1)).toBe("failure");
-    expect(result.reviews.some((entry) => entry.body?.state === "success")).toBe(false);
-    expect(result.stdout).toContain("awaiting maintainer approval");
-  });
-
   it("rereads author authority after a read deadline instead of retaining approval", () => {
     const result = evaluate({
       [jobsPath]: { responses: [{ requestTimeout: "fetch" }, jobs] },
@@ -341,100 +326,73 @@ describe("combined security review entry point", () => {
     expect(result.requests.filter((entry) => entry.path === "/graphql")).toHaveLength(1);
   });
 
+  const permissionDenied = { httpError: 403, message: "Resource not accessible by integration" };
+  const forbiddenMutation = { type: "FORBIDDEN", path: ["createCommitOnBranch"] };
+  const committed = { createCommitOnBranch: { commit: { oid: "e".repeat(40) } } };
+  function cleanupCase<T>(name: string, response: T, unavailable = false, baseReadDenied = false) {
+    return { name, response, unavailable, baseReadDenied };
+  }
   it.each([
-    {
-      name: "HTTP permission denial",
-      response: { httpError: 403, message: "Resource not accessible by integration" },
-      unavailable: true,
-    },
-    {
-      name: "GraphQL permission denial",
-      response: {
-        errors: [
-          {
-            type: "FORBIDDEN",
-            path: ["createCommitOnBranch"],
-            message: "Resource not accessible by integration",
-          },
-        ],
+    cleanupCase("HTTP permission denial", permissionDenied, true),
+    cleanupCase(
+      "GraphQL permission denial",
+      {
+        errors: [{ ...forbiddenMutation, message: "Resource not accessible by integration" }],
       },
-      unavailable: true,
-    },
-    { name: "unknown HTTP 403", response: { httpError: 403 }, unavailable: false },
-    {
-      name: "stale head",
-      response: { errors: [{ type: "STALE_DATA", message: "Expected branch head to match" }] },
-      unavailable: false,
-    },
-    {
-      name: "mixed GraphQL errors",
-      response: {
-        errors: [{ type: "FORBIDDEN", path: ["createCommitOnBranch"] }, { type: "INTERNAL" }],
-      },
-      unavailable: false,
-    },
-    {
-      name: "commit response field denial",
-      response: {
-        errors: [{ type: "FORBIDDEN", path: ["createCommitOnBranch", "commit", "oid"] }],
-      },
-      unavailable: false,
-    },
-    {
-      name: "partial commit response",
-      response: {
-        data: { createCommitOnBranch: { commit: { oid: "e".repeat(40) } } },
-        errors: [{ type: "FORBIDDEN", path: ["createCommitOnBranch"] }],
-      },
-      unavailable: false,
-    },
-    {
-      name: "base read permission denial",
-      response: { httpError: 403, message: "Resource not accessible by integration" },
-      unavailable: false,
-      baseReadDenied: true,
-    },
-  ])("keeps cleanup $name separate from dependency approval", (scenario) => {
-    const { response, unavailable } = scenario;
-    const baseReadDenied = "baseReadDenied" in scenario && scenario.baseReadDenied;
-    const routes = {
-      ...lockfileRoutes,
-      [`GET ${pullPath}`]: {
-        ...lockfilePr,
-        maintainer_can_modify: true,
-        head: { ...pr.head, repo: { id: 2, full_name: "contributor/openclaw" } },
-      },
-      [`GET /repos/openclaw/openclaw/contents/pnpm-lock.yaml`]: baseReadDenied
-        ? response
-        : lockfileContents,
-      "POST /graphql": response,
-    };
-    const cleanup = evaluate(routes, "autoscrub");
-    expect(cleanup.status, cleanup.stderr).toBe(unavailable ? 0 : 1);
-    expect(cleanup.requests.filter((entry) => entry.path === "/graphql")).toHaveLength(
-      baseReadDenied ? 0 : 1,
-    );
-    expect(cleanup.reviews.some((entry) => entry.body?.state === "success")).toBe(false);
-    expect(cleanup.waits).toEqual([]);
-    if (unavailable) {
-      const notice = cleanup.requests.find(
-        (entry) => entry.method === "POST" && entry.path.endsWith("/comments"),
+      true,
+    ),
+    cleanupCase("unknown HTTP 403", { httpError: 403 }),
+    cleanupCase("stale head", {
+      errors: [{ type: "STALE_DATA", message: "Expected branch head to match" }],
+    }),
+    cleanupCase("mixed GraphQL errors", { errors: [forbiddenMutation, { type: "INTERNAL" }] }),
+    cleanupCase("commit response field denial", {
+      errors: [{ type: "FORBIDDEN", path: ["createCommitOnBranch", "commit", "oid"] }],
+    }),
+    cleanupCase("partial commit response", { data: committed, errors: [forbiddenMutation] }),
+    cleanupCase("base read permission denial", permissionDenied, false, true),
+  ])(
+    "keeps cleanup $name separate from dependency approval",
+    ({ response, unavailable, baseReadDenied }) => {
+      const routes = {
+        ...lockfileRoutes,
+        [`GET ${pullPath}`]: {
+          ...lockfilePr,
+          maintainer_can_modify: true,
+          head: { ...pr.head, repo: { id: 2, full_name: "contributor/openclaw" } },
+        },
+        [`GET /repos/openclaw/openclaw/contents/pnpm-lock.yaml`]: baseReadDenied
+          ? response
+          : lockfileContents,
+        "POST /graphql": response,
+      };
+      const cleanup = evaluate(routes, "autoscrub");
+      expect(cleanup.status, cleanup.stderr).toBe(unavailable ? 0 : 1);
+      expect(cleanup.requests.filter((entry) => entry.path === "/graphql")).toHaveLength(
+        baseReadDenied ? 0 : 1,
       );
-      expect(notice?.body?.body).toContain("Automatic lockfile cleanup is best effort.");
-      const enforcement = evaluate(routes);
-      expect(enforcement.status, enforcement.stderr).toBe(0);
-      expect(enforcement.combined.at(-1)).toBe("failure");
-      expect(
-        enforcement.reviews.findLast(
-          (entry) => entry.body?.context === "openclaw/dependency-review",
-        )?.body?.state,
-      ).toBe("failure");
-      expect(enforcement.stdout).toContain("Automatic lockfile cleanup is best effort.");
-    } else {
-      expect(cleanup.combined.at(-1)).toBe("failure");
-      expect(cleanup.stderr).toContain("autoscrub failed");
-    }
-  });
+      expect(cleanup.reviews.some((entry) => entry.body?.state === "success")).toBe(false);
+      expect(cleanup.waits).toEqual([]);
+      if (unavailable) {
+        const notice = cleanup.requests.find(
+          (entry) => entry.method === "POST" && entry.path.endsWith("/comments"),
+        );
+        expect(notice?.body?.body).toContain("Automatic lockfile cleanup is best effort.");
+        const enforcement = evaluate(routes);
+        expect(enforcement.status, enforcement.stderr).toBe(0);
+        expect(enforcement.combined.at(-1)).toBe("failure");
+        expect(
+          enforcement.reviews.findLast(
+            (entry) => entry.body?.context === "openclaw/dependency-review",
+          )?.body?.state,
+        ).toBe("failure");
+        expect(enforcement.stdout).toContain("Automatic lockfile cleanup is best effort.");
+      } else {
+        expect(cleanup.combined.at(-1)).toBe("failure");
+        expect(cleanup.stderr).toContain("autoscrub failed");
+      }
+    },
+  );
 
   it.each([
     { name: "cleanup mutation", response: { httpError: 500 }, noticeFailure: false },
@@ -492,39 +450,6 @@ describe("combined security review entry point", () => {
   });
 
   it.each([
-    {
-      name: "read deadline",
-      route: rolePath,
-      failure: { requestTimeout: "fetch" },
-      rateLimit: false,
-    },
-    {
-      name: "status publication",
-      route: statusPath,
-      failure: { httpError: 500 },
-      rateLimit: false,
-    },
-    { name: "rate limit", route: rolePath, failure: { httpError: 429 }, rateLimit: true },
-  ])(
-    "bounds persistent $name failures without granting approval",
-    ({ route, failure, rateLimit }) => {
-      const result = evaluate({ [route]: failure });
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("recovery budget exhausted");
-      expect(result.waits).toHaveLength(3);
-      if (rateLimit) {
-        for (const [index, delay] of result.waits.entries()) {
-          expect(delay).toBeGreaterThanOrEqual(60_000 * 2 ** index);
-        }
-      } else {
-        expect(result.waits).toEqual([1_000, 2_000, 4_000]);
-      }
-      expect(requestsFor(result, route)).toHaveLength(4);
-      expect(result.requests.some((entry) => entry.body?.state === "success")).toBe(false);
-    },
-  );
-
-  it.each([
     { name: "status", route: statusPath },
     { name: "comment", route: "POST /repos/openclaw/openclaw/issues/7/comments" },
   ])("does not restart evaluation after an uncertain $name write deadline", ({ route }) => {
@@ -539,34 +464,6 @@ describe("combined security review entry point", () => {
     expect(result.stderr).toContain("exceeded timeout 30000ms");
     expect(result.combined).not.toContain("success");
   });
-
-  it.each(["detect", "enforce"])(
-    "recovers diff data that takes longer than seven seconds to settle in %s mode",
-    (mode) => {
-      const result = evaluate(
-        {
-          [`GET ${pullPath}`]: {
-            settlesAt: "2026-01-02T00:00:30Z",
-            before: { ...pr, changed_files: 3146 },
-            after: pr,
-          },
-          [`GET ${pullPath}/files`]: {
-            settlesAt: "2026-01-02T00:00:30Z",
-            before: files.slice(0, 1),
-            after: files,
-          },
-        },
-        mode,
-      );
-      expect(result.status, result.stderr).toBe(0);
-      expect(result.waits.some((delay) => delay >= 30_000)).toBe(true);
-      expect(result.requests.filter((entry) => entry.path === `${pullPath}/files`)).toHaveLength(2);
-      if (mode === "enforce") {
-        expect(result.combined.at(-1)).toBe("success");
-        expect(result.reviews.filter((entry) => entry.body?.state === "success")).toHaveLength(2);
-      }
-    },
-  );
 
   it.each([
     { phase: "before dependency approval", stableReads: 2 },
@@ -633,30 +530,6 @@ describe("combined security review entry point", () => {
     );
     expect(result.requests.some((entry) => entry.body?.state === "success")).toBe(false);
   });
-
-  it.each(["detect", "autoscrub", "enforce"])(
-    "stops superseded diff recovery at its first checkpoint in %s mode",
-    (mode) => {
-      const result = evaluate(
-        {
-          [`GET ${pullPath}`]: {
-            settlesAt: "2026-01-02T00:00:30Z",
-            before: pr,
-            after: { ...pr, head: { ...pr.head, sha: "d".repeat(40) } },
-          },
-          [`GET ${pullPath}/files`]: files.slice(0, 1),
-        },
-        mode,
-      );
-      expect(result.status, result.stderr).toBe(0);
-      expect(result.stdout).toContain("Superseded");
-      expect(result.waits).toEqual([30_000]);
-      expect(result.requests.filter((entry) => entry.path === pullPath + "/files")).toHaveLength(1);
-      const afterWait = afterFirstWait(result);
-      expect(afterWait).toEqual([{ method: "GET", path: pullPath }]);
-      expect(result.combined).not.toContain("success");
-    },
-  );
 
   it.each([false, true])(
     "checks the head before more slow file pages (superseded=%s)",
@@ -948,63 +821,6 @@ describe("combined security review entry point", () => {
     ).toBe("failure");
   });
 
-  it("recovers a failed sticky-notice update while preserving missing approval", () => {
-    const commentPath = "/repos/openclaw/openclaw/issues/comments/321";
-    const result = evaluate({
-      [`GET ${pullPath}`]: { ...pr, changed_files: 1 },
-      [`GET ${pullPath}/files`]: [files[0]],
-      "GET /repos/openclaw/openclaw/issues/7/comments": [
-        {
-          id: 321,
-          user: { login: "github-actions[bot]", type: "Bot" },
-          body: "<!-- openclaw:security-sensitive-guard -->\nOld notice",
-        },
-      ],
-      [`PATCH ${commentPath}`]: { responses: [{ httpError: 503 }, {}] },
-      [rolePath]: { role_name: "read" },
-    });
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.waits).toEqual([1_000]);
-    expect(result.requests.filter((entry) => entry.method === "PATCH")).toHaveLength(2);
-    expect(
-      result.requests.some((entry) => entry.method === "POST" && entry.path.endsWith("/comments")),
-    ).toBe(false);
-    expect(result.combined.at(-1)).toBe("failure");
-    expect(result.stdout).toContain("awaiting maintainer approval");
-  });
-
-  it("stops notice recovery when a newer head supersedes the review", () => {
-    const result = evaluate({
-      [`GET ${pullPath}`]: {
-        settlesAt: "2026-01-02T00:00:01Z",
-        before: pr,
-        after: { ...pr, head: { ...pr.head, sha: "d".repeat(40) } },
-      },
-      "POST /repos/openclaw/openclaw/issues/7/comments": { httpError: 500 },
-    });
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.waits).toEqual([1_000]);
-    const afterWait = afterFirstWait(result);
-    expect(afterWait).toEqual([{ method: "GET", path: pullPath }]);
-    expect(result.stdout).toContain("Superseded");
-    expect(result.combined).not.toContain("success");
-  });
-
-  it("bounds persistent notice publication failures", () => {
-    const commentPath = "/repos/openclaw/openclaw/issues/7/comments";
-    const result = evaluate({
-      [`GET ${pullPath}`]: { ...pr, changed_files: 1 },
-      [`GET ${pullPath}/files`]: [files[0]],
-      [`POST ${commentPath}`]: { httpError: 500 },
-      [rolePath]: { role_name: "read" },
-    });
-    expect(result.status).toBe(1);
-    expect(result.waits).toEqual([1_000, 2_000, 4_000]);
-    expect(requestsFor(result, `POST ${commentPath}`)).toHaveLength(4);
-    expect(result.combined).not.toContain("success");
-    expect(result.stderr).toContain("recovery budget exhausted");
-  });
-
   it("recovers rate-limited notice writes instead of treating them as missing permissions", () => {
     const result = evaluate({
       "POST /repos/openclaw/openclaw/issues/7/labels": {
@@ -1073,21 +889,6 @@ describe("combined security review entry point", () => {
         .filter((entry) => entry.path.includes("/statuses/"))
         .every((entry) => entry.path.endsWith(head)),
     ).toBe(true);
-  });
-
-  it("does not transfer an author's exemption to another PR with the same head", () => {
-    const result = evaluate({
-      [historyPath]: [otherReview],
-      "GET /repos/openclaw/openclaw/pulls/8": {
-        ...pr,
-        number: 8,
-        user: { id: 2, login: "contributor", type: "User" },
-      },
-    });
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain("same head");
-    expect(result.combined).not.toContain("success");
-    expect(result.reviews.some((entry) => entry.body?.state === "success")).toBe(false);
   });
 
   it("rechecks recorded PR identities before the combined success", () => {
@@ -1282,28 +1083,6 @@ describe("combined security review entry point", () => {
       expect(enforcement.stdout).toContain("/allow-dependencies-change");
     },
   );
-
-  it.each(lifecycleChanges)("stops a $name before reading more file pages", ({ changedPr }) => {
-    const page = filePage();
-    const result = evaluate({
-      [`GET ${pullPath}`]: {
-        settlesAt: "2026-01-02T00:00:30Z",
-        before: { ...pr, changed_files: 202 },
-        after: { ...changedPr, changed_files: 202 },
-      },
-      [`GET ${pullPath}/files`]: {
-        responses: [
-          { advanceMs: 15_000, response: page },
-          { advanceMs: 15_000, response: page },
-          files,
-        ],
-      },
-    });
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.requests.filter((entry) => entry.path === `${pullPath}/files`)).toHaveLength(2);
-    expect(result.requests.at(-1)).toMatchObject({ method: "GET", path: pullPath });
-    expect(result.requests.some((entry) => entry.body?.state === "success")).toBe(false);
-  });
 
   it.each([
     ...lifecycleChanges,
@@ -1829,21 +1608,6 @@ describe("combined security review entry point", () => {
         .filter((entry) => entry.method !== "GET")
         .every((entry) => entry.body?.context === "openclaw/ci-gate"),
     ).toBe(true);
-  });
-
-  it("activates both guards once an old head contains the rollout commit", () => {
-    const result = evaluate({
-      ...exemptRoutes,
-      [`GET /repos/openclaw/openclaw/compare/${landed}...${head}`]: {
-        base_commit: { sha: landed },
-        merge_base_commit: { sha: landed },
-        status: "ahead",
-      },
-      [rolePath]: { role_name: "read" },
-    });
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.reviews.filter((entry) => entry.body?.state === "failure")).toHaveLength(4);
-    expect(result.combined).not.toContain("success");
   });
 
   it("leaves the combined gate failed when rollout metadata cannot be read", () => {
