@@ -405,5 +405,5 @@ export function collectRegisteredEmbeddingProviderIds(
     ...(registry.embeddingProviders ?? []).map((entry) => entry.provider),
     ...listRegisteredEmbeddingProviders().map((entry) => entry.adapter),
   ];
-  return new Set(providers.flatMap(({ id, aliases }) => [id, ...(aliases ?? [])]));
+  return new Set(providers.flatMap(({ id, aliases }) => [id].concat(aliases ?? [])));
 }
