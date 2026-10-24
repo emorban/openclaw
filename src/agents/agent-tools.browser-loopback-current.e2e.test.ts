@@ -1,0 +1,108 @@
+import { afterEach, expect, it } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../config/config.js";
+import {
+  prepareExecApprovalsCurrentRead,
+  updateExecApprovals,
+} from "../infra/exec-approvals-store.js";
+import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db.js";
+import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
+import { createLocalBrowserLoopbackAssertion } from "./agent-tools.execution-policy.js";
+import { resolveConversationCapabilityProfile } from "./conversation-capability-profile.js";
+
+const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
+  afterEach(async () => {
+    await closeOpenClawStateDatabaseAsync();
+    cleanup();
+  }),
+);
+
+it("revokes an automatic preview when the execution-policy owner restricts host approvals", async () => {
+  const context = captureOpenClawStateWorkerContext({
+    env: { ...process.env, OPENCLAW_STATE_DIR: tempDirs.make("browser-loopback-policy-") },
+  });
+  const publish = (security: "full" | "deny") =>
+    updateExecApprovals(
+      {
+        update: {
+          kind: "replace",
+          file: { version: 1, defaults: { security, ask: "off" } },
+        },
+      },
+      context,
+    );
+  await publish("full");
+  const readCurrent = await prepareExecApprovalsCurrentRead(context);
+  const config = {};
+  const assertPreviewCurrent = createLocalBrowserLoopbackAssertion(
+    {
+      options: { config },
+      capabilityProfile: resolveConversationCapabilityProfile({ config }),
+      effectiveExecPolicy: { host: "gateway", security: "full", ask: "off" },
+      sandboxed: false,
+      workspaceOnly: false,
+      execApprovals: readCurrent(),
+    },
+    readCurrent,
+  );
+  expect(assertPreviewCurrent).toBeTypeOf("function");
+  expect(assertPreviewCurrent).not.toThrow();
+  await publish("deny");
+  expect(assertPreviewCurrent).toThrow("current unrestricted local execution");
+  await publish("full");
+  expect(assertPreviewCurrent).not.toThrow();
+});
+
+it("revokes the native turn grant when its inner abort signal closes", () => {
+  const controller = new AbortController();
+  const config = {};
+  const approvals = {
+    version: 1 as const,
+    defaults: { security: "full" as const, ask: "off" as const },
+  };
+  const assertCurrent = createLocalBrowserLoopbackAssertion(
+    {
+      options: { config, abortSignal: controller.signal },
+      capabilityProfile: resolveConversationCapabilityProfile({ config }),
+      effectiveExecPolicy: { host: "gateway", security: "full", ask: "off" },
+      sandboxed: false,
+      workspaceOnly: false,
+      execApprovals: approvals,
+    },
+    () => approvals,
+  );
+  expect(assertCurrent).not.toThrow();
+  controller.abort(new Error("native turn replaced"));
+  expect(assertCurrent).toThrow("native turn replaced");
+});
+
+it("retires the grant when the runtime config owner publishes a policy change", () => {
+  const config = {
+    tools: { exec: { host: "gateway" as const, security: "full" as const, ask: "off" as const } },
+  };
+  const approvals = {
+    version: 1 as const,
+    defaults: { security: "full" as const, ask: "off" as const },
+  };
+  setRuntimeConfigSnapshot(config);
+  try {
+    const assertCurrent = createLocalBrowserLoopbackAssertion(
+      {
+        options: { config },
+        capabilityProfile: resolveConversationCapabilityProfile({ config }),
+        effectiveExecPolicy: { host: "gateway", security: "full", ask: "off" },
+        sandboxed: false,
+        workspaceOnly: false,
+        execApprovals: approvals,
+      },
+      () => approvals,
+    );
+    expect(assertCurrent).not.toThrow();
+    setRuntimeConfigSnapshot({
+      tools: { exec: { host: "gateway", security: "deny", ask: "off" } },
+    });
+    expect(assertCurrent).toThrow("policy changed");
+  } finally {
+    clearRuntimeConfigSnapshot();
+  }
+});
