@@ -1,5 +1,6 @@
 import type { BrowserContextOptions, Locator } from "playwright";
 import { expect, it } from "vitest";
+import { createEmptyCostUsageTotals } from "../../../src/infra/session-cost-usage-totals.js";
 import type { SessionUsageEntry } from "../../../src/shared/usage-types.js";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 import { installUsageOverviewGateway as installMockGateway } from "./usage-overview-fixture.test-support.ts";
@@ -13,14 +14,6 @@ const suite = createControlUiE2eSuite({
 
 const viewport = { height: 1_000, width: 1_440 };
 const pageOptions: BrowserContextOptions = { locale: "en-US", serviceWorkers: "block", viewport };
-const costMessages = {
-  total: 40,
-  user: 20,
-  assistant: 20,
-  toolCalls: 12,
-  toolResults: 12,
-  errors: 0,
-};
 
 const totals = {
   input: 1_200_000,
@@ -36,19 +29,7 @@ const totals = {
   missingCostEntries: 0,
 };
 
-const emptyTotals = {
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  totalTokens: 0,
-  totalCost: 0,
-  inputCost: 0,
-  outputCost: 0,
-  cacheReadCost: 0,
-  cacheWriteCost: 0,
-  missingCostEntries: 0,
-};
+const emptyTotals = createEmptyCostUsageTotals();
 
 function dayOffset(offset: number): string {
   const date = new Date();
@@ -67,16 +48,6 @@ function dailyEntry(offset: number, totalCost: number, totalTokens: number) {
     inputCost: totalCost,
   };
 }
-
-const modelUsage = [
-  { provider: "openai", model: "gpt-5.5", count: 30, totals: { ...totals, totalCost: 22 } },
-  {
-    provider: "anthropic",
-    model: "claude-opus-4-6",
-    count: 10,
-    totals: { ...totals, totalCost: 10 },
-  },
-];
 
 function expectTexts(locator: Locator, expected: string[]) {
   return expect.poll(() => locator.allTextContents()).toEqual(expected);
@@ -508,43 +479,21 @@ suite.define(() => {
             startDate: dayOffset(-89),
             endDate: dayOffset(0),
             sessions: [
-              {
-                ...makeSession("agent:main:cost-analysis", "Cost analysis", Date.now(), {
-                  ...totals,
-                  activityDates: daily.map((entry) => entry.date),
-                  dailyBreakdown: daily.map((entry) => ({
-                    ...entry,
-                    cost: entry.totalCost,
-                    tokens: entry.totalTokens,
-                  })),
-                  messageCounts: costMessages,
-                  modelUsage,
-                }),
-                modelProvider: "openai",
-                model: "gpt-5.5",
-              },
+              makeSession("agent:main:cost-analysis", "Cost analysis", Date.now(), {
+                ...totals,
+                activityDates: daily.map((entry) => entry.date),
+                dailyBreakdown: daily.map((entry) => ({
+                  ...entry,
+                  cost: entry.totalCost,
+                  tokens: entry.totalTokens,
+                })),
+              }),
             ],
             totals,
             aggregates: {
-              messages: costMessages,
-              tools: { totalCalls: 12, uniqueTools: 2, tools: [{ name: "exec", count: 8 }] },
-              byModel: modelUsage,
-              byProvider: modelUsage.map(({ provider, count, totals: modelTotals }) => ({
-                provider,
-                count,
-                totals: modelTotals,
-              })),
-              byAgent: [{ agentId: "main", totals }],
-              byChannel: [],
+              ...emptyUsageResponses()["sessions.usage"].aggregates,
+              byProvider: [{ provider: "openai", count: 1, totals }],
               costDaily: daily,
-              daily: daily.map((entry) => ({
-                date: entry.date,
-                tokens: entry.totalTokens,
-                cost: entry.totalCost,
-                messages: 10,
-                toolCalls: 3,
-                errors: 0,
-              })),
             },
           },
           "usage.status": {

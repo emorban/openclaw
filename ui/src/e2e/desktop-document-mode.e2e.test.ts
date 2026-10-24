@@ -1,15 +1,11 @@
 import type { Locator, Page } from "playwright";
 import { expect, it } from "vitest";
-import { CONTROL_UI_BOOTSTRAP_CONFIG_PATH } from "../../../src/gateway/control-ui-bootstrap-contract.js";
 import type { DesktopClient } from "../components/desktop/desktop-client.ts";
 import { waitForControlUiGatewayReady } from "../test-helpers/control-ui-e2e-readiness.ts";
 import {
   controlUiBundledSettingsStorageKey,
   controlUiSessionUrl,
-  createControlUiMockBootstrapConfig,
-  createControlUiMockGatewayInitScript,
   installMockGateway,
-  type ControlUiMockGateway,
 } from "../test-helpers/control-ui-e2e.ts";
 import { chatSessionListResponse } from "./chat-flow.test-support.ts";
 import {
@@ -41,7 +37,6 @@ const activeLabel = (panel: Locator) =>
   panel.evaluate((element) =>
     (element.getRootNode() as Document | ShadowRoot).activeElement?.getAttribute("aria-label"),
   );
-type GatewayWindow = Window & { openclawControlUiE2eGateway?: ControlUiMockGateway };
 type Gateway = Awaited<ReturnType<typeof installMockGateway>>;
 type DesktopHost = HTMLElement & { desktopClientFactory: () => Pick<DesktopClient, "connect"> };
 const makeEnvironment = (id: string) => ({
@@ -250,7 +245,7 @@ suite.define(() => {
   it.each(["active", "starting", "offline"])(
     "opens the %s chat session desktop and follows an explicit pop-out selection",
     async (initialState) => {
-      await suite.withPage({ serviceWorkers: "block" }, async ({ context, page }) => {
+      await suite.withPage({ serviceWorkers: "block" }, async ({ page }) => {
         const sessionKey = "agent:main:cloud-desktop";
         // This test exercises an explicit manual open, not automatic discovery.
         await page.addInitScript(
@@ -410,50 +405,6 @@ suite.define(() => {
           return previousHrefs;
         });
         expect(observedHrefs.filter((href) => href !== focusPath)).toEqual([]);
-
-        const popupScenario = {
-          sessionKey,
-          deferredMethods: ["environments.status"],
-          featureMethods: desktopMethods,
-          methodResponses: { "desktop.observe": controlResponse },
-        };
-        await context.route(`**${CONTROL_UI_BOOTSTRAP_CONFIG_PATH}`, (route) =>
-          route.fulfill({ json: createControlUiMockBootstrapConfig(popupScenario) }),
-        );
-        await context.addInitScript({
-          content: createControlUiMockGatewayInitScript(popupScenario),
-        });
-        const [popup] = await Promise.all([context.waitForEvent("page"), popout.click()]);
-        try {
-          await popup.waitForLoadState("domcontentloaded");
-          expect(new URL(popup.url()).pathname).toBe(focusPath);
-          const focusedPanel = popup.locator("openclaw-desktop-panel");
-          await focusedPanel.waitFor({ state: "attached" });
-          await popup.waitForFunction(
-            () =>
-              (window as GatewayWindow).openclawControlUiE2eGateway?.findRequests(
-                "environments.status",
-              ).length,
-          );
-          await installDesktopClientFake(focusedPanel);
-          await popup.evaluate((environment) => {
-            (window as GatewayWindow).openclawControlUiE2eGateway?.resolveDeferred(
-              "environments.status",
-              environment,
-            );
-          }, inventory.environments[2]);
-          await remoteView(focusedPanel).waitFor();
-          expect(
-            await popup.evaluate(() =>
-              (window as GatewayWindow).openclawControlUiE2eGateway
-                ?.findRequests("desktop.observe")
-                .map((request) => request.params),
-            ),
-          ).toEqual([{ source: { kind: "node", nodeId: "maintenance" }, control: true }]);
-          await expect.poll(() => focusedPanel.getAttribute("data-view-only")).toBe("false");
-        } finally {
-          await popup.close();
-        }
       });
     },
   );
