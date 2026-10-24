@@ -52,6 +52,10 @@ function countTestLines(root: string, staged: boolean) {
   }
   const buffer = Buffer.alloc(64 * 1024);
   for (const file of files) {
+    // Unstaged deletions stay in ls-files; they count as zero lines.
+    if (!fs.existsSync(path.join(root, file))) {
+      continue;
+    }
     const descriptor = fs.openSync(path.join(root, file), "r");
     try {
       let size;
