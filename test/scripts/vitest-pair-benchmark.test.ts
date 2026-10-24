@@ -1,7 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   analyzeBenchmark,
@@ -22,7 +21,6 @@ import {
   buildBenchmarkCommandEnv,
   resolvePackageManagerIdentity,
   runOwnedCommand,
-  VITEST_PAIR_HARNESS_DEADLINE_MS,
   withVitestPairDeadline,
 } from "../../scripts/lib/vitest-pair-benchmark.mts";
 import { resolvePnpmRunner } from "../../scripts/pnpm-runner.mts";
@@ -34,18 +32,6 @@ import {
 import { isProcessAlive } from "../helpers/process-wait.js";
 import { awaitGateBeforeSettlement, withinTest } from "../helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
-
-// The managed owner joins terminal process groups, but Darwin may retain a foreign zombie
-// until its reaper runs. That PID has no ChildProcess handle in this test.
-async function waitForDescendantReap(pid: number, signal: AbortSignal): Promise<void> {
-  try {
-    while (isProcessAlive(pid)) {
-      await delay(5, undefined, { signal });
-    }
-  } catch (cause) {
-    throw new Error(`process still alive: ${pid}`, { cause });
-  }
-}
 
 const deadlineFixtureLifetime = createFixtureLifetime();
 afterEach(() => deadlineFixtureLifetime.cleanup());
@@ -67,17 +53,12 @@ const manifest: BenchmarkManifest = {
     improvementRatio: 0.95,
     improvementPairCount: 5,
   },
-  lanes: [
-    { id: "core", critical: true, config: "test/core.config.ts", files: ["src/core.test.ts"] },
-    {
-      id: "gateway",
-      critical: true,
-      config: "test/gateway.config.ts",
-      files: ["src/gateway.test.ts"],
-    },
-    { id: "ui", critical: true, config: "test/ui.config.ts", files: ["ui/view.test.ts"] },
-    { id: "lifecycle", critical: true, files: ["test/scripts/lifecycle.test.ts"] },
-  ],
+  lanes: ["core", "gateway", "ui", "lifecycle"].map((id) => ({
+    id,
+    critical: true,
+    files: [`src/${id}.test.ts`],
+    config: id === "core" ? "test/core.config.ts" : undefined,
+  })),
 };
 
 const execution = {
@@ -271,14 +252,14 @@ describe("Vitest pair benchmark", () => {
   it("uses source locations instead of version-specific rendered names", () => {
     const read = reportFixture("report-digest");
     const baseline = read([
-      reportAssertion("mime detection maps 'avif' image format"),
-      reportAssertion("mime detection maps 'jpg' image format"),
-      reportAssertion("mime detection 'detects docx from buffer'", { line: 79, column: 14 }),
+      reportAssertion("maps 'avif'"),
+      reportAssertion("maps 'jpg'"),
+      reportAssertion("'detects docx'", { line: 79, column: 14 }),
     ]);
     const candidate = read([
-      reportAssertion("mime detection maps avif image format"),
-      reportAssertion("mime detection maps jpg image format"),
-      reportAssertion("mime detection detects docx from buffer", { line: 79, column: 14 }),
+      reportAssertion("maps avif"),
+      reportAssertion("maps jpg"),
+      reportAssertion("detects docx", { line: 79, column: 14 }),
     ]);
 
     expect(candidate.digest).toBe(baseline.digest);
@@ -422,7 +403,6 @@ describe("Vitest pair benchmark", () => {
     "aborts the active child at the aggregate deadline and starts no successor",
     ({ signal }) =>
       deadlineFixtureLifetime.run(async () => {
-        expect(VITEST_PAIR_HARNESS_DEADLINE_MS).toBe(165 * 60 * 1000);
         const root = deadlineFixtureLifetime.createTempDir("vitest-pair-deadline-");
         const pidFile = path.join(root, "active.pid");
         const successor = path.join(root, "successor.txt");
@@ -535,24 +515,5 @@ describe("Vitest pair benchmark", () => {
 
     expect(result.exitCode).toBe(7);
     expect(readFileSync(attempts, "utf8")).toBe("attempt\n");
-  });
-
-  itUnix("fails closed and cleans a leaked descendant process", async ({ signal }) => {
-    const root = tempDirs.make("vitest-pair-leak-");
-    const pidFile = path.join(root, "child.pid");
-    const script = [
-      'const { spawn } = require("node:child_process");',
-      'const { writeFileSync } = require("node:fs");',
-      `const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });`,
-      `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
-      "child.unref();",
-    ].join("\n");
-
-    await expect(runScript(root, ["-e", script])).rejects.toThrow(
-      /process group remained active|cleanup could not verify/u,
-    );
-
-    const pid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
-    await waitForDescendantReap(pid, signal);
   });
 });

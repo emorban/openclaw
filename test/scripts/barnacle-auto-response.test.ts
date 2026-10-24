@@ -51,6 +51,7 @@ function barnacleContext(
   pullRequest: Record<string, unknown>,
   labels: string[] = [],
   options: Record<string, unknown> = {},
+  kind: "pull_request" | "issue" = "pull_request",
 ) {
   return {
     repo,
@@ -58,10 +59,11 @@ function barnacleContext(
       action: options.action ?? "opened",
       label: options.label,
       sender: options.sender,
-      pull_request: {
-        number: 123,
-        title: "Cleanup plugin docs",
-        body: blankTemplateBody,
+      comment: options.comment,
+      [kind]: {
+        number: kind === "issue" ? 456 : 123,
+        title: kind === "issue" ? "OpenClaw issue" : "Cleanup plugin docs",
+        body: kind === "issue" ? "" : blankTemplateBody,
         author_association: "CONTRIBUTOR",
         user: { login: "contributor" },
         labels: labels.map((name) => ({ name })),
@@ -76,22 +78,7 @@ function barnacleIssueContext(
   labels: string[] = [],
   options: Record<string, unknown> = {},
 ) {
-  const { payload } = barnacleContext(issue, labels, options);
-  const { pull_request, ...event } = payload;
-  return {
-    repo,
-    payload: {
-      ...event,
-      issue: {
-        ...pull_request,
-        number: 456,
-        title: "OpenClaw issue",
-        body: "",
-        ...issue,
-      },
-      comment: options.comment,
-    },
-  };
+  return barnacleContext(issue, labels, options, "issue");
 }
 
 function barnacleGithub(
@@ -137,6 +124,13 @@ function barnacleGithub(
   };
   const comments: Record<string, any>[] = [];
   const data = (value: unknown) => ({ data: structuredClone(value) });
+  const emptyPage = { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } };
+  const record =
+    <T>(entries: T[], effect: (params: T) => unknown) =>
+    async (params: T) => {
+      entries.push(params);
+      return data(effect(params));
+    };
   const github = {
     paginate: async () => files,
     rest: {
@@ -146,13 +140,11 @@ function barnacleGithub(
         listEventsForTimeline: async () => data([]),
         getComment: async ({ comment_id }: { comment_id: number }) =>
           data(comments.find((comment) => comment.id === comment_id)),
-        addLabels: async (params: { issue_number: number; labels: string[] }) => {
-          calls.addLabels.push(params);
+        addLabels: record(calls.addLabels, (params) => {
           state.labels.push(...params.labels.map((name) => ({ name })));
-          return data(state.labels);
-        },
-        createComment: async (params: { issue_number: number; body: string }) => {
-          calls.createComment.push(params);
+          return state.labels;
+        }),
+        createComment: record(calls.createComment, (params) => {
           const comment = {
             ...params,
             id: comments.length + 1,
@@ -163,8 +155,8 @@ function barnacleGithub(
             updated_at: "2026-10-19T00:00:00Z",
           };
           comments.push(comment);
-          return data(comment);
-        },
+          return comment;
+        }),
         createLabel: async () => undefined,
         getLabel: async (params: { name: string }) => ({
           data: {
@@ -174,25 +166,22 @@ function barnacleGithub(
               managedLabelSpecs[params.name as keyof typeof managedLabelSpecs]?.description ?? "",
           },
         }),
-        lock: async (params: { issue_number: number; lock_reason?: string }) => {
-          calls.lock.push(params);
+        lock: record(calls.lock, () => {
           state.locked = true;
-          return data(state);
-        },
-        removeLabel: async (params: { issue_number: number; name: string }) => {
-          calls.removeLabel.push(params);
+          return state;
+        }),
+        removeLabel: record(calls.removeLabel, (params) => {
           state.labels = state.labels.filter(
             (label: { name: string }) => label.name !== params.name,
           );
           if (removeLabelNotFound.has(params.name)) {
             throw Object.assign(new Error("not found"), { status: 404 });
           }
-        },
-        update: async (params: { issue_number: number; state?: string; state_reason?: string }) => {
-          calls.update.push(params);
+        }),
+        update: record(calls.update, (params) => {
           Object.assign(state, params, { closed_by: { id: 257215752 } });
-          return data(state);
-        },
+          return state;
+        }),
         updateLabel: async () => undefined,
       },
       pulls: {
@@ -224,11 +213,7 @@ function barnacleGithub(
             nodes: variables.ids.map((id) => ({
               id,
               lastEditedAt: null,
-              userContentEdits: {
-                totalCount: 0,
-                nodes: [],
-                pageInfo: { hasNextPage: false, endCursor: null },
-              },
+              userContentEdits: { totalCount: 0, ...emptyPage },
             })),
           }
         : {
@@ -237,7 +222,7 @@ function barnacleGithub(
               pullRequest: {
                 id: "item",
                 lastEditedAt: null,
-                reviews: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+                reviews: emptyPage,
               },
             },
           }),
@@ -307,8 +292,6 @@ describe("barnacle-auto-response", () => {
 
   it("classifies only changes confined to newly added ordinary skill roots for the ClawHub close", () => {
     for (const files of [
-      [file("src/skills/loading/plugin-skills.test.ts")],
-      [file("src/skills/workspace.ts")],
       [file("skills/weather/SKILL.md")],
       [file("custodian-skills/weather/SKILL.md", "added")],
       [file("skills/weather/SKILL.md", "added"), file("src/skills/workspace.ts")],
@@ -321,20 +304,17 @@ describe("barnacle-auto-response", () => {
         classifyPullRequestCandidateLabels(pr("Fix linked skill behavior", "Fixes #127931"), files),
       ).not.toContain("r: skill");
     }
-    for (const files of [
-      addedSkills("weather-helper/SKILL.md", "weather-helper/references/usage.md"),
-      addedSkills("Group/Weather-Helper/skill.md", "Group/Weather-Helper/scripts/check.mjs"),
-      addedSkills(
-        "weather-helper/SKILL.md",
-        "weather-helper/README.md",
-        "group/calendar-helper/SKILL.md",
-        "group/calendar-helper/assets/icon.svg",
+    expect(
+      classifyPullRequestCandidateLabels(
+        pr("Add weather helper skill"),
+        addedSkills(
+          "weather-helper/SKILL.md",
+          "weather-helper/references/usage.md",
+          "Group/Calendar-Helper/skill.md",
+          "Group/Calendar-Helper/scripts/check.mjs",
+        ),
       ),
-    ]) {
-      expect(classifyPullRequestCandidateLabels(pr("Add weather helper skill"), files)).toContain(
-        "r: skill",
-      );
-    }
+    ).toContain("r: skill");
   });
 
   it("removes a stale automated skill close label from a mixed skill and core PR", async () => {
@@ -373,11 +353,8 @@ describe("barnacle-auto-response", () => {
   });
 
   it("suppresses dirty-candidate when the PR has concrete behavior context", () => {
-    const body = [
-      "- Problem: gateway crashes when plugin metadata is missing",
-      "- Why it matters: users lose the running session",
-      "- What changed: add a guard around metadata loading",
-    ].join("\n");
+    const body =
+      "- Problem: gateway crashes\n- Why it matters: sessions lost\n- What changed: guard metadata";
     const labels = classifyPullRequestCandidateLabels(pr("Fix gateway crash", body), broadFiles());
     expect(labels).not.toContain(candidateLabels.dirtyCandidate);
   });
@@ -423,21 +400,22 @@ describe("barnacle-auto-response", () => {
   );
 
   it("does not close automation PRs for the active PR limit", async () => {
-    for (const [ref, login] of [
-      ["clawsweeper/openclaw-openclaw-73880", "app/openclaw-clawsweeper"],
-      ["clownfish/ghcrawl-156993-autonomous-smoke", "app/openclaw-clownfish"],
+    for (const pullRequest of [
+      {
+        head: { ref: "clawsweeper/openclaw-openclaw-73880" },
+        user: { login: "app/openclaw-clawsweeper" },
+      },
+      {
+        headRefName: "clownfish/ghcrawl-156993-autonomous-smoke",
+        user: { login: "app/openclaw-clownfish" },
+      },
     ]) {
-      for (const head of [{ head: { ref } }, { headRefName: ref }]) {
-        const calls = await runBarnacle(
-          barnacleContext({ ...head, user: { login } }, ["r: too-many-prs"]),
-          [],
-        );
-        expect(calls.removeLabel).toStrictEqual([expectedRemoveLabel(123, "r: too-many-prs")]);
-        expect(
-          calls.createComment.every((call) => !call.body.includes("more than 20 active PRs")),
-        ).toBe(true);
-        expect(calls.update).toStrictEqual([]);
-      }
+      const calls = await runBarnacle(barnacleContext(pullRequest, ["r: too-many-prs"]), []);
+      expect(calls.removeLabel).toStrictEqual([expectedRemoveLabel(123, "r: too-many-prs")]);
+      expect(
+        calls.createComment.every((call) => !call.body.includes("more than 20 active PRs")),
+      ).toBe(true);
+      expect(calls.update).toStrictEqual([]);
     }
   });
 

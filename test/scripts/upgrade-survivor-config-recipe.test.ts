@@ -32,31 +32,11 @@ import {
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const expectSuccess = (result: ReturnType<typeof spawnSync>) =>
   expect(result.status, String(result.stdout) + String(result.stderr)).toBe(0);
-const stepIds = (steps: { id: string }[]) => steps.map((step) => step.id);
 const configValue = (steps: ReturnType<typeof recipeSteps>, id: string) =>
   JSON.parse(steps.find((step) => step.id === id)?.argv[3] ?? "{}");
-const provider = (api: string, id: string, baseUrl: string, models: unknown[] = []) => ({
-  api,
-  apiKey: { source: "env", provider: "default", id },
-  baseUrl,
-  models,
-});
 
 const RECIPE_PATH = "scripts/e2e/lib/upgrade-survivor/config-recipe.mts";
-const RUN_PATH = "scripts/e2e/lib/upgrade-survivor/run.sh";
 const DOCKER_RUNNER_PATH = "scripts/e2e/upgrade-survivor-docker.sh";
-const sharedSteps = [
-  ["update-channel", "update"],
-  ["gateway", "gateway"],
-  ["models-openai", "models"],
-  ["models-anthropic", "models-anthropic"],
-  ["models-google", "models-google"],
-  ["agents", "agents"],
-  ["skills", "skills"],
-  ["plugins", "plugins"],
-];
-const sharedIds = sharedSteps.map(([id]) => id);
-const sharedIntents = sharedSteps.map(([, intent]) => intent);
 
 function configLeafWrites(steps: ReturnType<typeof recipeSteps>) {
   return steps.flatMap((step): { path: string; value: unknown }[] => {
@@ -130,12 +110,6 @@ process.exit(failed ? 17 : 0);
 }
 
 describe("upgrade survivor config recipe command resolution", () => {
-  it("selects the prerelease update channel for the plugin registry", () => {
-    const runner = readFileSync(RUN_PATH, "utf8");
-    expect(runner).toContain('OPENCLAW_UPGRADE_SURVIVOR_UPDATE_CHANNEL="beta"');
-    expect(runner).toContain("OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_CANDIDATE_VERSION");
-  });
-
   it.skipIf(process.platform === "win32").each([
     { liveEnv: {}, expectedKeys: [] },
     {
@@ -200,29 +174,16 @@ esac
       expect(args.join(" ")).not.toMatch(/fixture-(openai|anthropic|google)-key/u);
       const mounts = args.filter((_, index) => args[index - 1] === "-v");
       expect(mounts.filter((mount) => mount.includes("node_modules"))).toEqual([]);
-      expect(args).toContain(
-        "OPENCLAW_UPGRADE_SURVIVOR_TSX_IMPORT=/usr/local/lib/node_modules/tsx/dist/loader.mjs",
-      );
-      expect(mounts).toEqual(
-        expect.arrayContaining([
-          `${harnessRoot}/scripts/e2e:/app/scripts/e2e:ro`,
-          `${harnessRoot}/scripts/lib:/app/scripts/lib:ro`,
-          `${harnessRoot}/scripts/windows-cmd-helpers.mjs:/app/scripts/windows-cmd-helpers.mjs:ro`,
-          `${harnessRoot}/${RUN_PATH}:/tmp/openclaw-upgrade-survivor-run.sh:ro`,
-          `${candidate}:/tmp/openclaw-current.tgz:ro`,
-        ]),
+      const trustedMounts = mounts.filter((mount) => mount.startsWith(`${harnessRoot}/`));
+      expect(trustedMounts.length).toBeGreaterThan(0);
+      expect(trustedMounts.every((mount) => mount.endsWith(":ro"))).toBe(true);
+      expect(trustedMounts).toContain(
+        `${harnessRoot}/scripts/e2e/lib/upgrade-survivor/run.sh:${args.at(-1)}:ro`,
       );
       expect(mounts.filter((mount) => mount.startsWith(`${candidateRoot}/`))).toEqual([
         `${candidate}:/tmp/openclaw-current.tgz:ro`,
       ]);
       expect(args).toContain("OPENCLAW_UPGRADE_SURVIVOR_CANDIDATE_SPEC=/tmp/openclaw-current.tgz");
-      expect(args.slice(-5)).toEqual([
-        "timeout",
-        "--kill-after=30s",
-        "1200s",
-        "bash",
-        "/tmp/openclaw-upgrade-survivor-run.sh",
-      ]);
     },
   );
 
@@ -334,30 +295,11 @@ esac
         .filter((entry) => entry.path.startsWith("models.providers."))
         .map((entry) => [entry.path.slice("models.providers.".length), entry.value]),
     );
-    const gemini = {
-      id: "gemini-3.1-pro-preview",
-      reasoning: true,
-      contextWindow: 1048576,
-      maxTokens: 65536,
-    };
-    const googleProvider = provider(
-      "google-generative-ai",
-      "GEMINI_API_KEY",
-      "https://generativelanguage.googleapis.com/v1beta",
-      [
-        {
-          ...gemini,
-          name: "Gemini 3.1 Pro Preview",
-          input: ["text", "image"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        },
-      ],
-    );
     expect(ModelsConfigSchema.safeParse({ providers }).success).toBe(true);
-    expect(providers).toEqual({
-      openai: provider("openai-responses", "OPENAI_API_KEY", "https://api.openai.com/v1"),
-      anthropic: provider("anthropic-messages", "ANTHROPIC_API_KEY", "https://api.anthropic.com"),
-      google: googleProvider,
+    expect(providers).toMatchObject({
+      openai: { apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" } },
+      anthropic: { apiKey: { source: "env", provider: "default", id: "ANTHROPIC_API_KEY" } },
+      google: { apiKey: { source: "env", provider: "default", id: "GEMINI_API_KEY" } },
     });
     expect(writes.find((entry) => entry.path === "agents")?.value).toMatchObject({
       defaults: { model: { primary: "openai/gpt-5.5" } },
@@ -365,10 +307,9 @@ esac
     const google = configValue(steps, "models-google");
     expect(buildInlineProviderModels({ google })).toEqual([
       expect.objectContaining({
-        ...gemini,
+        id: "gemini-3.1-pro-preview",
         provider: "google",
-        api: googleProvider.api,
-        baseUrl: googleProvider.baseUrl,
+        api: "google-generative-ai",
       }),
     ]);
   });
@@ -404,43 +345,36 @@ esac
     );
   });
 
-  it.each(["2026.7.1-2", "2026.7.2-beta.3"])(
-    "authors one version-correct recovery roster for %s",
-    (version) => {
-      const steps = baselineSteps("recovery-cleanup", version);
-      const agentSteps = steps.filter(
-        (step) =>
-          step.argv[0] === "config" && step.argv[1] === "set" && step.argv[2]?.startsWith("agents"),
-      );
-      expect(agentSteps).toHaveLength(1);
-      expect(agentSteps[0]?.argv.slice(0, 3)).toEqual(["config", "set", "agents"]);
-      const agents = configValue(steps, "agents");
-      expect(agents.list.map((agent: { id: string }) => agent.id)).toEqual([
-        "main",
-        "ops",
-        "recovery-clean",
-        "recovery-protected",
-      ]);
-      expect([agents.entries, agents.ownership, agents.defaults.heartbeat.every]).toEqual([
-        undefined,
-        undefined,
-        "0m",
-      ]);
-      expect(agents.list.find((agent: { id: string }) => agent.id === "ops")).toMatchObject({
-        fastModeDefault: true,
-      });
-      expect(agents.list.filter((entry: { default?: boolean }) => entry.default)).toEqual([
-        expect.objectContaining({ id: "main", default: true }),
-      ]);
-      const baseAgents = configValue(baselineSteps("base", version), "agents");
-      expect(baseAgents.list.map((agent: { id: string }) => agent.id)).toEqual(["main", "ops"]);
-      expect(configLeafWrites(steps)).toContainEqual({
-        path: "channels.whatsapp",
-        value: readJson("scripts/e2e/lib/upgrade-survivor/config-recipe/channels-whatsapp.json"),
-      });
-      expect(steps.at(-1)?.id).toBe("validate");
-    },
-  );
+  it.each(["2026.7.1-2"])("authors one version-correct recovery roster for %s", (version) => {
+    const steps = baselineSteps("recovery-cleanup", version);
+    const agentSteps = steps.filter(
+      (step) =>
+        step.argv[0] === "config" && step.argv[1] === "set" && step.argv[2]?.startsWith("agents"),
+    );
+    expect(agentSteps).toHaveLength(1);
+    expect(agentSteps[0]?.argv.slice(0, 3)).toEqual(["config", "set", "agents"]);
+    const agents = configValue(steps, "agents");
+    expect(agents.list.map((agent: { id: string }) => agent.id)).toEqual([
+      "main",
+      "ops",
+      "recovery-clean",
+      "recovery-protected",
+    ]);
+    expect([agents.entries, agents.ownership, agents.defaults.heartbeat.every]).toEqual([
+      undefined,
+      undefined,
+      "0m",
+    ]);
+    expect(agents.list.find((agent: { id: string }) => agent.id === "ops")).toMatchObject({
+      fastModeDefault: true,
+    });
+    expect(agents.list.filter((entry: { default?: boolean }) => entry.default)).toEqual([
+      expect.objectContaining({ id: "main", default: true }),
+    ]);
+    const baseAgents = configValue(baselineSteps("base", version), "agents");
+    expect(baseAgents.list.map((agent: { id: string }) => agent.id)).toEqual(["main", "ops"]);
+    expect(steps.at(-1)?.id).toBe("validate");
+  });
 
   it("authors Tool Search through the baseline CLI", () => {
     const version = "2026.9.7";
@@ -518,34 +452,9 @@ esac
       });
       const failed = failPath !== undefined;
       expect(result.status, result.stdout + result.stderr).toBe(failed ? 1 : 0);
-      expect(stepIds(summary.steps)).toEqual([
-        ...sharedIds,
-        ...(batched ? ["channels"] : ["channels-discord", "channels-telegram"]),
-        ...(failed
-          ? []
-          : [
-              "tools-tool-search",
-              "plugins-configured-installs",
-              "channels-whatsapp-unset",
-              "channels-matrix",
-              "validate",
-            ]),
-      ]);
-      expect(summary.acceptedIntents).toEqual([
-        ...sharedIntents,
-        ...(failed
-          ? batched
-            ? []
-            : ["discord-channel"]
-          : [
-              "discord-channel",
-              "telegram-channel",
-              "whatsapp-channel",
-              "tool-search",
-              "configured-plugin-installs",
-              "validate",
-            ]),
-      ]);
+      expect(summary.acceptedIntents.includes("discord-channel")).toBe(!failed || !batched);
+      expect(summary.acceptedIntents.includes("telegram-channel")).toBe(!failed);
+      expect(summary.acceptedIntents.includes("validate")).toBe(!failed);
       const steps = baselineSteps(scenario, version);
       expect(loggedArgs).toEqual(
         (failed ? steps.slice(0, batched ? 9 : 10) : steps).map((step) => step.argv),

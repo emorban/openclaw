@@ -51,6 +51,20 @@ const ANDROID_TOOLING_SHA = "d".repeat(40);
 const ANDROID_PROTECTED_REF = `release-publish/${ANDROID_TOOLING_SHA.slice(0, 12)}-123`;
 const ANDROID_ASSETS = ["OpenClaw-Android.apk", "OpenClaw-Android-SHA256SUMS.txt"];
 const FAILED_PARENT = { status: "completed", conclusion: "failure" };
+type Fields = Record<string, unknown>;
+type Publication = Partial<
+  Record<
+    | "afterAdmission"
+    | "afterFirstUpload"
+    | "afterToolingRead"
+    | "nativeCiAfterAdmission"
+    | "nativeCiAfterAssetLookup"
+    | "nativeCiAfterFirstUpload"
+    | "nativeCiAfterToolingRead"
+    | "release",
+    Fields
+  >
+> & { beforeProvenance?: boolean; targetSha?: string };
 
 function workflowStep(file: string, name: string): string {
   const workflow = parse(fs.readFileSync(file, "utf8"));
@@ -81,26 +95,15 @@ function runAndroidApproval({
   publication,
 }: {
   ref?: string;
-  approval?: Record<string, unknown>;
-  run?: Record<string, unknown>;
-  identity?: Record<string, unknown>;
+  approval?: Fields;
+  run?: Fields;
+  identity?: Fields;
   recovery?: boolean;
   attestationExitCode?: number;
-  release?: Record<string, unknown>;
+  release?: Fields;
   targetSha?: string;
-  nativeCi?: Record<string, unknown>;
-  publication?: {
-    afterAdmission?: Record<string, unknown>;
-    afterFirstUpload?: Record<string, unknown>;
-    afterToolingRead?: Record<string, unknown>;
-    nativeCiAfterAdmission?: Record<string, unknown>;
-    nativeCiAfterAssetLookup?: Record<string, unknown>;
-    nativeCiAfterFirstUpload?: Record<string, unknown>;
-    nativeCiAfterToolingRead?: Record<string, unknown>;
-    beforeProvenance?: boolean;
-    targetSha?: string;
-    release?: Record<string, unknown>;
-  };
+  nativeCi?: Fields;
+  publication?: Publication;
 } = {}) {
   const tempRoot = tempRoots.make("openclaw-android-approval-");
   fs.mkdirSync(path.join(tempRoot, ".release-harness"));
@@ -166,6 +169,8 @@ function runAndroidApproval({
   const nativeCiPath = path.join(tempRoot, "native-ci.json");
   const targetPath = path.join(tempRoot, "target.json");
   const effectsPath = path.join(tempRoot, "uploads.json");
+  const execute = (workflow: string, step: string, cwd?: string) =>
+    runWorkflowStep(`.github/workflows/${workflow}.yml`, step, env, cwd);
   writeJson(parentPath, parent);
   const nativeRun = {
     id: 91,
@@ -194,49 +199,53 @@ function runAndroidApproval({
     },
   });
   fs.writeFileSync(effectsPath, "[]");
+  writeJson(path.join(tempRoot, "fixture.json"), {
+    publication: publication ?? {},
+    parent,
+    nativeRun,
+    identityEndpoint: `repos/openclaw/openclaw/${identityEndpoint}`,
+    tooling,
+    attestationExitCode,
+  });
   fs.writeFileSync(
     path.join(tempRoot, "gh"),
     `#!${process.execPath}
 const fs = require("node:fs");
+const path = require("node:path");
 const args = process.argv.slice(2);
-const publication = ${JSON.stringify(publication ?? {})};
-const publishing = fs.existsSync(${JSON.stringify(path.join(tempRoot, "publishing"))});
-const parent = ${JSON.stringify(parent)}, nativeRun = ${JSON.stringify(nativeRun)};
+const file = name => path.join(process.env.RUNNER_TEMP, name);
+const {publication, parent, nativeRun, identityEndpoint, tooling, attestationExitCode} = require(file("fixture.json"));
+const publishing = fs.existsSync(file("publishing"));
 function replace(file, base, phase) {
   if (publication[phase]) fs.writeFileSync(file, JSON.stringify({ ...base, ...publication[phase] }));
 }
 function output(text) { process.stdout.write(text); process.exit(0); }
 if (args[0] === "attestation" && args[1] === "verify") {
-  process.exit(${attestationExitCode});
+  process.exit(attestationExitCode);
 }
 if (args[0] === "release" && args[1] === "view") {
-  if (args.includes("assets") && publishing) replace(${JSON.stringify(nativeCiPath)}, nativeRun, "nativeCiAfterAssetLookup");
-  output(JSON.stringify(JSON.parse(fs.readFileSync(${JSON.stringify(targetPath)}, "utf8")).release));
+  if (args.includes("assets") && publishing) replace(file("native-ci.json"), nativeRun, "nativeCiAfterAssetLookup");
+  output(JSON.stringify(JSON.parse(fs.readFileSync(file("target.json"), "utf8")).release));
 }
 if (args[0] === "release" && args[1] === "upload") {
-  const effects = JSON.parse(fs.readFileSync(${JSON.stringify(effectsPath)}, "utf8"));
+  const effects = JSON.parse(fs.readFileSync(file("uploads.json"), "utf8"));
   effects.push(args[3]);
-  fs.writeFileSync(${JSON.stringify(effectsPath)}, JSON.stringify(effects));
+  fs.writeFileSync(file("uploads.json"), JSON.stringify(effects));
   if (effects.length === 1) {
-    replace(${JSON.stringify(parentPath)}, parent, "afterFirstUpload");
-    replace(${JSON.stringify(nativeCiPath)}, nativeRun, "nativeCiAfterFirstUpload");
+    replace(file("parent.json"), parent, "afterFirstUpload");
+    replace(file("native-ci.json"), nativeRun, "nativeCiAfterFirstUpload");
   }
   process.exit(0);
 }
-const runs = ${JSON.stringify({
-      "repos/openclaw/openclaw/actions/runs/123": parentPath,
-      "repos/openclaw/openclaw/actions/runs/91": nativeCiPath,
-    })};
+const runs = { "repos/openclaw/openclaw/actions/runs/123": file("parent.json"),
+  "repos/openclaw/openclaw/actions/runs/91": file("native-ci.json") };
 if (args[0] === "api" && runs[args[1]]) output(fs.readFileSync(runs[args[1]], "utf8"));
-const responses = ${JSON.stringify({
-      [`repos/openclaw/openclaw/${identityEndpoint}`]: tooling,
-    })};
-if (args[0] !== "api" || !responses[args[1]]) process.exit(91);
+if (args[0] !== "api" || args[1] !== identityEndpoint) process.exit(91);
 if (publishing) {
-  replace(${JSON.stringify(parentPath)}, parent, "afterToolingRead");
-  replace(${JSON.stringify(nativeCiPath)}, nativeRun, "nativeCiAfterToolingRead");
+  replace(file("parent.json"), parent, "afterToolingRead");
+  replace(file("native-ci.json"), nativeRun, "nativeCiAfterToolingRead");
 }
-process.stdout.write(JSON.stringify(responses[args[1]]));
+process.stdout.write(JSON.stringify(tooling));
 `,
     { mode: 0o755 },
   );
@@ -254,20 +263,11 @@ if (JSON.stringify(args) === JSON.stringify(["rev-parse", "v2026.8.1^{commit}"])
 `,
     { mode: 0o755 },
   );
-  const producer = runWorkflowStep(
-    ".github/workflows/openclaw-release-publish.yml",
-    "Write Android release approval",
-    env,
-    tempRoot,
-  );
+  const producer = execute("openclaw-release-publish", "Write Android release approval", tempRoot);
   expect(producer.status, producer.stderr).toBe(0);
   writeJson(approvalPath, { ...JSON.parse(fs.readFileSync(approvalPath, "utf8")), ...approval });
   writeJson(nativeCiPath, { ...nativeRun, ...nativeCi });
-  let result = runWorkflowStep(
-    ".github/workflows/android-release.yml",
-    "Validate release approval and target",
-    env,
-  );
+  let result = execute("android-release", "Validate release approval and target");
   if (publication) {
     expect(result.status, result.stderr).toBe(0);
     writeJson(parentPath, { ...parent, ...publication.afterAdmission });
@@ -283,12 +283,11 @@ if (JSON.stringify(args) === JSON.stringify(["rev-parse", "v2026.8.1^{commit}"])
     for (const name of ANDROID_ASSETS) {
       fs.writeFileSync(path.join(tempRoot, "dist", name), "fixture");
     }
-    result = runWorkflowStep(
-      ".github/workflows/android-release.yml",
+    result = execute(
+      "android-release",
       publication.beforeProvenance
         ? "Revalidate release approval before Android provenance"
         : "Upload immutable Android release assets",
-      env,
       tempRoot,
     );
   }
@@ -475,10 +474,10 @@ describe("scripts/validate-release-publish-approval.mjs", () => {
   androidIt("rechecks failure parent authority immediately before provenance", () => {
     const workflow = parse(fs.readFileSync(".github/workflows/android-release.yml", "utf8"));
     const steps = workflow.jobs.publish_signed_android_apk.steps;
-    const provenanceIndex = steps.findIndex(
+    const provenance = steps.findIndex(
       (step: { name: string }) => step.name === "Attest Android APK provenance",
     );
-    expect(steps[provenanceIndex - 1].name).toBe(
+    expect(steps[provenance - 1]?.name).toBe(
       "Revalidate release approval before Android provenance",
     );
     rejectAndroid({
