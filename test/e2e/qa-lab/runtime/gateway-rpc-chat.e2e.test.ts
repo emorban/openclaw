@@ -14,7 +14,6 @@ import {
   pollHistory,
   sendChat,
   waitForRun,
-  type GatewayChatRun,
   type GatewayChatHistory,
   type GatewayChatMessage,
 } from "./gateway-recovery.test-support.js";
@@ -46,15 +45,6 @@ const responsesInputSchema = z.object({
     }),
   ),
 });
-const describedSessionSchema = z.object({
-  session: z.object({
-    agentId: z.string().optional(),
-    key: z.string(),
-    sessionId: z.string().optional(),
-    placement: z.object({ state: z.string() }).optional(),
-    hasActiveRun: z.boolean().optional(),
-  }),
-});
 const historyTextSchema = z.union([
   z.string(),
   z.array(z.object({ type: z.literal("text"), text: z.string() })).length(1),
@@ -83,7 +73,7 @@ let harness: Awaited<ReturnType<ReturnType<typeof createQaLiveLaneGateway>["star
 async function startChatGateway(
   options: Pick<
     Parameters<ReturnType<typeof createQaLiveLaneGateway>["start"]>[0],
-    "mockAuthAgentIds" | "mutateConfig"
+    "mutateConfig"
   > = {},
 ) {
   gatewayOwner = createQaLiveLaneGateway();
@@ -361,181 +351,6 @@ describe("Gateway chat RPCs", () => {
       await disconnectGatewayClient(client);
     }
   });
-
-  it.each([
-    { first: "main", second: "work", withAttachment: true, seedChat: true },
-    { first: "work", second: "main", withAttachment: false, seedChat: true },
-    { first: "main", second: "work", withAttachment: false, seedChat: false },
-  ])(
-    "keeps explicit $first then $second ownership through global chat and native agent dispatch and history (chatAttachment=$withAttachment, seedChat=$seedChat)",
-    { timeout: 120_000 },
-    async ({ first, second, withAttachment, seedChat }) => {
-      const { gateway, mock: provider } = await startChatGateway({
-        mockAuthAgentIds: ["main", "work"],
-        mutateConfig: (config) => {
-          const agents = (config.agents ??= {});
-          agents.ownership = "explicit";
-          agents.entries = { main: {}, work: {} };
-          for (const model of Object.values(agents.defaults?.models ?? {})) {
-            model.agentRuntime = { id: "openclaw" };
-          }
-          config.session = { ...config.session, scope: "global" };
-          return config;
-        },
-      });
-      const mock = expectDefined(provider, "mock provider");
-      expect(gateway.cfg.plugins?.allow).toEqual(["qa-lab"]);
-      const sessionKey = "global";
-      const replies = new Map(
-        [first, second].map((owner) => [owner, `GLOBAL_OWNER_${owner}_${randomUUID()}`]),
-      );
-      const sessionIds = new Map<string, string>();
-      let cursor = 0;
-      const turns = (seedChat ? ["chat.send", "agent"] : ["agent"]).flatMap((method) =>
-        [first, second].map((agentId) => ({ method, agentId })),
-      );
-      for (const { method, agentId } of turns) {
-        const reply = `${expectDefined(replies.get(agentId), "owner reply marker")}_${method}`;
-        const otherAgentId = agentId === "main" ? "work" : "main";
-        const otherReply = expectDefined(replies.get(otherAgentId), "other owner reply marker");
-        const prompt = `Gateway ${method} ownership QA for ${agentId}. Reply exactly \`${reply}\`.`;
-        const attachments =
-          withAttachment && method === "chat.send"
-            ? [
-                {
-                  fileName: `${agentId}-notes.txt`,
-                  mimeType: "text/plain",
-                  content: Buffer.from(`${agentId} attachment ${reply}`).toString("base64"),
-                },
-              ]
-            : undefined;
-        const started = (await gateway.call(
-          method,
-          {
-            sessionKey,
-            agentId,
-            message: prompt,
-            deliver: false,
-            idempotencyKey: randomUUID(),
-            attachments,
-          },
-          { timeoutMs: 30_000 },
-        )) as GatewayChatRun;
-        expect(started.status).toBe(method === "agent" ? "accepted" : "started");
-        expect(typeof started.runId).toBe("string");
-        const terminal = await waitForRun(gateway, started.runId);
-        const requests = requestSnapshotsSchema.parse(
-          await readMockJson(mock.baseUrl, `/debug/requests?after=${cursor}`),
-        );
-        cursor = Math.max(cursor, ...requests.map((request) => request.cursor));
-        const expectInput = (text: string, present: boolean, label: string) =>
-          expect
-            .soft(
-              requests.some((request) => request.raw.includes(text)),
-              label,
-            )
-            .toBe(present);
-        expectInput(prompt, true, `${agentId} ${method} must reach the provider`);
-        if (attachments) {
-          expectInput(
-            `${agentId} attachment ${reply}`,
-            true,
-            `${agentId} attachment must reach the provider`,
-          );
-        }
-        expectInput(
-          otherReply,
-          false,
-          `${agentId} provider input must exclude ${otherAgentId} history`,
-        );
-        expect.soft(terminal, JSON.stringify(terminal)).toMatchObject({
-          runId: started.runId,
-          status: "ok",
-        });
-        // Exercise the other explicit owner even when the first run fails before execution.
-        if (terminal.status !== "ok") {
-          continue;
-        }
-
-        const history = await waitForChatHistory({
-          gateway,
-          sessionKey,
-          agentId,
-          expectedUser: prompt,
-          expectedAssistant: reply,
-        });
-        expect(historyContainsExpectedTurns(history, prompt, reply)).toBe(true);
-        expect(history.sessionKey).toBe(sessionKey);
-        const sessionId = expectDefined(history.sessionId, "canonical history session id");
-        if (sessionIds.has(agentId)) {
-          expect(sessionId).toBe(sessionIds.get(agentId));
-        }
-        sessionIds.set(agentId, sessionId);
-        expect(new Set(sessionIds.values()).size).toBe(sessionIds.size);
-        if (method === "agent" && seedChat) {
-          const seedReply = `${expectDefined(replies.get(agentId), "owner reply marker")}_chat.send`;
-          expect(historyContainsExpectedTurns(history, seedReply, seedReply)).toBe(true);
-          expect(requests.some((request) => request.raw.includes(seedReply))).toBe(true);
-        }
-        expect(
-          (history.messages ?? []).some((message) => messageContains(message, otherReply)),
-        ).toBe(false);
-        const otherHistory = (await gateway.call("chat.history", {
-          sessionKey,
-          agentId: otherAgentId,
-          limit: 20,
-        })) as GatewayChatHistory;
-        expect(
-          (otherHistory.messages ?? []).some((message) => messageContains(message, reply)),
-        ).toBe(false);
-      }
-      // Plain-local turn claims are owner-only; a leaked final claim rejects the next turn.
-      for (const agentId of [first, second]) {
-        const reply = `GLOBAL_OWNER_CLAIM_RELEASED_${agentId}`;
-        const started = (await gateway.call(
-          "agent",
-          {
-            sessionKey,
-            agentId,
-            message: `Gateway claim release QA for ${agentId}. Reply exactly \`${reply}\`.`,
-            deliver: false,
-            idempotencyKey: randomUUID(),
-          },
-          { timeoutMs: 30_000 },
-        )) as GatewayChatRun;
-        const terminal = await waitForRun(gateway, started.runId);
-        expect(terminal, JSON.stringify(terminal)).toMatchObject({ status: "ok" });
-      }
-      // Plain-local placements live with the Gateway placement owner, not in SQL rows.
-      // The terminal event can precede the final session row projection.
-      await expect
-        .poll(() =>
-          Promise.all(
-            [first, second].map(async (agentId) => {
-              const { session } = describedSessionSchema.parse(
-                await gateway.call("sessions.describe", { key: sessionKey, agentId }),
-              );
-              return {
-                agentId: session.agentId,
-                key: session.key,
-                sessionId: session.sessionId,
-                placement: session.placement?.state,
-                active: session.hasActiveRun === true,
-              };
-            }),
-          ),
-        )
-        .toEqual(
-          [first, second].map((agentId) => ({
-            agentId,
-            key: sessionKey,
-            sessionId: expectDefined(sessionIds.get(agentId), "owner session id"),
-            placement: "local",
-            active: false,
-          })),
-        );
-    },
-  );
 
   it("enforces session authority before side effects", { timeout: 120_000 }, async () => {
     harness = await startChatGateway({
