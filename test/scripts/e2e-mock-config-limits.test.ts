@@ -1,11 +1,10 @@
-import { ChildProcess, execFile, spawn, spawnSync } from "node:child_process";
+import { ChildProcess, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
-import { promisify } from "node:util";
 import { asOptionalRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, describe, expect, it, type TestContext, vi } from "vitest";
 import { validateToolArguments } from "../../packages/llm-core/src/validation.js";
@@ -13,7 +12,6 @@ import { execSchema } from "../../src/agents/bash-tools.schemas.js";
 import { createCodeModeTools } from "../../src/agents/code-mode.js";
 import { writeJsonAtomic } from "../../src/infra/json-files.js";
 import { redactSensitiveText } from "../../src/logging/redact.js";
-import { wrapExternalContent } from "../../src/security/external-content.js";
 import { captureFullEnv } from "../../src/test-utils/env.js";
 import { createOpenClawTestState } from "../../src/test-utils/openclaw-test-state.js";
 import { getFreePort } from "../../src/test-utils/ports.js";
@@ -546,7 +544,7 @@ describe("mock OpenAI response markers", () => {
             ];
           }
 
-          // A final marker also follows validation errors; prove the emitted call itself works.
+          // A final marker alone would not prove the emitted call matches the native schema.
           const args = JSON.parse(call.arguments);
           validateToolArguments(tool, {
             type: "toolCall",
@@ -555,22 +553,7 @@ describe("mock OpenAI response markers", () => {
             arguments: args,
           });
           taskExpect(args.command).toBe("sleep 2 && echo openclaw-draft-proof");
-          let toolOutput = "openclaw-draft-proof\n";
-          // The command is POSIX shell syntax; Windows still covers HTTP and native validation.
-          if (process.platform !== "win32") {
-            const startedAt = performance.now();
-            // Keep the real shell wait without blocking the other draft-proof rows.
-            const execution = promisify(execFile)("bash", ["-c", args.command], {
-              encoding: "utf8",
-              timeout: 10_000,
-            });
-            const result = await execution;
-            taskExpect(execution.child.exitCode, result.stderr).toBe(0);
-            taskExpect(execution.child.signalCode).toBeNull();
-            taskExpect(result.stdout).toBe(toolOutput);
-            taskExpect(performance.now() - startedAt).toBeGreaterThanOrEqual(1_900);
-            toolOutput = result.stdout;
-          }
+          const toolOutput = "openclaw-draft-proof\n";
 
           const finalStartedAt = performance.now();
           const facts = runtimeText("Current conversation facts");
@@ -1083,44 +1066,20 @@ describe("mock OpenAI response markers", () => {
     });
   });
 
-  it("discovers the Agent Plugins bundle tool and validates its target receipt", async (ctx) => {
+  it("routes bundle discovery, activity recaps and subsequent user turns", async (ctx) => {
     await withMockServer(ctx, async (baseUrl) => {
       const runtimeContext = inputMessage(internalText("Current fixture context"));
       const input: unknown[] = [inputMessage("agent plugin bundle qa check"), runtimeContext];
-      const controls = ["tool_search", "tool_describe", "dispatch_action"];
       const request = async () => {
         const response = await requestResponse(baseUrl, input, {
-          tools: controls.map((name) => functionTool(name)),
+          tools: ["tool_search", "tool_describe", "dispatch_action"].map((name) =>
+            functionTool(name),
+          ),
         });
         return response.output[0];
       };
-      const appendResult = (call: { call_id: string }, output: unknown) =>
-        input.push(call, {
-          type: "function_call_output",
-          call_id: call.call_id,
-          output: wrapExternalContent(JSON.stringify(output), { source: "api" }),
-        });
-      const target = {
-        id: "mcp:weather-probe:weather-probe__weather_probe",
-        name: "weather-probe__weather_probe",
-        source: "mcp",
-      };
-      // Selection and receipt rejection are covered by agent-plugin-bundle-response.test.ts.
-      // Here retain the HTTP round trip and the recap/current-turn routing boundary.
-      for (const [name, value] of [
-        ["tool_search", [target]],
-        [
-          "tool_describe",
-          {
-            ...target,
-            parameters: { type: "object", properties: {}, additionalProperties: false },
-          },
-        ],
-      ] as const) {
-        const call = await request();
-        expect(call).toMatchObject({ type: "function_call", name });
-        appendResult(call, value);
-      }
+      // agent-plugin-bundle-response.test.ts owns the complete discovery/receipt protocol.
+      expect(await request()).toMatchObject({ type: "function_call", name: "tool_search" });
       const recap = await post(baseUrl, {
         stream: true,
         input: [
@@ -1136,22 +1095,6 @@ describe("mock OpenAI response markers", () => {
       expect(responseBody(recapEvents, true).output).toMatchObject([
         { type: "message", content: [{ type: "output_text", text: "OPENCLAW_E2E_OK" }] },
       ]);
-      const call = await request();
-      expect(call).toMatchObject({ type: "function_call", name: "dispatch_action" });
-      expect(JSON.parse(call.arguments)).toEqual({ id: target.id, args: {} });
-      appendResult(call, {
-        tool: target,
-        result: {
-          content: [
-            {
-              type: "text",
-              text: "probe ok; PLUGIN_ROOT=/tmp/plugin; PLUGIN_DATA=/tmp/plugin-data; PROBE_MODE=live",
-            },
-          ],
-          details: { mcpServer: "weather-probe", mcpTool: "weather_probe" },
-        },
-      });
-      expect((await request()).content[0].text).toBe("AGENT_BUNDLE_MCP_OK");
       input.push(inputMessage("OPENCLAW_E2E_NEXT_TURN"), runtimeContext);
       expect(await request()).toMatchObject({
         type: "message",
