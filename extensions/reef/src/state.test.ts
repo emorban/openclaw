@@ -487,7 +487,7 @@ describe("Reef SQLite state", () => {
         revocation,
         reapproval,
         finalRevocation,
-        observed.then((receipt) => receipt.value),
+        observed.then((observedReceipt) => observedReceipt.value),
       ]);
       expect(settled).toEqual([review, review, review, { approved: false }]);
     } finally {
