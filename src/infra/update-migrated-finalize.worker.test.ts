@@ -211,6 +211,7 @@ it("keeps live callbacks and deadline owners out of the migrated wire contract",
 
 it("refuses a malformed post-core timeout before invoking the updater", async () => {
   const update = vi.fn();
+  // mock-isolation: Check input rejection without running package updates against the host.
   vi.doMock("../cli/update-cli/update-command.js", () => ({ updateCommand: update }));
   vi.stubEnv(POST_CORE_UPDATE_ENV, "1");
   vi.stubEnv(POST_CORE_UPDATE_RESULT_PATH_ENV, "/synthetic/post-core.json");
@@ -243,6 +244,7 @@ it.each([
   { field: "databaseGenerations", value: { "/synthetic/agent.sqlite": false } },
 ])("refuses malformed Doctor $field before maintenance", async ({ field, value }) => {
   const doctor = vi.fn();
+  // mock-isolation: Check input rejection without running maintenance against the host.
   vi.doMock("../flows/doctor-health.js", () => ({ runDoctorHealthFlow: doctor }));
   process.env.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH = "/synthetic/doctor.json";
   try {
