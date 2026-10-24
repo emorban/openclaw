@@ -1,4 +1,5 @@
 // Synthetic historical-window startup workload; use a fresh root for each cold sample.
+// Default settling includes memory-core's five-minute follow-up; 30 seconds isolates the initial pass.
 // node --import ./scripts/tsx.mjs scripts/perf/session-lifecycle-boot.ts --mode seed --root <internal-dir> --sessions 1000
 // SQLMEASURE_OBSERVER=<frozen-observer.cjs> node --import ./scripts/tsx.mjs scripts/perf/session-lifecycle-boot.ts --mode run --root <internal-dir> --output <new-internal-dir>
 import { spawn } from "node:child_process";
@@ -28,7 +29,7 @@ const { values } = parseArgs({
     output: { type: "string" },
     sessions: { type: "string", default: "1000" },
     entry: { type: "string", default: "dist/entry.js" },
-    "settle-seconds": { type: "string", default: "30" },
+    "settle-seconds": { type: "string", default: "330" },
     "steady-seconds": { type: "string", default: "60" },
     profile: { type: "boolean", default: false },
   },
