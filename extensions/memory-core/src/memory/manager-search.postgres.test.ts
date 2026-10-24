@@ -117,7 +117,13 @@ function createFixture(
     database = openEngineStore({
       anchor,
       input: { connection: dsn, schemaPrefix: "memory_search_test" },
-      schema: { id: "memory_search", version: 1, sqlite: "", postgres: schema },
+      schema: {
+        id: "memory_search",
+        version: 1,
+        sqlite: "",
+        postgres: schema,
+        postgresVectorSearchVersion: 2,
+      },
       openSqlite: () => {
         throw new Error("Unexpected SQLite memory search fixture");
       },
