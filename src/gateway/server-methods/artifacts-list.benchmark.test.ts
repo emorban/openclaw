@@ -1,3 +1,4 @@
+import { writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { DatabaseSync } from "node:sqlite";
@@ -14,8 +15,10 @@ import { closeOpenClawAgentDatabaseByPathAsync } from "../../state/openclaw-agen
 import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
+import { readSessionArtifacts } from "../session-transcript-readers.js";
 import { artifactsHandlers } from "./artifacts.js";
 import { createHistoryReadContext } from "./chat-history.test-helpers.js";
+import { listSessionBranchesForGateway } from "./sessions-branches-list.js";
 import type { RespondFn } from "./types.js";
 
 it.each(["default", "custom", "configured alias", "selected alias"] as const)(
@@ -103,9 +106,9 @@ it.each(["default", "custom", "configured alias", "selected alias"] as const)(
 );
 
 it.runIf(process.env.OPENCLAW_DB_WORKER_BENCH === "1")(
-  "measures artifacts.list over 500 files and persisted transcript metadata",
+  "measures artifacts.list over 500 URL artifacts and persisted transcript metadata",
   async () => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
       await captureRuntimeConfigAsyncReader()();
       const scope = {
         agentId: "main",
@@ -116,13 +119,10 @@ it.runIf(process.env.OPENCLAW_DB_WORKER_BENCH === "1")(
       const files = Array.from({ length: 500 }, (_, index) => ({
         type: "file",
         title: `result-${index}.txt`,
-        url: state.statePath(`result-${index}.txt`),
+        url: `https://artifacts.example.test/results/result-${index}.txt`,
         mimeType: "text/plain",
         sizeBytes: 4096,
       }));
-      for (const file of files) {
-        await fs.writeFile(file.url, "x".repeat(file.sizeBytes));
-      }
       await replaceTranscriptEvents(scope, [
         { type: "session", version: 3, id: scope.sessionId },
         ...files.map((file, index) => ({
@@ -137,48 +137,81 @@ it.runIf(process.env.OPENCLAW_DB_WORKER_BENCH === "1")(
       ]);
       await waitForSessionTranscriptProjection(scope);
       const context = await createHistoryReadContext();
-      const request = async () => {
-        let response: Parameters<RespondFn> | undefined;
-        await artifactsHandlers["artifacts.list"]!({
-          params: { sessionKey: scope.sessionKey },
-          context,
-          client: null,
-          req: { type: "req", id: "artifact-bench", method: "artifacts.list" },
-          isWebchatConnect: () => false,
-          respond: (...args) => {
-            response = args;
-          },
-        });
-        expect(response?.[0]).toBe(true);
-        expect(response?.[1]).toMatchObject({ artifacts: expect.any(Array) });
-        return JSON.stringify(response?.[1]);
-      };
-      const coldStart = performance.now();
-      const golden = await request();
-      const coldMs = performance.now() - coldStart;
-      expect(JSON.parse(golden).artifacts).toHaveLength(500);
-      const samples = [];
-      for (let round = 0; round < 9; round++) {
-        const start = performance.now();
-        const cpu = process.threadCpuUsage();
-        const response = await request();
-        const elapsed = process.threadCpuUsage(cpu);
-        const wallMs = performance.now() - start;
-        expect(response).toBe(golden);
-        if (round >= 2) {
-          samples.push({ wallMs, mainThreadCpuMs: (elapsed.user + elapsed.system) / 1000 });
-        }
+      if (process.env.OPENCLAW_ARTIFACT_BENCH_PAUSE === "1") {
+        // The Linux controller moves this scope from preparation to measurement CPUs.
+        writeSync(1, `${JSON.stringify({ artifactBenchReadyPid: process.pid })}\n`);
+        process.kill(process.pid, "SIGSTOP");
       }
-      console.log(
-        JSON.stringify({
-          method: "artifacts.list",
-          files: files.length,
-          coldMs,
-          samples,
-          medianWallMs: samples.map((s) => s.wallMs).toSorted((a, b) => a - b)[3],
-          medianMainThreadCpuMs: samples.map((s) => s.mainThreadCpuMs).toSorted((a, b) => a - b)[3],
-        }),
-      );
+      for (const method of ["artifacts.list", "sessions.branches.list"] as const) {
+        const request = async () => {
+          let response: Parameters<RespondFn> | undefined;
+          const handler =
+            method === "artifacts.list"
+              ? artifactsHandlers["artifacts.list"]!
+              : listSessionBranchesForGateway;
+          await handler({
+            params: { sessionKey: scope.sessionKey },
+            context,
+            client: null,
+            req: { type: "req", id: "artifact-bench", method },
+            isWebchatConnect: () => false,
+            respond: (...args) => {
+              response = args;
+            },
+          });
+          return response;
+        };
+        const coldStart = performance.now();
+        const first = await request();
+        const coldMs = performance.now() - coldStart;
+        expect(first?.[0]).toBe(true);
+        const golden = JSON.stringify(first?.[1]);
+        const field = method === "artifacts.list" ? "artifacts" : "branches";
+        expect(JSON.parse(golden)[field]).toHaveLength(method === "artifacts.list" ? 500 : 1);
+        const workerResult =
+          method === "artifacts.list"
+            ? await readSessionArtifacts(scope, {
+                kind: "list",
+                sessionKey: scope.sessionKey,
+                includeDownloadData: false,
+              })
+            : undefined;
+        const samples = [];
+        const warmup = 25;
+        const count = 1200;
+        for (let round = 0; round < warmup + count; round++) {
+          const start = performance.now();
+          const cpu = process.threadCpuUsage();
+          const response = await request();
+          const elapsed = process.threadCpuUsage(cpu);
+          const wallMs = performance.now() - start;
+          expect(response?.[0]).toBe(true);
+          expect(JSON.stringify(response?.[1])).toBe(golden);
+          if (round >= warmup) {
+            samples.push({ wallMs, mainThreadCpuMs: (elapsed.user + elapsed.system) / 1000 });
+          }
+        }
+        const wall = samples.map((sample) => sample.wallMs).toSorted((a, b) => a - b);
+        const cpu = samples.map((sample) => sample.mainThreadCpuMs).toSorted((a, b) => a - b);
+        console.log(
+          JSON.stringify({
+            method,
+            files: files.length,
+            coldMs,
+            samples: samples.length,
+            workerResultJsonBytes: workerResult
+              ? Buffer.byteLength(JSON.stringify(workerResult))
+              : undefined,
+            responseBytes: Buffer.byteLength(golden),
+            meanWallMs: wall.reduce((sum, value) => sum + value, 0) / count,
+            medianWallMs: wall[Math.floor(count / 2)],
+            p95WallMs: wall[Math.ceil(count * 0.95) - 1],
+            p99WallMs: wall[Math.ceil(count * 0.99) - 1],
+            maxWallMs: wall.at(-1),
+            meanMainThreadCpuMs: cpu.reduce((sum, value) => sum + value, 0) / count,
+          }),
+        );
+      }
     });
   },
 );
