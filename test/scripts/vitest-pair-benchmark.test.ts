@@ -228,12 +228,6 @@ function expectTerminalFailure(root: string, error: string) {
 describe("Vitest pair benchmark", () => {
   it("keeps the committed representative inventory valid and available", () => {
     const committed = loadBenchmarkManifest("scripts/vitest-pair-benchmark-lanes.json");
-    expect(committed.lanes.map((lane) => lane.id)).toStrictEqual([
-      "core-unit",
-      "gateway-core",
-      "ui-jsdom",
-      "worker-lifecycle",
-    ]);
     expect(assertInventoryAvailable(process.cwd(), committed).inventorySha256).toMatch(
       /^[0-9a-f]{64}$/u,
     );

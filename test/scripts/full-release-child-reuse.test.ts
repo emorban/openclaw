@@ -206,6 +206,13 @@ async function fixture(
     attempts,
   };
 }
+type ReuseFixture = Awaited<ReturnType<typeof fixture>>;
+type Selection = NonNullable<Awaited<ReturnType<typeof discoverReusableReleaseChild>>>;
+type Mutation = (data: ReuseFixture, selection: Selection) => void | Promise<void>;
+const attemptError = "current successful attempt";
+const artifactError = "artifact identity, digest, or expiry";
+const publisherError = "publisher step did not succeed";
+const originError = "source parent origin";
 
 describe("independent release child reuse", () => {
   it("accepts candidate-owned evidence outside main ancestry", async () => {
@@ -340,27 +347,14 @@ describe("independent release child reuse", () => {
     ).toEqual(data.receipt.jobs);
   });
 
-  it.each<
-    [
-      string,
-      (
-        data: Awaited<ReturnType<typeof fixture>>,
-        selection: NonNullable<Awaited<ReturnType<typeof discoverReusableReleaseChild>>>,
-      ) => void | Promise<void>,
-      string,
-    ]
-  >([
+  it.each<[string, Mutation, string]>([
     [
       "non-main-ancestor tooling",
       (data) => void (data.lineage.status = "diverged"),
       "not a main ancestor",
     ],
-    ["new child attempt", (data) => void (data.run.run_attempt = 2), "current successful attempt"],
-    [
-      "failed child",
-      (data) => void (data.run.conclusion = "failure"),
-      "current successful attempt",
-    ],
+    ["new attempt", (data) => void (data.run.run_attempt = 2), attemptError],
+    ["failed child", (data) => void (data.run.conclusion = "failure"), attemptError],
     [
       "different workflow",
       (data) => void (data.run.path = ".github/workflows/counterfeit.yml"),
@@ -369,27 +363,27 @@ describe("independent release child reuse", () => {
     [
       "foreign repository",
       (data) => void (data.run.head_repository.full_name = "other/repo"),
-      "current successful attempt",
+      attemptError,
     ],
     [
       "expired artifact",
       (data) => void (data.artifact.expires_at = "2026-09-22T00:00:00Z"),
-      "artifact identity, digest, or expiry",
+      artifactError,
     ],
     [
       "counterfeit artifact owner",
       (data) => void (data.artifact.workflow_run.id = 999),
-      "artifact identity, digest, or expiry",
+      artifactError,
     ],
     [
       "failed upload hidden by job COE",
       (data) => void (data.jobs[2]!.steps[2]!.conclusion = "failure"),
-      "publisher step did not succeed",
+      publisherError,
     ],
     [
       "failed seal",
       (data) => void (data.jobs[2]!.steps[1]!.conclusion = "failure"),
-      "publisher step did not succeed",
+      publisherError,
     ],
     [
       "changed workload",
@@ -400,18 +394,10 @@ describe("independent release child reuse", () => {
     [
       "counterfeit parent origin",
       (data) => void (data.parent.path = ".github/workflows/unrelated.yml"),
-      "source parent origin",
+      originError,
     ],
-    [
-      "different parent workflow SHA",
-      (data) => void (data.parent.head_sha = "c".repeat(40)),
-      "source parent origin",
-    ],
-    [
-      "different parent workflow ref",
-      (data) => void (data.parent.head_branch = "other-transport"),
-      "source parent origin",
-    ],
+    ["parent SHA", (data) => void (data.parent.head_sha = "c".repeat(40)), originError],
+    ["parent ref", (data) => void (data.parent.head_branch = "other-transport"), originError],
     [
       "canonical receipt mutation with updated artifact digest",
       async (data, selection) => {
@@ -445,7 +431,7 @@ describe("independent release child reuse", () => {
           return github(endpoint);
         };
       },
-      "current successful attempt",
+      attemptError,
     ],
   ])("rejects %s at revalidation and discovery", async (_name, mutate, error) => {
     const data = await fixture();

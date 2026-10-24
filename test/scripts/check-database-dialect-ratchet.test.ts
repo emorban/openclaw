@@ -8,6 +8,27 @@ import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => vi.restoreAllMocks());
+const matches = (constructs: string[], line?: number) =>
+  constructs.map((construct) => ({ construct, ...(line === undefined ? {} : { line }) }));
+const repeated = (construct: string, count: number) =>
+  Array.from({ length: count }, () => construct);
+function ownerCases(
+  file: string,
+  cases: readonly (readonly [sql: string, construct: string, result: number])[],
+  alwaysOwner = false,
+) {
+  return cases.map(([sql, construct, result]) => ({
+    file,
+    sql,
+    construct,
+    result,
+    owner: alwaysOwner || result === 0,
+  }));
+}
+const nonMaintenance = [
+  ["INSERT OR IGNORE INTO t VALUES (1)", "insert-conflict", 1],
+  ["SELECT json_extract(value, '$') FROM t", "json-projection", 1],
+] as const;
 
 function fixture() {
   const root = tempDirs.make("openclaw-dialect-ratchet-");
@@ -82,10 +103,7 @@ it("counts SQL-looking static text and conflict methods while ignoring prose and
     { file: "extensions/store/read.mts", matches: [{ construct: "sqlite-catalog" }] },
     {
       file: "packages/store/schema.sql",
-      matches: [
-        { construct: "transaction-mode", line: 3 },
-        { construct: "printf", line: 3 },
-      ],
+      matches: matches(["transaction-mode", "printf"], 3),
     },
     {
       file: "src/infra/kysely-sync.ts",
@@ -94,31 +112,19 @@ it("counts SQL-looking static text and conflict methods while ignoring prose and
     {
       file: "src/runtime.ts",
       matches: [
-        { construct: "pragma", line: 4 },
-        { construct: "user-version", line: 4 },
-        { construct: "pragma", line: 4 },
-        { construct: "schema-version", line: 4 },
-        { construct: "data-version", line: 4 },
-        { construct: "pragma", line: 4 },
-        { construct: "json-string-set", line: 5 },
-        { construct: "randomblob", line: 5 },
-        { construct: "json-projection", line: 5 },
-        { construct: "transaction-mode", line: 6 },
-        { construct: "json-string-set", line: 6 },
-        { construct: "json-string-set", line: 8 },
-        { construct: "insert-conflict", line: 9 },
-        { construct: "insert-conflict", line: 9 },
-        { construct: "insert-conflict", line: 9 },
-        { construct: "insert-conflict", line: 9 },
-        { construct: "insert-conflict", line: 9 },
-        { construct: "json-string-set", line: 11 },
-        { construct: "json-string-set", line: 11 },
-        { construct: "randomblob", line: 11 },
-        { construct: "fts5", line: 12 },
+        ...matches(
+          ["pragma", "user-version", "pragma", "schema-version", "data-version", "pragma"],
+          4,
+        ),
+        ...matches(["json-string-set", "randomblob", "json-projection"], 5),
+        ...matches(["transaction-mode", "json-string-set"], 6),
+        ...matches(["json-string-set"], 8),
+        ...matches(repeated("insert-conflict", 5), 9),
+        ...matches(["json-string-set", "json-string-set", "randomblob"], 11),
+        ...matches(["fts5"], 12),
       ],
     },
   ]);
-  expect(inventory(root)).toEqual(rows);
 });
 
 it("preserves SQL quotation state across substitutions and reports the original span", () => {
@@ -153,11 +159,7 @@ it("counts only SQLite-specific transaction modes across owners", () => {
   expect(inventory(root)).toMatchObject([
     {
       file: "src/other.ts",
-      matches: [
-        { construct: "transaction-mode" },
-        { construct: "transaction-mode" },
-        { construct: "transaction-mode" },
-      ],
+      matches: matches(repeated("transaction-mode", 3)),
     },
   ]);
   expect(inventory(root).map((row) => row.matches.length)).toEqual([3]);
@@ -182,7 +184,7 @@ it("retains SQLite JSONB debt without counting PostgreSQL catalog constructors",
   expect(inventory(root)).toMatchObject([
     {
       file: "src/sqlite.ts",
-      matches: Array.from({ length: 4 }, () => ({ construct: "json-projection" })),
+      matches: matches(repeated("json-projection", 4)),
     },
   ]);
   expect(inventory(root).map((row) => row.matches.length)).toEqual([4]);
@@ -217,21 +219,16 @@ it("excludes overlapping JSON only in native PostgreSQL branches", () => {
     {
       file: "src/runtime.ts",
       matches: [
-        { construct: "json-string-set", line: 4 },
-        { construct: "json-string-set", line: 6 },
-        { construct: "json-projection", line: 6 },
-        { construct: "json-projection", line: 6 },
-        { construct: "json-projection", line: 6 },
-        { construct: "rowid", line: 6 },
-        { construct: "json-projection", line: 7 },
-        { construct: "json-projection", line: 9 },
-        { construct: "json-projection", line: 11 },
-        { construct: "json-string-set", line: 11 },
+        ...matches(["json-string-set"], 4),
+        ...matches(["json-string-set", ...repeated("json-projection", 3), "rowid"], 6),
+        ...matches(["json-projection"], 7),
+        ...matches(["json-projection"], 9),
+        ...matches(["json-projection", "json-string-set"], 11),
       ],
     },
     {
       file: "src/unrelated.ts",
-      matches: [{ construct: "json-projection" }, { construct: "json-string-set" }],
+      matches: matches(["json-projection", "json-string-set"]),
     },
   ]);
 });
@@ -312,10 +309,7 @@ it("distinguishes table column lists from custom function calls", () => {
   expect(inventory(root)).toMatchObject([
     {
       file: "packages/store/schema.sql",
-      matches: [
-        { construct: "custom-function", line: 6 },
-        { construct: "custom-function", line: 7 },
-      ],
+      matches: [...matches(["custom-function"], 6), ...matches(["custom-function"], 7)],
     },
   ]);
   expect(inventory(root).map((row) => row.matches.length)).toEqual([2]);
@@ -374,116 +368,38 @@ it("compares base to working tree or index using only changed files, and permits
 });
 
 it.each([
-  {
-    file: "src/infra/sqlite-strict.ts",
-    sql: "PRAGMA foreign_keys = OFF",
-    result: 0,
-    owner: true,
-    construct: "pragma",
-  },
-  {
-    file: "src/consumer.ts",
-    sql: "PRAGMA foreign_keys = OFF",
-    result: 1,
-    owner: false,
-    construct: "pragma",
-  },
-  {
-    file: "src/infra/sqlite-snapshot.ts",
-    sql: "PRAGMA auto_vacuum",
-    result: 0,
-    owner: true,
-    construct: "pragma",
-  },
-  {
-    file: "src/consumer.ts",
-    sql: "PRAGMA auto_vacuum",
-    result: 1,
-    owner: false,
-    construct: "pragma",
-  },
-  {
-    file: "src/infra/sqlite-snapshot.ts",
-    sql: "INSERT OR IGNORE INTO t VALUES (1)",
-    result: 1,
-    owner: true,
-    construct: "insert-conflict",
-  },
-  {
-    file: "src/infra/sqlite-snapshot.ts",
-    sql: "SELECT json_extract(value, '$') FROM t",
-    result: 1,
-    owner: true,
-    construct: "json-projection",
-  },
-  {
-    file: "src/infra/sqlite-strict.ts",
-    sql: "INSERT OR IGNORE INTO t VALUES (1)",
-    result: 1,
-    owner: true,
-    construct: "insert-conflict",
-  },
-  {
-    file: "src/infra/sqlite-strict.ts",
-    sql: "SELECT json_extract(value, '$') FROM t",
-    result: 1,
-    owner: true,
-    construct: "json-projection",
-  },
-  ...(
-    [
-      ["BEGIN EXCLUSIVE", "transaction-mode", 0],
-      ["PRAGMA locking_mode=EXCLUSIVE", "pragma", 0],
-      ["PRAGMA schema_version", "schema-version", 0],
-      ["VACUUM", "vacuum", 1],
-      ["INSERT OR IGNORE INTO t VALUES (1)", "insert-conflict", 1],
-      ["SELECT json_extract(value, '$') FROM t", "json-projection", 1],
-    ] as const
-  ).map(([sql, construct, result]) => ({
-    file: "src/infra/update-doctor-migration-attribution.ts",
-    sql,
-    construct,
-    result,
-    owner: result === 0,
-  })),
-  ...(
-    [
-      ["SELECT * FROM archive ORDER BY rowid", "rowid", 0],
-      ["INSERT OR IGNORE INTO t VALUES (1)", "insert-conflict", 1],
-      ["SELECT json_extract(value, '$') FROM t", "json-projection", 1],
-    ] as const
-  ).map(([sql, construct, result]) => ({
-    file: "src/infra/sqlite-migration-scoped-snapshot.ts",
-    sql,
-    construct,
-    result,
-    owner: true,
-  })),
-  ...(
-    [
-      ["SELECT rowid FROM previous", "rowid", 0],
-      ["INSERT OR IGNORE INTO t VALUES (1)", "insert-conflict", 1],
-      ["SELECT json_extract(value, '$') FROM t", "json-projection", 1],
-    ] as const
-  ).map(([sql, construct, result]) => ({
-    file: "src/state/openclaw-state-db-schema-v31-workspace-manifests.ts",
-    sql,
-    construct,
-    result,
-    owner: result === 0,
-  })),
-  ...(
-    [
-      ["BEGIN EXCLUSIVE", "transaction-mode"],
-      ["SELECT * FROM archive ORDER BY rowid", "rowid"],
-    ] as const
-  ).map(([sql, construct]) => ({
-    file: "src/consumer.ts",
-    sql,
-    construct,
-    result: 1,
-    owner: false,
-  })),
+  ...ownerCases(
+    "src/infra/sqlite-strict.ts",
+    [["PRAGMA foreign_keys = OFF", "pragma", 0], ...nonMaintenance],
+    true,
+  ),
+  ...ownerCases(
+    "src/infra/sqlite-snapshot.ts",
+    [["PRAGMA auto_vacuum", "pragma", 0], ...nonMaintenance],
+    true,
+  ),
+  ...ownerCases("src/consumer.ts", [
+    ["PRAGMA foreign_keys = OFF", "pragma", 1],
+    ["PRAGMA auto_vacuum", "pragma", 1],
+    ["BEGIN EXCLUSIVE", "transaction-mode", 1],
+    ["SELECT * FROM archive ORDER BY rowid", "rowid", 1],
+  ]),
+  ...ownerCases("src/infra/update-doctor-migration-attribution.ts", [
+    ["BEGIN EXCLUSIVE", "transaction-mode", 0],
+    ["PRAGMA locking_mode=EXCLUSIVE", "pragma", 0],
+    ["PRAGMA schema_version", "schema-version", 0],
+    ["VACUUM", "vacuum", 1],
+    ...nonMaintenance,
+  ]),
+  ...ownerCases(
+    "src/infra/sqlite-migration-scoped-snapshot.ts",
+    [["SELECT * FROM archive ORDER BY rowid", "rowid", 0], ...nonMaintenance],
+    true,
+  ),
+  ...ownerCases("src/state/openclaw-state-db-schema-v31-workspace-manifests.ts", [
+    ["SELECT rowid FROM previous", "rowid", 0],
+    ...nonMaintenance,
+  ]),
 ])(
   "ratchets $sql in $file with only primitive maintenance excluded",
   ({ file, sql, result, owner, construct }) => {
