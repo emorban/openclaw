@@ -3999,8 +3999,10 @@ model completion, and broadcast delivery are checked before and after measuremen
 Add `--clients 70 --sidebar-limit 200` to refresh each viewer's sidebar after every
 broadcast using the real Control UI conditional-row decoder over WebSockets. Each
 refresh must decode 200 rows and show the patched session title. The fixture has
-70 recipient connections plus one sender; its 5,000 sessions remain independent
-of the selected page size. Omit `--sidebar-limit` to isolate Inbox publication.
+70 recipient connections for one profile plus one sender; the existing list owner
+can coalesce their identical sidebar requests. Its 5,000-session base fixture
+remains independent of the selected page size. Omit `--sidebar-limit` to isolate
+Inbox publication.
 
 ```sh
 node --expose-gc --trace-gc-nvp --import ./scripts/tsx.mjs \
@@ -4046,9 +4048,10 @@ time. Always report both sides' maximum pause; the candidate maximum exceeding
 max(50 ms, twice baseline maximum) retains its gate. Guard-interrupted pairs are
 discarded and rerun; use the shared production guard without a stricter threshold.
 
-Sampled allocation includes collected objects and reports whole-process and
-owner attribution per Inbox read and per broadcast, plus a rate normalized to
-the measured minute. Broadcast allocation also reports bytes per recipient
+Sampled allocation includes collected objects in the main isolate, including the
+in-process WebSocket and UI driver, and reports owner attribution per Inbox read
+and per broadcast, plus a rate normalized to the measured minute. Worker-isolate
+allocations are not sampled. Broadcast allocation also reports bytes per recipient
 viewer. Owner subtrees (`readTarget`, `readView`, `shareSidebarSessionRows`) can
 overlap, so do not sum them. The broadcast profile is saved as
 `<output>.broadcast.heapprofile`; the list profile keeps `<output>.heapprofile`.
